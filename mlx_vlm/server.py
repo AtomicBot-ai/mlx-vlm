@@ -950,6 +950,20 @@ def _build_gen_args(
     logit_bias = getattr(request, "logit_bias", None)
     if logit_bias is not None and isinstance(logit_bias, dict):
         logit_bias = {int(k): v for k, v in logit_bias.items()}
+
+    # Atomic-Chat fork: honour the OpenAI/HF-TGI convention of nesting
+    # template knobs inside ``chat_template_kwargs`` (e.g.
+    # ``{"chat_template_kwargs": {"enable_thinking": false}}``). Upstream
+    # only reads top-level fields, so the official thinking-toggle UI in
+    # most OpenAI-compatible clients silently no-ops. Nested values take
+    # precedence when explicitly provided.
+    template_kwargs = getattr(request, "chat_template_kwargs", None) or {}
+
+    def _pick(name: str, default):
+        if isinstance(template_kwargs, dict) and name in template_kwargs:
+            return template_kwargs[name]
+        return getattr(request, name, default)
+
     args = GenerationArguments(
         max_tokens=max_tokens,
         temperature=getattr(request, "temperature", DEFAULT_TEMPERATURE),
@@ -958,9 +972,9 @@ def _build_gen_args(
         min_p=getattr(request, "min_p", 0.0),
         repetition_penalty=getattr(request, "repetition_penalty", None),
         logit_bias=logit_bias,
-        enable_thinking=getattr(request, "enable_thinking", True),
-        thinking_budget=getattr(request, "thinking_budget", None),
-        thinking_start_token=getattr(request, "thinking_start_token", None),
+        enable_thinking=bool(_pick("enable_thinking", True)),
+        thinking_budget=_pick("thinking_budget", None),
+        thinking_start_token=_pick("thinking_start_token", None),
         tenant_id=tenant_id,
     )
     if processor is not None:
@@ -2332,8 +2346,22 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                         output_tokens = 0
                         request_id = f"chatcmpl-{uuid.uuid4()}"
-                        # Track thinking state for reasoning/content split
-                        in_thinking = False
+                        # Track thinking state for reasoning/content split.
+                        #
+                        # Atomic-Chat fork: many chat templates (Qwen3, Gemma
+                        # 3/4, GLM 4.5, …) inject the opening `<think>` /
+                        # `<|channel>thought` marker into the *prompt itself*
+                        # as a generation primer, so the model never re-emits
+                        # the opening tag in its streamed output — it just
+                        # writes the chain of thought directly and eventually
+                        # closes with `</think>`. Without seeding `in_thinking`
+                        # from the rendered prompt, the entire CoT leaks into
+                        # `delta.content` and the trailing `</think>` becomes
+                        # visible text to the user.
+                        prompt_tail = (formatted_prompt or "").rstrip()
+                        in_thinking = prompt_tail.endswith("<think>") or prompt_tail.endswith(
+                            "<|channel>thought"
+                        )
                         accumulated = ""
                         full_output = ""  # raw output for tool call parsing
                         # Track tool-call state to suppress markup from content
