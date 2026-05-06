@@ -6,11 +6,14 @@ def top_p_sampling(logits: mx.array, top_p: float, temperature: float) -> mx.arr
     Apply top-p (nucleus) sampling to logits.
 
     Args:
-        logits: The logits from the model's output. Shape [vocab] or [B, vocab].
+        logits: The logits from the model's output. Shape [vocab], [B, vocab],
+            or any leading-batch shape [..., vocab] (e.g. [B, K, vocab] for
+            DFlash speculative decoding which samples K positions per step).
         top_p: The cumulative probability threshold for top-p filtering.
         temperature: Temperature parameter for softmax distribution reshaping.
     Returns:
-        token selected based on the top-p criterion. Shape [] or [B].
+        token selected based on the top-p criterion. Shape matches logits with
+        the trailing vocab dimension removed.
     """
     unbatched = logits.ndim == 1
     if unbatched:
@@ -38,7 +41,11 @@ def top_p_sampling(logits: mx.array, top_p: float, temperature: float) -> mx.arr
     )
 
     sampled_pos = mx.random.categorical(mx.log(top_probs))
-    token = mx.take_along_axis(sorted_indices, sampled_pos[:, None], axis=-1).squeeze(
-        -1
-    )
+    # `sampled_pos[..., None]` keeps shape compatible across rank-N inputs:
+    # for [B, V] -> [B, 1], for [B, K, V] -> [B, K, 1] (DFlash speculative
+    # decoding). The previous `[:, None]` only worked for rank-2 logits and
+    # crashed in `.squeeze(-1)` when called with [B, K, V] from draft_block.
+    token = mx.take_along_axis(
+        sorted_indices, sampled_pos[..., None], axis=-1
+    ).squeeze(-1)
     return token.squeeze(0) if unbatched else token
