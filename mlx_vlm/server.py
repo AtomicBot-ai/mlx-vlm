@@ -1196,6 +1196,22 @@ def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
         print(f"Using cached model: {model_path}, Adapter: {adapter_path}")
         return model_cache["model"], model_cache["processor"], model_cache["config"]
 
+    # Atomic-Chat fork addition: in single-model mode the server is launched
+    # by a desktop app that pre-loads exactly one model and never expects
+    # hot-swap. Clients in the wild pass arbitrary labels (model_id, repo
+    # short-name, etc.) in the `model` field of the request body — without
+    # this guard we would unload and try to fetch them from HF, which 401s
+    # for non-existent / private repos and breaks the whole session. When
+    # `MLX_VLM_SINGLE_MODEL=1` is set, ignore the requested label and keep
+    # serving from the cached model.
+    if os.environ.get("MLX_VLM_SINGLE_MODEL") == "1" and model_cache:
+        cached_path = model_cache.get("cache_key", (None, None))[0]
+        print(
+            f"Single-model mode: ignoring requested '{model_path}', "
+            f"serving cached '{cached_path}'."
+        )
+        return model_cache["model"], model_cache["processor"], model_cache["config"]
+
     # If cache exists but doesn't match, clear it
     if model_cache:
         print("New model request, clearing existing cache...")
