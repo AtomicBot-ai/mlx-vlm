@@ -1,0 +1,213 @@
+name: Build & Release MLX-VLM Server (macOS ARM64)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build-mlxvlm-macos.yml'
+      - 'mlx_vlm/**'
+      - 'pyproject.toml'
+      - 'requirements.txt'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  macOS-arm64:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set version tag
+        id: version
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          TAG="mlxvlm-macos-arm64-${SHORT_SHA}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Import code signing certificate
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          CERTIFICATE_PATH=$RUNNER_TEMP/build_certificate.p12
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+
+          echo -n "$MACOS_CERTIFICATE_P12" | base64 --decode -o $CERTIFICATE_PATH
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
+          security import $CERTIFICATE_PATH -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          security set-key-partition-list -S apple-tool:,apple: \
+            -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security list-keychain -d user -s $KEYCHAIN_PATH
+
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+
+          IDENTITY=$(security find-identity -v -p codesigning $KEYCHAIN_PATH | head -1 | grep -o '".*"' | tr -d '"')
+          echo "CODESIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          echo "Signing identity: $IDENTITY"
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install pyinstaller
+          pip install -e .
+
+      - name: Build with PyInstaller
+        run: |
+          # NOTE: --onefile keeps drop-in compatibility with the previous
+          # dflash mlx-server binary (single file under
+          # `src-tauri/resources/bin/mlx-server`). Heavy collect-all targets
+          # are required because mlx-vlm resolves model + drafter modules
+          # lazily via importlib at request time.
+          pyinstaller \
+            --onefile \
+            --name mlx-server \
+            --collect-all mlx \
+            --collect-all mlx_lm \
+            --collect-all mlx_vlm \
+            --collect-all mlx_audio \
+            --collect-submodules mlx_vlm.models \
+            --collect-submodules mlx_vlm.speculative \
+            --collect-submodules mlx_vlm.tool_parsers \
+            --collect-data transformers \
+            --collect-data tokenizers \
+            --hidden-import fastapi \
+            --hidden-import uvicorn \
+            --hidden-import uvicorn.logging \
+            --hidden-import uvicorn.loops \
+            --hidden-import uvicorn.loops.auto \
+            --hidden-import uvicorn.protocols \
+            --hidden-import uvicorn.protocols.http \
+            --hidden-import uvicorn.protocols.http.auto \
+            --hidden-import uvicorn.protocols.websockets \
+            --hidden-import uvicorn.protocols.websockets.auto \
+            --hidden-import uvicorn.lifespan \
+            --hidden-import uvicorn.lifespan.on \
+            --hidden-import huggingface_hub \
+            --hidden-import miniaudio \
+            --hidden-import llguidance \
+            --hidden-import cv2 \
+            --exclude-module gradio \
+            --exclude-module jupyter \
+            --exclude-module IPython \
+            mlx_vlm/_entry_server.py
+
+          echo "=== Binary info ==="
+          file dist/mlx-server
+          ls -lh dist/mlx-server
+
+      - name: Verify binary runs
+        run: |
+          ./dist/mlx-server --help || true
+          echo "Binary executes successfully"
+
+      - name: Sign binary
+        run: |
+          echo "Signing mlx-server..."
+          codesign --force --options runtime --timestamp \
+            --sign "$CODESIGN_IDENTITY" dist/mlx-server
+          codesign --verify --verbose dist/mlx-server
+          echo "Code signing completed"
+
+      - name: Prepare release archive
+        run: |
+          mkdir -p release
+          cp dist/mlx-server release/
+          cd release
+          tar -czf ../mlxvlm-mlx-server-macos-arm64.tar.gz mlx-server
+          cd ..
+          ls -lh mlxvlm-mlx-server-macos-arm64.tar.gz
+
+      - name: Notarize release archive
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          echo "=== Creating zip for notarization ==="
+          zip -j mlx-server-notarize.zip dist/mlx-server
+
+          echo "=== Notarizing ==="
+          xcrun notarytool submit mlx-server-notarize.zip \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_ID_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait --timeout 15m
+
+          rm mlx-server-notarize.zip
+          echo "=== Notarization complete ==="
+
+      - name: Clean up keychain
+        if: always()
+        run: |
+          security delete-keychain $KEYCHAIN_PATH 2>/dev/null || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlxvlm-mlx-server-macos-arm64
+          path: release/
+          retention-days: 30
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: "MLX-VLM Server macOS ARM64 (${{ steps.version.outputs.short_sha }})"
+          body: |
+            ## MLX-VLM Server — macOS ARM64
+
+            Built from `main` branch at commit `${{ steps.version.outputs.short_sha }}`.
+
+            ### What's included
+
+            - `mlx-server` — standalone OpenAI-compatible inference server based on
+              [`mlx-vlm`](https://github.com/Blaizzy/mlx-vlm) (Atomic-Chat fork).
+            - Vision Language Model + text-only inference (mlx-lm under the hood).
+            - DFlash speculative decoding (`--draft-model ... --draft-kind dflash`).
+            - Gemma 4 MTP speculative decoding (`--draft-kind mtp`).
+            - Continuous batching, KV cache quantization, APC, structured outputs.
+
+            ### Usage
+
+            ```bash
+            tar -xzf mlxvlm-mlx-server-macos-arm64.tar.gz
+
+            # Plain MLX inference (loopback only)
+            ./mlx-server --model /path/to/model --host 127.0.0.1 --port 8080
+
+            # DFlash accelerated inference
+            ./mlx-server --model /path/to/model \
+              --draft-model /path/to/dflash-draft \
+              --draft-kind dflash \
+              --host 127.0.0.1 --port 8080
+            ```
+
+            ### For Atomic Chat integration
+
+            This binary is automatically downloaded during the Atomic Chat build process
+            (`make build-mlx-server`).
+          files: |
+            mlxvlm-mlx-server-macos-arm64.tar.gz
+          draft: false
+          prerelease: true
