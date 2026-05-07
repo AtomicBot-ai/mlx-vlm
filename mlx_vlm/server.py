@@ -156,6 +156,71 @@ def get_top_logprobs_k():
     return max(0, min(k, 20))
 
 
+def _coerce_eos_to_set(value: Any) -> set[int]:
+    """Normalize a HF-style ``eos_token_id`` field into a ``set[int]``.
+
+    Accepts ``int``, ``list[int]`` (or any iterable of ints), or ``None``.
+    Anything else (including ``str``) is dropped silently — callers always
+    have at least one other source to fall back on.
+    """
+    if value is None:
+        return set()
+    if isinstance(value, bool):
+        # ``bool`` is a subclass of ``int``; reject it to avoid 0/1 sneaking
+        # in as fake token ids.
+        return set()
+    if isinstance(value, int):
+        return {value}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return {int(v) for v in value if isinstance(v, int) and not isinstance(v, bool)}
+    return set()
+
+
+def _collect_stop_tokens(config: Any, processor: Any, model_path: str) -> set[int]:
+    """Aggregate EOS token ids from all canonical HF sources.
+
+    VLM wrappers (Qwen3.5, Gemma3-VLM, ...) keep ``eos_token_id`` inside
+    ``text_config`` and leave the top-level field as ``None``. Chat-tuned
+    models also publish a separate ``generation_config.json`` with the full
+    chat-stop list (e.g. Gemma 4 ships ``[1, 106, 50]`` covering both the
+    base ``<eos>`` and ``<end_of_turn>``).
+
+    Sources merged in this order — none mandatory, all union'd:
+
+      1. ``config.eos_token_id``              # legacy / non-VLM
+      2. ``config.text_config.eos_token_id``  # VLM wrappers
+      3. ``processor.tokenizer.eos_token_id`` # chat-aware EOS, most reliable
+      4. ``<model_path>/generation_config.json::eos_token_id``
+                                              # HF standard for chat models
+    """
+    stop_tokens: set[int] = set()
+
+    stop_tokens |= _coerce_eos_to_set(getattr(config, "eos_token_id", None))
+
+    text_config = getattr(config, "text_config", None)
+    if text_config is not None:
+        stop_tokens |= _coerce_eos_to_set(getattr(text_config, "eos_token_id", None))
+
+    tokenizer = getattr(processor, "tokenizer", processor)
+    stop_tokens |= _coerce_eos_to_set(getattr(tokenizer, "eos_token_id", None))
+
+    gen_cfg_path = os.path.join(model_path, "generation_config.json")
+    if os.path.isfile(gen_cfg_path):
+        try:
+            with open(gen_cfg_path, encoding="utf-8") as f:
+                gen_cfg = json.load(f)
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "Failed to read %s: %s; skipping generation_config EOS source.",
+                gen_cfg_path,
+                exc,
+            )
+        else:
+            stop_tokens |= _coerce_eos_to_set(gen_cfg.get("eos_token_id"))
+
+    return stop_tokens
+
+
 # =============================================================================
 # ResponseGenerator - Concurrent Request Handling with Threaded Batching
 # =============================================================================
@@ -308,12 +373,19 @@ class ResponseGenerator:
             self.model_path, self.adapter_path
         )
 
-        stop_tokens = set()
-        if hasattr(config, "eos_token_id"):
-            if isinstance(config.eos_token_id, list):
-                stop_tokens.update(config.eos_token_id)
-            elif config.eos_token_id is not None:
-                stop_tokens.add(config.eos_token_id)
+        # VLM wrappers (Qwen3.5, Gemma3-VLM, ...) keep ``eos_token_id`` only
+        # inside ``text_config``; chat-tuned models also publish a separate
+        # ``generation_config.json`` with the full chat-stop list. Aggregate
+        # all canonical sources so generation actually halts at ``<|im_end|>``
+        # / ``<end_of_turn>`` instead of running into ``max_tokens``.
+        stop_tokens = _collect_stop_tokens(config, processor, self.model_path)
+        if not stop_tokens:
+            logger.warning(
+                "No EOS tokens resolved for %s. Generation will only stop at "
+                "max_tokens. Check config.json / generation_config.json / "
+                "tokenizer_config.json.",
+                self.model_path,
+            )
 
         draft_model = None
         draft_kind = os.environ.get("MLX_VLM_DRAFT_KIND", "dflash")
@@ -2359,9 +2431,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         # `delta.content` and the trailing `</think>` becomes
                         # visible text to the user.
                         prompt_tail = (formatted_prompt or "").rstrip()
-                        in_thinking = prompt_tail.endswith("<think>") or prompt_tail.endswith(
-                            "<|channel>thought"
-                        )
+                        in_thinking = prompt_tail.endswith(
+                            "<think>"
+                        ) or prompt_tail.endswith("<|channel>thought")
                         accumulated = ""
                         full_output = ""  # raw output for tool call parsing
                         # Track tool-call state to suppress markup from content
@@ -2540,7 +2612,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                     elapsed = time.perf_counter() - request_start
                     logger.debug(
-                        "chat/completions stream done: tokens=%d " "total_time=%.2fs",
+                        "chat/completions stream done: tokens=%d total_time=%.2fs",
                         output_tokens,
                         elapsed,
                     )
@@ -2613,9 +2685,12 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             pass
                         return text, pt, gt, pm
 
-                    full_text, prompt_tokens, output_tokens, peak_memory = (
-                        await asyncio.to_thread(_blocking_generate)
-                    )
+                    (
+                        full_text,
+                        prompt_tokens,
+                        output_tokens,
+                        peak_memory,
+                    ) = await asyncio.to_thread(_blocking_generate)
                 else:
                     gen_result = generate(
                         model=model,
@@ -2850,7 +2925,7 @@ async def unload_model_endpoint():
 
     return {
         "status": "success",
-        "message": f"Model unloaded successfully",
+        "message": "Model unloaded successfully",
         "unloaded": unloaded_info,
     }
 
