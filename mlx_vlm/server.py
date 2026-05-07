@@ -750,7 +750,16 @@ class ResponseGenerator:
                     max_tokens_map[uid] = args.max_tokens
                     all_input_ids.append(input_ids.squeeze(0).tolist())
                     rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
-                    sampler = self._make_sampler(args) or _make_sampler(temp=0)
+                    # Speculative decoding (DFlash/MTP) requires lossless target
+                    # sampling: the strict-equality verification in
+                    # ``_speculative_walk_batch`` is biased at ``temp > 0`` and
+                    # degenerates when the drafter distribution diverges from
+                    # the target's (especially with a quantization mismatch
+                    # like a bf16 drafter on a 4-bit target). Force greedy
+                    # regardless of ``args.temperature``; throughput stays —
+                    # only stochastic "creativity" is sacrificed. The MTP
+                    # README's ``Caveats`` section documents this constraint.
+                    sampler = _make_sampler(temp=0)
 
                 B = len(uids)
                 max_len = max(len(ids) for ids in all_input_ids)
