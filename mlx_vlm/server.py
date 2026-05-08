@@ -3165,6 +3165,36 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     server_metrics.record_success(envelope)
                     metrics_finalized = True
 
+                    # Emit a final SSE chunk carrying decode-only TPS so
+                    # OpenAI-compatible clients (e.g. Atomic-Chat AI SDK
+                    # extractor) can render the real generation rate.
+                    # Without this, every per-token chunk only carried
+                    # token *counts* and the client fell back to a
+                    # wall-clock estimate that includes prefill + TTFT,
+                    # heavily underreporting throughput on long prompts
+                    # and making MTP look slower than baseline.
+                    final_prompt_tokens = (
+                        ctx.prompt_tokens
+                        if response_generator is not None
+                        else stream_prompt_tokens
+                    )
+                    final_usage = UsageStats(
+                        prompt_tokens=int(final_prompt_tokens),
+                        completion_tokens=int(completion_tokens),
+                        total_tokens=int(final_prompt_tokens) + int(completion_tokens),
+                        prompt_tps=float(envelope.get("prefill_tok_s") or 0.0),
+                        generation_tps=float(envelope.get("decode_tok_s") or 0.0),
+                        peak_memory=float(envelope.get("peak_memory_gb") or 0.0),
+                    )
+                    final_chunk = ChatStreamChunk(
+                        id=request_id,
+                        created=int(time.time()),
+                        model=request.model,
+                        usage=final_usage,
+                        choices=[],
+                    )
+                    yield f"data: {final_chunk.model_dump_json()}\n\n"
+
                     # Signal stream end
                     yield "data: [DONE]\n\n"
 
