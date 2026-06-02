@@ -6,7 +6,7 @@ import mlx.nn as nn
 
 from mlx_vlm.trainer.datasets import VisionDataset
 from mlx_vlm.trainer.lora import LoRaLayer
-from mlx_vlm.trainer.sft_trainer import TrainingArgs, train
+from mlx_vlm.trainer.sft_trainer import TrainingArgs, iterate_batches, train
 
 
 class TestDataset(unittest.TestCase):
@@ -130,6 +130,32 @@ class TestDataset(unittest.TestCase):
         self.assertEqual(dataset.processor, self.mock_processor)
 
 
+class TestBatchCollation(unittest.TestCase):
+    def test_iterate_batches_concatenates_variable_length_pixel_values(self):
+        dataset = [
+            {
+                "input_ids": mx.array([1, 2, 3]),
+                "attention_mask": mx.array([1, 1, 1]),
+                "pixel_values": mx.zeros((2, 4)),
+                "image_grid_thw": mx.array([[1, 1, 2]]),
+            },
+            {
+                "input_ids": mx.array([4, 5]),
+                "attention_mask": mx.array([1, 1]),
+                "pixel_values": mx.ones((3, 4)),
+                "image_grid_thw": mx.array([[1, 1, 3]]),
+            },
+        ]
+
+        batch = next(iterate_batches(dataset, batch_size=2, max_seq_length=32))
+
+        self.assertEqual(batch["input_ids"].shape, (2, 32))
+        self.assertEqual(batch["pixel_values"].shape, (5, 4))
+        self.assertTrue(
+            mx.array_equal(batch["image_grid_thw"], mx.array([[1, 1, 2], [1, 1, 3]]))
+        )
+
+
 class TestTrainer(unittest.TestCase):
     def setUp(self):
         class DummyOutput:
@@ -196,6 +222,44 @@ class TestTrainer(unittest.TestCase):
 
         self.mock_optimizer.update.assert_called()
         mock_save_safetensors.assert_called()
+
+    @patch("mlx_vlm.trainer.sft_trainer.iterate_batches")
+    @patch("mlx_vlm.trainer.sft_trainer.mx.save_safetensors")
+    def test_train_uses_default_adapter_file_when_missing(
+        self, mock_save_safetensors, mock_iterate_batches
+    ):
+        mock_batch = {
+            "input_ids": mx.array([[1, 2, 3], [1, 2, 3], [1, 2, 3], [1, 2, 3]]),
+            "attention_mask": mx.array([[1, 1, 1], [1, 1, 1], [1, 1, 1], [1, 1, 1]]),
+            "pixel_values": mx.array(
+                [[[0.1, 0.2]], [[0.1, 0.2]], [[0.1, 0.2]], [[0.1, 0.2]]]
+            ),
+            "labels": mx.array([[0, 1, 2], [0, 1, 2], [0, 1, 2], [0, 1, 2]]),
+        }
+        mock_iterate_batches.return_value = iter([mock_batch])
+
+        train(
+            model=self.mock_model,
+            optimizer=self.mock_optimizer,
+            train_dataset=MagicMock(__len__=lambda self: 4),
+            val_dataset=None,
+            args=TrainingArgs(
+                iters=1,
+                batch_size=4,
+                steps_per_save=1,
+                adapter_file=None,
+            ),
+        )
+
+        saved_paths = [call.args[0] for call in mock_save_safetensors.call_args_list]
+        self.assertEqual(
+            saved_paths,
+            [
+                "adapters.safetensors",
+                "0000001_adapters.safetensors",
+                "adapters.safetensors",
+            ],
+        )
 
 
 class TestLoRaScaling(unittest.TestCase):

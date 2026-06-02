@@ -28,6 +28,26 @@ def _flat_seq_len(value):
     return np.array(_squeeze_leading_batch_dim(value)).reshape(-1).shape[0]
 
 
+def _collate_arrays(values):
+    """Stack same-shaped arrays, or concatenate variable-length feature rows."""
+    try:
+        return mx.stack(values)
+    except ValueError:
+        first = values[0]
+        if (
+            isinstance(first, mx.array)
+            and first.ndim > 1
+            and all(
+                isinstance(v, mx.array)
+                and v.ndim == first.ndim
+                and v.shape[1:] == first.shape[1:]
+                for v in values
+            )
+        ):
+            return mx.concatenate(values, axis=0)
+        raise
+
+
 @dataclass
 class TrainingArgs:
     batch_size: int = field(default=4, metadata={"help": "Minibatch size."})
@@ -83,6 +103,18 @@ class TrainingArgs:
         default=1,
         metadata={"help": "Number of steps to accumulate gradients before updating."},
     )
+
+
+def _resolve_adapter_file(args: TrainingArgs) -> Path:
+    adapter_file = getattr(args, "adapter_file", None)
+    if adapter_file:
+        return Path(adapter_file)
+
+    adapter_path = getattr(args, "adapter_path", None)
+    if adapter_path:
+        return Path(adapter_path) / "adapters.safetensors"
+
+    return Path(TrainingArgs.__dataclass_fields__["adapter_file"].default)
 
 
 def vision_language_loss_fn(
@@ -212,7 +244,7 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
 
             pixel_values_batch = None
             if "pixel_values" in items[0] and items[0]["pixel_values"] is not None:
-                pixel_values_batch = mx.stack(
+                pixel_values_batch = _collate_arrays(
                     [_squeeze_leading_batch_dim(item["pixel_values"]) for item in items]
                 )
 
@@ -231,7 +263,7 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
                 vals = [_squeeze_leading_batch_dim(item[k]) for item in items]
                 if isinstance(vals[0], mx.array):
                     try:
-                        batch[k] = mx.stack(vals)
+                        batch[k] = _collate_arrays(vals)
                     except Exception:
                         batch[k] = vals[0]
                 else:
@@ -334,6 +366,8 @@ def train(
         print(
             f"{Colors.OKBLUE}No validation dataset provided — training will run without validation.{Colors.ENDC}"
         )
+
+    adapter_file = _resolve_adapter_file(args)
 
     # Enable gradient checkpointing if requested
     if args.grad_checkpoint:
@@ -479,20 +513,18 @@ def train(
 
         # Save checkpoint
         if it % args.steps_per_save == 0 and rank == 0:
-            save_adapter(model, args.adapter_file)
-            checkpoint = (
-                Path(args.adapter_file).parent / f"{it:07d}_adapters.safetensors"
-            )
+            save_adapter(model, adapter_file)
+            checkpoint = adapter_file.parent / f"{it:07d}_adapters.safetensors"
             save_adapter(model, checkpoint)
             print(
                 f"{Colors.OKBLUE}Iter {it}: Saved adapter weights to "
-                f"{args.adapter_file} and {checkpoint}.{Colors.ENDC}",
+                f"{adapter_file} and {checkpoint}.{Colors.ENDC}",
                 flush=True,
             )
 
     # Save final weights
     if rank == 0:
-        save_adapter(model, args.adapter_file)
+        save_adapter(model, adapter_file)
         print(
-            f"{Colors.OKGREEN}Saved final adapter weights to {args.adapter_file}.{Colors.ENDC}"
+            f"{Colors.OKGREEN}Saved final adapter weights to {adapter_file}.{Colors.ENDC}"
         )

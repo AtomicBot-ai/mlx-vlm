@@ -4,6 +4,7 @@ import inspect
 import json
 import logging
 import math
+import struct
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
@@ -49,6 +50,8 @@ MODEL_REMAPPING = {
 MAX_FILE_SIZE_GB = 5
 
 MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
+
+SAFETENSORS_DTYPE_FALLBACKS = {"F8_E8M0": "U8"}
 
 
 def quantize_activations(model: nn.Module) -> nn.Module:
@@ -113,7 +116,10 @@ def get_model_and_args(config: dict):
     Returns:
         A tuple containing the Model class and the ModelArgs class.
     """
-    model_type = config["model_type"].lower()
+    raw_model_type = config.get("model_type") or config.get("speculators_model_type")
+    if raw_model_type is None:
+        raise KeyError("model_type")
+    model_type = raw_model_type.lower()
 
     model_type = MODEL_REMAPPING.get(model_type, model_type)
 
@@ -132,13 +138,32 @@ def get_model_and_args(config: dict):
             last_err = e
             continue
 
+    if _is_text_only_config(config):
+        arch = importlib.import_module("mlx_vlm.models.text_only")
+        return arch, "text_only"
+
     msg = f"Model type {model_type} not supported. Error: {last_err}"
     logging.error(msg)
     raise ValueError(msg)
 
 
+def _has_config(config: dict, key: str) -> bool:
+    value = config.get(key)
+    return value is not None and value != {}
+
+
+def _is_text_only_config(config: dict) -> bool:
+    return not any(
+        _has_config(config, key)
+        for key in ("vision_config", "audio_config", "dflash_config")
+    )
+
+
 def get_model_path(
-    path_or_hf_repo: str, revision: Optional[str] = None, force_download: bool = False
+    path_or_hf_repo: str,
+    revision: Optional[str] = None,
+    force_download: bool = False,
+    allow_patterns: Optional[List[str]] = None,
 ) -> Path:
     """
     Ensures the model is available locally. If the path does not exist locally,
@@ -157,7 +182,8 @@ def get_model_path(
             snapshot_download(
                 repo_id=path_or_hf_repo,
                 revision=revision,
-                allow_patterns=[
+                allow_patterns=allow_patterns
+                or [
                     "*.json",
                     "*.safetensors",
                     "*.py",
@@ -227,7 +253,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
 
     weights = {}
     for wf in weight_files:
-        weights.update(mx.load(wf))
+        weights.update(_load_safetensors(wf))
 
     with safetensors.safe_open(weight_files[0], framework="np") as f:
         is_mlx_format = f.metadata() and f.metadata().get("format") == "mlx"
@@ -288,6 +314,10 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
             elif quant_method == "mxfp4":
                 quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+            elif quant_method == "fp8" and config.get("model_type") == "deepseek_v4":
+                from .models.deepseek_v4.language import make_quantization_config
+
+                quantization = make_quantization_config(model)
             elif quant_method in ("awq", "gptq", "bitnet"):
                 logging.warning(
                     "Quantization method %s is not supported in mlx_vlm.load_model()",
@@ -308,6 +338,11 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         # Handle legacy models which may or may not have vision quantized
         # TODO: Re-upload the models with the new quantization config and remove this
         skip_vision = config.get("vision_config", {}).get("skip_vision", False)
+        quantized_model = (
+            model.language_model._model
+            if getattr(model, "_is_text_model", False)
+            else model
+        )
 
         def get_class_predicate(p, m):
             # Always skip vision and audio models
@@ -325,7 +360,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             return f"{p}.scales" in weights
 
         nn.quantize(
-            model,
+            quantized_model,
             group_size=quantization["group_size"],
             bits=quantization["bits"],
             mode=quantization.get("mode", "affine"),
@@ -345,8 +380,53 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     if not lazy:
         mx.eval(model.parameters())
 
+    model.model_path = model_path
     model.eval()
     return model
+
+
+def _load_safetensors(path: str) -> dict:
+    try:
+        return mx.load(path)
+    except RuntimeError as e:
+        if not any(dtype in str(e) for dtype in SAFETENSORS_DTYPE_FALLBACKS):
+            raise
+        load_error = e
+
+    with open(path, "r+b") as f:
+        header_len = struct.unpack("<Q", f.read(8))[0]
+        original_header = f.read(header_len)
+        header = json.loads(original_header)
+        changed = False
+
+        for tensor_info in header.values():
+            if not isinstance(tensor_info, dict):
+                continue
+            dtype = tensor_info.get("dtype")
+            if dtype in SAFETENSORS_DTYPE_FALLBACKS:
+                tensor_info["dtype"] = SAFETENSORS_DTYPE_FALLBACKS[dtype]
+                changed = True
+
+        if not changed:
+            raise load_error
+
+        patched_header = json.dumps(header, separators=(",", ":")).encode("utf-8")
+        if len(patched_header) > header_len:
+            raise RuntimeError(
+                f"Cannot reinterpret unsupported safetensors dtype in {path}: "
+                "patched header is larger than the original header."
+            )
+
+        try:
+            f.seek(8)
+            f.write(patched_header)
+            f.write(b" " * (header_len - len(patched_header)))
+            f.flush()
+            return mx.load(path)
+        finally:
+            f.seek(8)
+            f.write(original_header)
+            f.flush()
 
 
 def sanitize_weights(model_obj, weights, config=None):
@@ -385,6 +465,7 @@ def load(
     adapter_path: Optional[str] = None,
     lazy: bool = False,
     revision: Optional[str] = None,
+    strict: bool = True,
     **kwargs,
 ) -> Tuple[nn.Module, ProcessorMixin]:
     """
@@ -401,6 +482,8 @@ def load(
             when needed. Default: ``False``
         revision (str, optional): A revision id which can be a branch name,
             a tag, or a commit hash. Default: ``None``.
+        strict (bool): Whether or not to raise an exception if weights don't
+            match. Default: ``True``.
         quantize_activations (bool, optional): If True, convert QuantizedLinear layers
             to QQLinear layers for activation quantization. Only supported for models
             quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
@@ -416,7 +499,7 @@ def load(
     model_path = get_model_path(
         path_or_hf_repo, force_download=force_download, revision=revision
     )
-    model = load_model(model_path, lazy, **kwargs)
+    model = load_model(model_path, lazy, strict=strict, **kwargs)
     if adapter_path is not None:
         model = apply_lora_layers(model, adapter_path)
         model.eval()
@@ -542,7 +625,10 @@ def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImagePro
     else:
         config = load_config(model_path, **kwargs)
 
-    model_class, _ = get_model_and_args(config)
+    try:
+        model_class, _ = get_model_and_args(config)
+    except ValueError:
+        return None
     image_processor = None
 
     if hasattr(model_class, "ImageProcessor"):
@@ -560,7 +646,7 @@ def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> ProcessorMixin:
 
-    processor = AutoProcessor.from_pretrained(model_path, use_fast=True, **kwargs)
+    processor = AutoProcessor.from_pretrained(model_path, **kwargs)
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
 
@@ -574,7 +660,9 @@ def load_processor(
 
         # Determine the EOS token IDs, prioritizing the function argument
         final_eos_token_ids = (
-            eos_token_ids if eos_token_ids is not None else tokenizer_obj.eos_token_ids
+            eos_token_ids
+            or getattr(tokenizer_obj, "eos_token_ids", None)
+            or getattr(tokenizer_obj, "eos_token_id", None)
         )
 
         # Create and assign the StoppingCriteria
@@ -1608,6 +1696,7 @@ class ThinkingBudgetCriteria:
         self.in_thinking = self.enable_thinking
         self.thinking_token_count = 0
         self.budget_exceeded = False
+        self.forced_token_id = None
 
     def reset_thinking_state(self):
         """Reset thinking state between generations."""
