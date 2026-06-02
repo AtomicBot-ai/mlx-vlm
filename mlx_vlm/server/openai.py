@@ -1433,8 +1433,22 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                         output_tokens = 0
                         request_id = f"chatcmpl-{uuid.uuid4()}"
-                        # Track thinking state for reasoning/content split
-                        in_thinking = False
+                        # Track thinking state for reasoning/content split.
+                        #
+                        # Atomic-Chat fork: many chat templates (Qwen3, Gemma
+                        # 3/4, GLM 4.5, …) inject the opening `<think>` /
+                        # `<|channel>thought` marker into the *prompt itself*
+                        # as a generation primer, so the model never re-emits
+                        # the opening tag in its streamed output — it just
+                        # writes the chain of thought directly and eventually
+                        # closes with `</think>`. Without seeding `in_thinking`
+                        # from the rendered prompt, the entire CoT leaks into
+                        # `delta.content` and the trailing `</think>` becomes
+                        # visible text to the user.
+                        prompt_tail = (formatted_prompt or "").rstrip()
+                        in_thinking = prompt_tail.endswith(
+                            "<think>"
+                        ) or prompt_tail.endswith("<|channel>thought")
                         accumulated = ""
                         full_output = ""  # raw output for tool call parsing
                         # Track tool-call state to suppress markup from content

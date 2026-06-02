@@ -104,11 +104,22 @@ def _build_gen_args(
     logit_bias = getattr(request, "logit_bias", None)
     if logit_bias is not None and isinstance(logit_bias, dict):
         logit_bias = {int(k): v for k, v in logit_bias.items()}
-    enable_thinking = _request_field_or_default(
-        request,
-        "enable_thinking",
-        get_server_enable_thinking(),
-    )
+
+    # Atomic-Chat fork: honour the OpenAI/HF-TGI convention of nesting
+    # template knobs inside ``chat_template_kwargs`` (e.g.
+    # ``{"chat_template_kwargs": {"enable_thinking": false}}``). Upstream
+    # only reads top-level fields, so the official thinking-toggle UI in
+    # most OpenAI-compatible clients silently no-ops. Nested values take
+    # precedence when explicitly provided. The default for ``enable_thinking``
+    # comes from the server-level config (upstream behaviour) so that the
+    # ``--enable-thinking`` CLI flag still works when the request omits it.
+    template_kwargs = getattr(request, "chat_template_kwargs", None) or {}
+
+    def _pick(name: str, default):
+        if isinstance(template_kwargs, dict) and name in template_kwargs:
+            return template_kwargs[name]
+        return _request_field_or_default(request, name, default)
+
     args = GenerationArguments(
         max_tokens=max_tokens,
         temperature=getattr(request, "temperature", DEFAULT_TEMPERATURE),
@@ -136,10 +147,10 @@ def _build_gen_args(
             DEFAULT_REPETITION_CONTEXT_SIZE,
         ),
         logit_bias=logit_bias,
-        enable_thinking=enable_thinking,
-        thinking_budget=getattr(request, "thinking_budget", None),
-        thinking_start_token=getattr(request, "thinking_start_token", None),
-        thinking_end_token=getattr(request, "thinking_end_token", None),
+        enable_thinking=bool(_pick("enable_thinking", get_server_enable_thinking())),
+        thinking_budget=_pick("thinking_budget", None),
+        thinking_start_token=_pick("thinking_start_token", None),
+        thinking_end_token=_pick("thinking_end_token", None),
         tenant_id=tenant_id,
     )
     if processor is not None:
@@ -402,6 +413,26 @@ def get_cached_model(
     # Return from cache if already loaded and matches the requested paths
     if runtime.model_cache.get("cache_key") == cache_key:
         print(f"Using cached model: {model_path}, Adapter: {adapter_path}")
+        return (
+            runtime.model_cache["model"],
+            runtime.model_cache["processor"],
+            runtime.model_cache["config"],
+        )
+
+    # Atomic-Chat fork addition: in single-model mode the server is launched
+    # by a desktop app that pre-loads exactly one model and never expects
+    # hot-swap. Clients in the wild pass arbitrary labels (model_id, repo
+    # short-name, etc.) in the `model` field of the request body — without
+    # this guard we would unload and try to fetch them from HF, which 401s
+    # for non-existent / private repos and breaks the whole session. When
+    # `MLX_VLM_SINGLE_MODEL=1` is set, ignore the requested label and keep
+    # serving from the cached model.
+    if os.environ.get("MLX_VLM_SINGLE_MODEL") == "1" and runtime.model_cache:
+        cached_path = runtime.model_cache.get("cache_key", (None,))[0]
+        print(
+            f"Single-model mode: ignoring requested '{model_path}', "
+            f"serving cached '{cached_path}'."
+        )
         return (
             runtime.model_cache["model"],
             runtime.model_cache["processor"],

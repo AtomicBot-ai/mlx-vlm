@@ -1,4 +1,5 @@
 import gc
+import json
 import logging
 import os
 import time
@@ -8,7 +9,7 @@ from dataclasses import dataclass, field
 from queue import Empty as QueueEmpty
 from queue import Queue
 from threading import Event, Lock, Thread
-from typing import Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 import mlx.core as mx
 from fastapi import HTTPException
@@ -49,6 +50,71 @@ DEFAULT_SPECULATIVE_BATCH_COALESCE_MS = 5.0
 DEFAULT_ENABLE_THINKING = False
 METRICS_HISTORY_LIMIT = 100
 METRICS_RECENT_LIMIT = 32
+
+
+def _coerce_eos_to_set(value: Any) -> set[int]:
+    """Normalize a HF-style ``eos_token_id`` field into a ``set[int]``.
+
+    Accepts ``int``, ``list[int]`` (or any iterable of ints), or ``None``.
+    Anything else (including ``str``) is dropped silently — callers always
+    have at least one other source to fall back on.
+    """
+    if value is None:
+        return set()
+    if isinstance(value, bool):
+        # ``bool`` is a subclass of ``int``; reject it to avoid 0/1 sneaking
+        # in as fake token ids.
+        return set()
+    if isinstance(value, int):
+        return {value}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return {int(v) for v in value if isinstance(v, int) and not isinstance(v, bool)}
+    return set()
+
+
+def _collect_stop_tokens(config: Any, processor: Any, model_path: str) -> set[int]:
+    """Aggregate EOS token ids from all canonical HF sources.
+
+    VLM wrappers (Qwen3.5, Gemma3-VLM, ...) keep ``eos_token_id`` inside
+    ``text_config`` and leave the top-level field as ``None``. Chat-tuned
+    models also publish a separate ``generation_config.json`` with the full
+    chat-stop list (e.g. Gemma 4 ships ``[1, 106, 50]`` covering both the
+    base ``<eos>`` and ``<end_of_turn>``).
+
+    Sources merged in this order — none mandatory, all union'd:
+
+      1. ``config.eos_token_id``              # legacy / non-VLM
+      2. ``config.text_config.eos_token_id``  # VLM wrappers
+      3. ``processor.tokenizer.eos_token_id`` # chat-aware EOS, most reliable
+      4. ``<model_path>/generation_config.json::eos_token_id``
+                                              # HF standard for chat models
+    """
+    stop_tokens: set[int] = set()
+
+    stop_tokens |= _coerce_eos_to_set(getattr(config, "eos_token_id", None))
+
+    text_config = getattr(config, "text_config", None)
+    if text_config is not None:
+        stop_tokens |= _coerce_eos_to_set(getattr(text_config, "eos_token_id", None))
+
+    tokenizer = getattr(processor, "tokenizer", processor)
+    stop_tokens |= _coerce_eos_to_set(getattr(tokenizer, "eos_token_id", None))
+
+    gen_cfg_path = os.path.join(model_path, "generation_config.json")
+    if os.path.isfile(gen_cfg_path):
+        try:
+            with open(gen_cfg_path, encoding="utf-8") as f:
+                gen_cfg = json.load(f)
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "Failed to read %s: %s; skipping generation_config EOS source.",
+                gen_cfg_path,
+                exc,
+            )
+        else:
+            stop_tokens |= _coerce_eos_to_set(gen_cfg.get("eos_token_id"))
+
+    return stop_tokens
 
 
 class PromptTooLongError(ValueError):
@@ -774,12 +840,19 @@ class ResponseGenerator:
             self.model_path, self.adapter_path
         )
 
-        stop_tokens = set()
-        if hasattr(config, "eos_token_id"):
-            if isinstance(config.eos_token_id, list):
-                stop_tokens.update(config.eos_token_id)
-            elif config.eos_token_id is not None:
-                stop_tokens.add(config.eos_token_id)
+        # VLM wrappers (Qwen3.5, Gemma3-VLM, ...) keep ``eos_token_id`` only
+        # inside ``text_config``; chat-tuned models also publish a separate
+        # ``generation_config.json`` with the full chat-stop list. Aggregate
+        # all canonical sources so generation actually halts at ``<|im_end|>``
+        # / ``<end_of_turn>`` instead of running into ``max_tokens``.
+        stop_tokens = _collect_stop_tokens(config, processor, self.model_path)
+        if not stop_tokens:
+            logger.warning(
+                "No EOS tokens resolved for %s. Generation will only stop at "
+                "max_tokens. Check config.json / generation_config.json / "
+                "tokenizer_config.json.",
+                self.model_path,
+            )
 
         draft_model = None
         draft_kind = os.environ.get("MLX_VLM_DRAFT_KIND")
