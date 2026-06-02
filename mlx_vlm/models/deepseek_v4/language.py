@@ -1256,6 +1256,11 @@ class LanguageModel(nn.Module):
     ) -> int:
         if isinstance(accepted, int):
             accepted = mx.array([accepted])
+        elif not isinstance(accepted, mx.array):
+            # The MTP batch caller (`speculative/mtp.py::_mtp_rounds_batch`)
+            # hands us a Python list of per-row accepted counts; coerce to an
+            # int32 array so the array ops below (`.max()`, `.tolist()`) work.
+            accepted = mx.array(list(accepted), dtype=mx.int32)
 
         max_a = int(accepted.max().item())
         if gdn_states:
