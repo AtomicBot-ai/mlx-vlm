@@ -41,7 +41,7 @@ from ..speculative.utils import (
 )
 from ..tokenizer_utils import _ServerTokenStreamer, make_streaming_detokenizer
 from ..utils import ThinkingBudgetCriteria, load, prepare_inputs
-from ._chat_templates import GEMMA_CHAT_TEMPLATE
+from ._chat_templates import GEMMA4_UNIFIED_CHAT_TEMPLATE, GEMMA_CHAT_TEMPLATE
 from .runtime import runtime
 
 logger = logging.getLogger("mlx_vlm.server")
@@ -115,6 +115,41 @@ def _collect_stop_tokens(config: Any, processor: Any, model_path: str) -> set[in
         else:
             stop_tokens |= _coerce_eos_to_set(gen_cfg.get("eos_token_id"))
 
+    # Gemma-family chat models declare their end-of-turn control token as a
+    # separate ``eot_token`` string in tokenizer_config.json (Gemma 4's
+    # ``<turn|>`` = 106), which is NOT carried in generation_config's
+    # ``eos_token_id`` (often just ``<eos>`` = 1). Without it the model emits
+    # its turn-end token but generation never halts — endless self-dialogue.
+    # Resolve it via the tokenizer and union it in.
+    tok_cfg_path = os.path.join(model_path, "tokenizer_config.json")
+    if os.path.isfile(tok_cfg_path):
+        try:
+            with open(tok_cfg_path, encoding="utf-8") as f:
+                tok_cfg = json.load(f)
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "Failed to read %s: %s; skipping eot_token stop source.",
+                tok_cfg_path,
+                exc,
+            )
+        else:
+            eot = tok_cfg.get("eot_token")
+            if isinstance(eot, dict):
+                eot = eot.get("content")
+            if isinstance(eot, str) and eot:
+                unk_id = getattr(tokenizer, "unk_token_id", None)
+                try:
+                    eot_id = tokenizer.convert_tokens_to_ids(eot)
+                except Exception:  # noqa: BLE001 - tokenizer impls vary
+                    eot_id = None
+                if (
+                    isinstance(eot_id, int)
+                    and not isinstance(eot_id, bool)
+                    and eot_id >= 0
+                    and eot_id != unk_id
+                ):
+                    stop_tokens.add(eot_id)
+
     return stop_tokens
 
 
@@ -124,10 +159,16 @@ def _collect_stop_tokens(config: Any, processor: Any, model_path: str) -> set[in
 _SUPPRESS_LOGIT_BIAS = -1e9
 
 # Model families whose MLX conversions sometimes ship without a
-# ``chat_template`` and therefore need the embedded Gemma fallback.
-_GEMMA_TEMPLATE_MODEL_TYPES = frozenset(
-    {"gemma3", "gemma3n", "gemma4", "gemma4_unified"}
-)
+# ``chat_template`` and therefore need the embedded Gemma fallback, mapped to
+# the correct turn template. Gemma 2/3/3n use ``<start_of_turn>`` framing;
+# Gemma 4 (both the dense ``gemma4`` and the omni ``gemma4_unified``) use the
+# ``<|turn>`` / ``<turn|>`` unified framing — they are NOT interchangeable.
+_GEMMA_TEMPLATE_BY_TYPE = {
+    "gemma3": GEMMA_CHAT_TEMPLATE,
+    "gemma3n": GEMMA_CHAT_TEMPLATE,
+    "gemma4": GEMMA4_UNIFIED_CHAT_TEMPLATE,
+    "gemma4_unified": GEMMA4_UNIFIED_CHAT_TEMPLATE,
+}
 
 
 def _collect_suppress_tokens(model_path: str) -> set[int]:
@@ -163,18 +204,21 @@ def _maybe_install_gemma_chat_template(processor: Any, config: Any) -> bool:
     Some MLX conversions of Gemma 3 / Gemma 4 (notably the ``gemma4_unified``
     omni build) drop ``chat_template`` from ``tokenizer_config.json``. With no
     template the server falls back to a raw, unframed prompt, so the
-    instruction-tuned model echoes / rambles instead of answering. We assign
-    the published Gemma template (``<start_of_turn>`` framing, emits its own
-    ``bos_token``) to both the processor and its tokenizer, but only when the
-    model is a Gemma family member AND no template is already present (never
-    clobber a real one). Returns ``True`` when a template was installed.
+    instruction-tuned model echoes / rambles (and never stops, since its
+    turn-end token is never emitted). We assign the *family-correct* Gemma
+    template to both the processor and its tokenizer — ``<start_of_turn>``
+    framing for Gemma 2/3/3n, ``<|turn>`` unified framing for Gemma 4 — but
+    only when the model is a known Gemma family member AND no template is
+    already present (never clobber a real one). Returns ``True`` when a
+    template was installed.
     """
     model_type = None
     if isinstance(config, dict):
         model_type = config.get("model_type")
     else:
         model_type = getattr(config, "model_type", None)
-    if model_type not in _GEMMA_TEMPLATE_MODEL_TYPES:
+    template = _GEMMA_TEMPLATE_BY_TYPE.get(model_type)
+    if template is None:
         return False
 
     tokenizer = getattr(processor, "tokenizer", None)
@@ -189,7 +233,7 @@ def _maybe_install_gemma_chat_template(processor: Any, config: Any) -> bool:
         if target is None:
             continue
         try:
-            target.chat_template = GEMMA_CHAT_TEMPLATE
+            target.chat_template = template
             installed = True
         except (AttributeError, TypeError):
             # Some processor/tokenizer objects expose ``chat_template`` as a
