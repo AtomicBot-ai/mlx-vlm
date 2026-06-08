@@ -41,6 +41,7 @@ from ..speculative.utils import (
 )
 from ..tokenizer_utils import _ServerTokenStreamer, make_streaming_detokenizer
 from ..utils import ThinkingBudgetCriteria, load, prepare_inputs
+from ._chat_templates import GEMMA_CHAT_TEMPLATE
 from .runtime import runtime
 
 logger = logging.getLogger("mlx_vlm.server")
@@ -115,6 +116,92 @@ def _collect_stop_tokens(config: Any, processor: Any, model_path: str) -> set[in
             stop_tokens |= _coerce_eos_to_set(gen_cfg.get("eos_token_id"))
 
     return stop_tokens
+
+
+# Logit offset large enough to drive a suppressed token's softmax probability to
+# ~0 across the temperature range we serve, while staying finite (avoids the
+# NaN risk of ``-inf`` after temperature division).
+_SUPPRESS_LOGIT_BIAS = -1e9
+
+# Model families whose MLX conversions sometimes ship without a
+# ``chat_template`` and therefore need the embedded Gemma fallback.
+_GEMMA_TEMPLATE_MODEL_TYPES = frozenset(
+    {"gemma3", "gemma3n", "gemma4", "gemma4_unified"}
+)
+
+
+def _collect_suppress_tokens(model_path: str) -> set[int]:
+    """Read ``generation_config.json::suppress_tokens`` for a model.
+
+    Omni / multimodal Gemma 4 builds publish a ``suppress_tokens`` list (the
+    image/audio soft-token ids, e.g. ``[258883, 258882]``) that must never be
+    sampled into text output. Upstream's server only mines this file for
+    ``eos_token_id``; without honouring ``suppress_tokens`` those control
+    tokens leak into the response (rendered as ``<image>`` / ``<audio>``). We
+    apply them as a default ``logit_bias`` on every request.
+    """
+    gen_cfg_path = os.path.join(model_path, "generation_config.json")
+    if not os.path.isfile(gen_cfg_path):
+        return set()
+    try:
+        with open(gen_cfg_path, encoding="utf-8") as f:
+            gen_cfg = json.load(f)
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            "Failed to read %s: %s; skipping suppress_tokens.", gen_cfg_path, exc
+        )
+        return set()
+    value = gen_cfg.get("suppress_tokens")
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        return set()
+    return {int(v) for v in value if isinstance(v, int) and not isinstance(v, bool)}
+
+
+def _maybe_install_gemma_chat_template(processor: Any, config: Any) -> bool:
+    """Install the canonical Gemma turn template when a model ships without one.
+
+    Some MLX conversions of Gemma 3 / Gemma 4 (notably the ``gemma4_unified``
+    omni build) drop ``chat_template`` from ``tokenizer_config.json``. With no
+    template the server falls back to a raw, unframed prompt, so the
+    instruction-tuned model echoes / rambles instead of answering. We assign
+    the published Gemma template (``<start_of_turn>`` framing, emits its own
+    ``bos_token``) to both the processor and its tokenizer, but only when the
+    model is a Gemma family member AND no template is already present (never
+    clobber a real one). Returns ``True`` when a template was installed.
+    """
+    model_type = None
+    if isinstance(config, dict):
+        model_type = config.get("model_type")
+    else:
+        model_type = getattr(config, "model_type", None)
+    if model_type not in _GEMMA_TEMPLATE_MODEL_TYPES:
+        return False
+
+    tokenizer = getattr(processor, "tokenizer", None)
+    has_template = getattr(processor, "chat_template", None) is not None or (
+        tokenizer is not None and getattr(tokenizer, "chat_template", None) is not None
+    )
+    if has_template:
+        return False
+
+    installed = False
+    for target in (processor, tokenizer):
+        if target is None:
+            continue
+        try:
+            target.chat_template = GEMMA_CHAT_TEMPLATE
+            installed = True
+        except (AttributeError, TypeError):
+            # Some processor/tokenizer objects expose ``chat_template`` as a
+            # read-only property; setting it on the other target is enough.
+            continue
+    if installed:
+        logger.warning(
+            "Model %r ships no chat_template; installed the canonical Gemma "
+            "turn template as a fallback so chat is framed correctly.",
+            model_type,
+        )
+    return installed
 
 
 class PromptTooLongError(ValueError):
@@ -796,6 +883,7 @@ class ResponseGenerator:
         self.processor = None
         self.config = None
         self.stop_tokens = set()
+        self.suppress_tokens: set[int] = set()
         self.vision_cache = vision_cache
         self.draft_model = None
         self.kv_bits = kv_bits
@@ -839,6 +927,12 @@ class ResponseGenerator:
         model, processor, config = load_model_resources(
             self.model_path, self.adapter_path
         )
+
+        # Gemma 3 / Gemma 4 MLX conversions occasionally drop the chat_template
+        # from tokenizer_config.json. Install the canonical Gemma turn template
+        # before first use so chat prompts are framed (otherwise the model gets
+        # raw text and echoes / rambles). No-op when a real template exists.
+        _maybe_install_gemma_chat_template(processor, config)
 
         # VLM wrappers (Qwen3.5, Gemma3-VLM, ...) keep ``eos_token_id`` only
         # inside ``text_config``; chat-tuned models also publish a separate
@@ -892,6 +986,9 @@ class ResponseGenerator:
         self.processor = processor
         self.config = config
         self.stop_tokens = stop_tokens
+        # Control tokens (image/audio soft tokens) the model asks us never to
+        # emit; applied as a default logit_bias on every request below.
+        self.suppress_tokens = _collect_suppress_tokens(self.model_path)
         self.draft_model = draft_model
         self.draft_kind = draft_kind
         self.tokenizer = (
@@ -966,8 +1063,17 @@ class ResponseGenerator:
     def _make_logits_processors(
         self, args: GenerationArguments
     ) -> List[Callable[[mx.array, mx.array], mx.array]]:
+        logit_bias = args.logit_bias
+        if self.suppress_tokens:
+            # Force the model's ``suppress_tokens`` (image/audio soft tokens)
+            # toward zero probability on every request. ``setdefault`` keeps any
+            # explicit per-token bias the caller already supplied.
+            merged = dict(logit_bias) if logit_bias else {}
+            for token_id in self.suppress_tokens:
+                merged.setdefault(token_id, _SUPPRESS_LOGIT_BIAS)
+            logit_bias = merged
         processors = make_logits_processors(
-            args.logit_bias,
+            logit_bias,
             args.repetition_penalty,
             args.repetition_context_size,
             args.presence_penalty,
