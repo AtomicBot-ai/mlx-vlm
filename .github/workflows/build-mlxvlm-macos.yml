@@ -71,6 +71,30 @@ jobs:
           pip install pyinstaller
           pip install -e .
 
+      - name: Verify transformers is torch-free for Gemma4
+        run: |
+          # Regression guard: transformers < 5.9.0 unconditionally `import torch`
+          # inside the Gemma4 image processor, which crashes the torch-free MLX
+          # runtime (ModuleNotFoundError: No module named 'torch'). 5.9.0+ guards
+          # the import behind is_vision_available() and falls back to the PIL
+          # processor. Fail the build before we ship another broken binary.
+          python - <<'PY'
+          import transformers
+          from packaging.version import Version
+
+          ver = Version(transformers.__version__)
+          assert ver >= Version("5.9.0"), (
+              f"transformers {transformers.__version__} is too old; "
+              "Gemma4 processor will require torch. Need >= 5.9.0."
+          )
+          # Importing the Gemma4 processor reproduces the exact failing path; if
+          # it pulls in torch (absent in the MLX runtime) this raises
+          # ModuleNotFoundError and fails the build here instead of at runtime.
+          from transformers.models.gemma4 import processing_gemma4  # noqa: F401
+
+          print(f"OK: transformers {transformers.__version__}, Gemma4 processor imports cleanly")
+          PY
+
       - name: Build with PyInstaller
         run: |
           # NOTE: --onefile keeps drop-in compatibility with the previous
