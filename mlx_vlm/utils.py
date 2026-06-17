@@ -575,6 +575,20 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                     model_class.AudioModel, weights, model_config.audio_config
                 )
 
+    # Drop vestigial K/V projections for KV-shared layers that the current
+    # architecture no longer instantiates. Older conversions (incl.
+    # already-MLX-format gemma-4 checkpoints, for which the sanitize block above
+    # is skipped) still carry these weights and would otherwise fail strict load.
+    language_model = getattr(model, "language_model", None)
+    if language_model is not None and hasattr(
+        language_model, "_is_unused_shared_kv_weight"
+    ):
+        weights = {
+            k: v
+            for k, v in weights.items()
+            if not language_model._is_unused_shared_kv_weight(k)
+        }
+
     if not has_quantization:
         quantization_config = config.get("quantization_config", None)
         if quantization_config is None:
