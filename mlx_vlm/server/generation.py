@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from queue import Empty as QueueEmpty
 from queue import Queue
 from threading import Event, Lock, Thread
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, Generator, List, Optional, Tuple
 
 import mlx.core as mx
 from fastapi import HTTPException
@@ -29,9 +29,12 @@ from ..generate import (
     DEFAULT_THINKING_START_TOKEN,
     DEFAULT_TOP_P,
     BatchGenerator,
+    _chunked_prefill_enabled,
     _make_cache,
     _merge_prefill_prompt_kwargs,
 )
+from ..generate.common import generation_stream, wired_limit
+from ..generate.diffusion import diffusion_generation_family, stream_diffusion_generate
 from ..sample_utils import top_p_sampling
 from ..speculative.utils import (
     make_speculative_prompt_cache,
@@ -39,6 +42,7 @@ from ..speculative.utils import (
     speculative_hidden_state,
     speculative_prefill_kwargs,
 )
+from ..structured import ThinkingAwareLogitsProcessor
 from ..tokenizer_utils import _ServerTokenStreamer, make_streaming_detokenizer
 from ..utils import ThinkingBudgetCriteria, load, prepare_inputs
 from ._chat_templates import GEMMA4_UNIFIED_CHAT_TEMPLATE, GEMMA_CHAT_TEMPLATE
@@ -302,6 +306,93 @@ def get_speculative_batch_coalesce_s():
         return DEFAULT_SPECULATIVE_BATCH_COALESCE_MS / 1000.0
 
 
+def _sequence_aligned_prefill_keys(
+    prompt_kwargs: dict, *, batch_size: int, sequence_length: int
+) -> List[str]:
+    return [
+        k
+        for k, v in (prompt_kwargs or {}).items()
+        if isinstance(v, mx.array)
+        and v.ndim >= 2
+        and v.shape[0] == batch_size
+        and v.shape[1] == sequence_length
+    ]
+
+
+def _slice_prefill_kwargs(prompt_kwargs: dict, keys: List[str], n: int) -> dict:
+    if not keys:
+        return prompt_kwargs
+    out = dict(prompt_kwargs)
+    for key in keys:
+        if key in out:
+            out[key] = out[key][:, :n, ...]
+    return out
+
+
+def _drop_prefill_kwargs(prompt_kwargs: dict, keys: List[str], n: int) -> dict:
+    if not keys:
+        return prompt_kwargs
+    out = dict(prompt_kwargs)
+    for key in keys:
+        if key in out:
+            out[key] = out[key][:, n:, ...]
+    return out
+
+
+def _run_chunked_speculative_prefill(
+    lm,
+    input_ids: mx.array,
+    inputs_embeds: mx.array,
+    prompt_cache,
+    prompt_kwargs: dict,
+    speculative_kwargs: dict,
+    *,
+    prefill_step_size: Optional[int],
+    generation_stream,
+) -> Tuple[object, mx.array]:
+    """Prefill target cache in chunks, capturing speculative state only at end."""
+    remaining_input_ids = input_ids
+    remaining_embeds = inputs_embeds
+    remaining_kwargs = dict(prompt_kwargs or {})
+    sequence_keys = _sequence_aligned_prefill_keys(
+        remaining_kwargs,
+        batch_size=input_ids.shape[0],
+        sequence_length=inputs_embeds.shape[1],
+    )
+
+    if (
+        prefill_step_size is not None
+        and prefill_step_size > 0
+        and remaining_embeds.shape[1] > prefill_step_size
+    ):
+        while remaining_embeds.shape[1] > 1:
+            n_to_process = min(prefill_step_size, remaining_embeds.shape[1] - 1)
+            chunk_kwargs = _slice_prefill_kwargs(
+                remaining_kwargs, sequence_keys, n_to_process
+            )
+            with mx.stream(generation_stream):
+                lm(
+                    remaining_input_ids[:, :n_to_process],
+                    cache=prompt_cache,
+                    inputs_embeds=remaining_embeds[:, :n_to_process],
+                    n_to_process=n_to_process,
+                    **chunk_kwargs,
+                )
+            mx.eval([c.state for c in prompt_cache])
+            remaining_input_ids = remaining_input_ids[:, n_to_process:]
+            remaining_embeds = remaining_embeds[:, n_to_process:]
+            remaining_kwargs = _drop_prefill_kwargs(
+                remaining_kwargs, sequence_keys, n_to_process
+            )
+            mx.clear_cache()
+
+    final_kwargs = {**remaining_kwargs, **speculative_kwargs}
+    final_kwargs["inputs_embeds"] = remaining_embeds
+    with mx.stream(generation_stream):
+        out = lm(remaining_input_ids, cache=prompt_cache, **final_kwargs)
+    return out, remaining_input_ids
+
+
 def _position_seed(seed: int, row_id: int, position: int) -> int:
     x = (int(seed) ^ 0x9E3779B9) & 0xFFFFFFFF
     x = (x + (int(row_id) + 1) * 0x85EBCA6B) & 0xFFFFFFFF
@@ -387,6 +478,19 @@ def get_server_enable_thinking():
     if raw is None:
         return DEFAULT_ENABLE_THINKING
     return raw.lower() in ("1", "true", "yes", "on")
+
+
+def get_server_thinking_budget():
+    raw = os.environ.get("MLX_VLM_THINKING_BUDGET")
+    return None if raw is None else int(raw)
+
+
+def get_server_thinking_start_token():
+    return os.environ.get("MLX_VLM_THINKING_START_TOKEN")
+
+
+def get_server_thinking_end_token():
+    return os.environ.get("MLX_VLM_THINKING_END_TOKEN")
 
 
 def get_quantized_kv_bits(model: str):
@@ -823,7 +927,11 @@ class GenerationMetrics:
 
 @dataclass
 class StreamingToken:
-    """A single token response during streaming generation."""
+    """A single token response during streaming generation.
+
+    Diffusion models stream block-by-block: one StreamingToken per denoised
+    block, with ``token_count`` carrying the number of tokens in the block.
+    """
 
     text: str
     token: int
@@ -833,6 +941,44 @@ class StreamingToken:
     prompt_tps: Optional[float] = None
     top_logprobs: Optional[List[Tuple[int, float]]] = None
     cached_tokens: int = 0
+    token_count: int = 1
+
+
+def _diffusion_block_chunks(results) -> "Generator[StreamingToken, None, None]":
+    """Group diffusion engine results into block-by-block streaming tokens.
+
+    The diffusion engine emits a canvas's tokens right after that canvas
+    finishes denoising, followed by a block-boundary marker. Each completed
+    block becomes one StreamingToken; the final token carries the finish
+    reason (plus any text flushed by detokenizer finalization).
+    """
+    block_text: List[str] = []
+    last_token = 0
+    emitted_tokens = 0
+    for result in results:
+        if result.is_draft:
+            continue
+        if result.text:
+            block_text.append(result.text)
+        if result.token is not None:
+            last_token = int(result.token)
+        if not result.diffusion_block_complete and not result.finish_reason:
+            continue
+        if result.finish_reason or block_text:
+            token_count = max(result.generation_tokens - emitted_tokens, 0)
+            emitted_tokens = result.generation_tokens
+            yield StreamingToken(
+                text="".join(block_text),
+                token=last_token,
+                logprobs=None,
+                finish_reason=result.finish_reason,
+                peak_memory=result.peak_memory,
+                prompt_tps=result.prompt_tps,
+                token_count=token_count,
+            )
+            block_text = []
+        if result.finish_reason:
+            return
 
 
 class _TokenIterator:
@@ -1105,7 +1251,7 @@ class ResponseGenerator:
         )
 
     def _make_logits_processors(
-        self, args: GenerationArguments
+        self, args: GenerationArguments, input_ids: Optional[mx.array] = None
     ) -> List[Callable[[mx.array, mx.array], mx.array]]:
         logit_bias = args.logit_bias
         if self.suppress_tokens:
@@ -1126,8 +1272,62 @@ class ResponseGenerator:
             args.frequency_context_size,
         )
         if args.logits_processors is not None:
-            processors.extend(args.logits_processors)
+            request_processors = args.logits_processors
+            if input_ids is not None and self._prompt_has_open_thinking(
+                args, input_ids
+            ):
+                request_processors = self._wrap_processors_until_thinking_done(
+                    args, request_processors
+                )
+            processors.extend(request_processors)
         return processors
+
+    def _thinking_token_ids(self, args: GenerationArguments) -> Tuple[int, int]:
+        tokenizer = self.tokenizer
+        thinking_start_token = args.thinking_start_token or DEFAULT_THINKING_START_TOKEN
+        thinking_end_token = args.thinking_end_token or DEFAULT_THINKING_END_TOKEN
+        thinking_start_token_id = tokenizer.encode(
+            thinking_start_token, add_special_tokens=False
+        )[-1]
+        thinking_end_token_id = tokenizer.encode(
+            thinking_end_token, add_special_tokens=False
+        )[-1]
+        return thinking_start_token_id, thinking_end_token_id
+
+    def _prompt_has_open_thinking(
+        self, args: GenerationArguments, input_ids: mx.array
+    ) -> bool:
+        if not args.enable_thinking:
+            return False
+        thinking_start_token_id, thinking_end_token_id = self._thinking_token_ids(args)
+        tokens = input_ids.flatten().tolist()
+        try:
+            last_start = len(tokens) - 1 - tokens[::-1].index(thinking_start_token_id)
+        except ValueError:
+            return False
+        try:
+            last_end = len(tokens) - 1 - tokens[::-1].index(thinking_end_token_id)
+        except ValueError:
+            last_end = -1
+        return last_start > last_end
+
+    def _wrap_processors_until_thinking_done(
+        self,
+        args: GenerationArguments,
+        processors: List[Callable[[mx.array, mx.array], mx.array]],
+    ) -> List[Callable[[mx.array, mx.array], mx.array]]:
+        thinking_start_token = args.thinking_start_token or DEFAULT_THINKING_START_TOKEN
+        thinking_end_token = args.thinking_end_token or DEFAULT_THINKING_END_TOKEN
+        return [
+            ThinkingAwareLogitsProcessor(
+                processor=processor,
+                tokenizer=self.tokenizer,
+                thinking_start_token=thinking_start_token,
+                thinking_end_token=thinking_end_token,
+                enable_thinking=True,
+            )
+            for processor in processors
+        ]
 
     def _make_thinking_budget_criteria(
         self, args: GenerationArguments, input_ids: mx.array
@@ -1137,12 +1337,7 @@ class ResponseGenerator:
         tokenizer = self.tokenizer
         thinking_start_token = args.thinking_start_token or DEFAULT_THINKING_START_TOKEN
         thinking_end_token = args.thinking_end_token or DEFAULT_THINKING_END_TOKEN
-        thinking_start_token_id = tokenizer.encode(
-            thinking_start_token, add_special_tokens=False
-        )[-1]
-        enable_thinking = bool(args.enable_thinking) and (
-            thinking_start_token_id in input_ids.flatten().tolist()
-        )
+        enable_thinking = self._prompt_has_open_thinking(args, input_ids)
         return ThinkingBudgetCriteria(
             tokenizer=tokenizer,
             thinking_budget=args.thinking_budget,
@@ -1236,6 +1431,13 @@ class ResponseGenerator:
             return
 
         self._ready.set()
+
+        # Diffusion models cannot run through the AR batch generator; each
+        # family gets its own per-request generator in the diffusion lane.
+        diffusion_family = diffusion_generation_family(self.model)
+        if diffusion_family is not None:
+            self._run_diffusion(diffusion_family)
+            return
 
         if self.draft_model is not None and self.draft_kind != "mtp":
             self._run_speculative()
@@ -1334,7 +1536,9 @@ class ResponseGenerator:
                             [input_ids.squeeze(0).tolist()],
                             max_tokens=args.max_tokens,
                             prompt_kwargs=[gen_kwargs],
-                            logits_processors=[self._make_logits_processors(args)],
+                            logits_processors=[
+                                self._make_logits_processors(args, input_ids)
+                            ],
                             thinking_budget_criteria=[thinking_budget_criteria],
                         )
                     except Exception as e:
@@ -1373,6 +1577,195 @@ class ResponseGenerator:
 
         if batch_gen is not None and callable(getattr(batch_gen, "close", None)):
             batch_gen.close()
+
+    def _run_diffusion(self, family: str):
+        """GPU thread loop for diffusion models.
+
+        Diffusion generation runs one request at a time (batch size 1).
+        Output streams back block-by-block: one queue item per denoised
+        block, plus a final item carrying the finish reason. Non-streaming
+        endpoints aggregate the same items into a single response.
+        """
+        generate_request = (
+            self._generate_diffusion
+            if family == "block"
+            else self._generate_masked_diffusion
+        )
+        uid_counter = 0
+        cancelled: set = set()
+        while not self._stop:
+            try:
+                new_items, should_stop = self._collect_pending_requests(active=False)
+                if should_stop:
+                    break
+                cancelled |= self._drain_cancellations()
+                for rqueue, raw_inputs, prompt_tokens, args, _images in new_items:
+                    uid_counter += 1
+                    uid = uid_counter
+                    rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
+                    try:
+                        generate_request(uid, rqueue, raw_inputs, args, cancelled)
+                        rqueue.put(None)
+                    except Exception as e:
+                        logger.exception("Error in diffusion generation")
+                        try:
+                            rqueue.put(e)
+                            rqueue.put(None)
+                        except Exception:
+                            pass
+                    mx.clear_cache()
+            except Exception:
+                logger.exception("Error in diffusion generation thread")
+                mx.clear_cache()
+                gc.collect()
+
+    def _generate_diffusion(self, uid, rqueue, raw_inputs, args, cancelled):
+        if args.logits_processors is not None:
+            raise ValueError(
+                "Structured response_format is not supported with diffusion models."
+            )
+        if args.seed is not None:
+            mx.random.seed(args.seed)
+
+        input_ids = raw_inputs.get("input_ids")
+        if input_ids is not None and input_ids.ndim == 1:
+            input_ids = input_ids[None]
+        tokenizer = self.tokenizer
+        if hasattr(tokenizer, "stopping_criteria"):
+            tokenizer.stopping_criteria.reset(self.config.eos_token_id)
+
+        results = stream_diffusion_generate(
+            self.model,
+            self.processor,
+            tokenizer,
+            input_ids,
+            raw_inputs.get("pixel_values"),
+            raw_inputs.get("attention_mask"),
+            max_tokens=args.max_tokens,
+            temperature=args.temperature,
+            skip_special_token_ids=set(
+                getattr(tokenizer, "all_special_ids", None) or []
+            ),
+            mm_token_type_ids=raw_inputs.get("mm_token_type_ids"),
+        )
+        try:
+            with wired_limit(self.model, [generation_stream]):
+                for chunk in _diffusion_block_chunks(results):
+                    rqueue.put(chunk)
+                    if chunk.finish_reason:
+                        break
+                    cancelled |= self._drain_cancellations()
+                    if uid in cancelled:
+                        cancelled.discard(uid)
+                        break
+        finally:
+            results.close()
+
+    def _generate_masked_diffusion(self, uid, rqueue, raw_inputs, args, cancelled):
+        """Generate with a masked-diffusion text model (llada, nemotron).
+
+        The model's own blocking generate loop runs the diffusion; an
+        ``on_block`` callback streams each completed block back as one
+        StreamingToken (models without the hook fall back to a single final
+        chunk).
+        """
+        if args.logits_processors is not None:
+            raise ValueError(
+                "Structured response_format is not supported with diffusion models."
+            )
+        if args.seed is not None:
+            mx.random.seed(args.seed)
+
+        input_ids = raw_inputs.get("input_ids")
+        if input_ids is not None and input_ids.ndim == 1:
+            input_ids = input_ids[None]
+        tokenizer = self.tokenizer
+        if hasattr(tokenizer, "stopping_criteria"):
+            tokenizer.stopping_criteria.reset(self.config.eos_token_id)
+
+        config = self.config
+        gen_stats: dict = {}
+        emitted_text = ""
+        emitted_tokens = 0
+
+        def flush(tokens, finish_reason=None):
+            nonlocal emitted_text, emitted_tokens
+            text = tokenizer.decode(tokens, skip_special_tokens=True) if tokens else ""
+            if text.startswith(emitted_text):
+                delta = text[len(emitted_text) :]
+            elif not emitted_text:
+                delta = text
+            else:
+                # Retokenization changed already-emitted text; nothing safe
+                # to stream for this block. The final flush resyncs.
+                delta = "" if finish_reason is None else text
+            if not delta and not finish_reason:
+                return
+            prompt_time = gen_stats.get("prompt_time") or 0.0
+            rqueue.put(
+                StreamingToken(
+                    text=delta,
+                    token=tokens[-1] if tokens else 0,
+                    logprobs=None,
+                    finish_reason=finish_reason,
+                    peak_memory=mx.get_peak_memory() / 1e9,
+                    prompt_tps=(
+                        input_ids.size / prompt_time if prompt_time > 0 else None
+                    ),
+                    token_count=max(len(tokens) - emitted_tokens, 0),
+                )
+            )
+            if text.startswith(emitted_text):
+                emitted_text = text
+            emitted_tokens = max(len(tokens), emitted_tokens)
+
+        def on_block(tokens):
+            flush(tokens)
+            cancelled.update(self._drain_cancellations())
+            if uid in cancelled:
+                cancelled.discard(uid)
+                return False
+            return True
+
+        # Sampler knobs resolve as: config default_diffusion_* attribute >
+        # the model generate()'s own reference defaults (omitted here).
+        tuned_kwargs = {}
+        for key, config_attr in (
+            ("threshold", "default_diffusion_threshold"),
+            ("min_threshold", "default_diffusion_min_threshold"),
+            ("editing_threshold", "default_diffusion_editing_threshold"),
+            ("num_to_transfer", "default_diffusion_num_to_transfer"),
+            ("max_transfer_per_step", "default_diffusion_max_transfer_per_step"),
+            ("max_post_steps", "default_diffusion_max_post_steps"),
+            ("stability_steps", "default_diffusion_stability_steps"),
+        ):
+            value = getattr(config, config_attr, None)
+            if value is not None:
+                tuned_kwargs[key] = value
+
+        with wired_limit(self.model, [generation_stream]):
+            generated = self.model.language_model.generate(
+                input_ids,
+                temperature=args.temperature,
+                block_length=getattr(config, "default_block_length", None) or 32,
+                steps=getattr(config, "default_diffusion_steps", None) or 32,
+                gen_length=args.max_tokens,
+                top_p=(None if args.top_p is None or args.top_p >= 1.0 else args.top_p),
+                eos_early_stop=True,
+                visualize=False,
+                tokenizer=tokenizer,
+                skip_special_tokens=True,
+                stats=gen_stats,
+                on_block=on_block,
+                **tuned_kwargs,
+            )
+            mx.eval(generated)
+
+        tokens = generated[0].tolist()
+        finish_reason = (
+            "stop" if tokens and tokenizer.stopping_criteria(tokens[-1]) else "length"
+        )
+        flush(tokens, finish_reason=finish_reason)
 
     def _run_speculative(self):
         """GPU thread loop with DFlash, EAGLE-3, or MTP speculative decoding.
@@ -1464,12 +1857,30 @@ class ResponseGenerator:
                     make_cache=_make_cache,
                 )
 
-                lm_call_kwargs = {**prefill_kwargs, **prompt_kwargs}
-                lm_call_kwargs["inputs_embeds"] = inputs_embeds_mx
+                prefill_step_size = get_prefill_step_size()
+                policy_kwargs = {**prompt_kwargs, **prefill_kwargs}
+                if not _chunked_prefill_enabled(
+                    self.model,
+                    input_ids=input_mx,
+                    inputs_embeds=inputs_embeds_mx,
+                    prompt_cache=prompt_cache,
+                    draft_model=drafter,
+                    draft_kind=draft_kind,
+                    prefill_kwargs=policy_kwargs,
+                ):
+                    prefill_step_size = None
 
                 prompt_started = time.perf_counter()
-                with mx.stream(generation_stream):
-                    out = lm(input_mx, cache=prompt_cache, **lm_call_kwargs)
+                out, input_mx = _run_chunked_speculative_prefill(
+                    lm,
+                    input_mx,
+                    inputs_embeds_mx,
+                    prompt_cache,
+                    prompt_kwargs,
+                    prefill_kwargs,
+                    prefill_step_size=prefill_step_size,
+                    generation_stream=generation_stream,
+                )
                 hidden = speculative_hidden_state(draft_kind, out)
                 shared_kv_states = out.shared_kv_states if is_mtp else None
                 sample_row_ids = [0] * B

@@ -1,3 +1,4 @@
+import importlib
 import inspect
 import threading
 import unittest
@@ -275,6 +276,45 @@ class TestModels(unittest.TestCase):
 
         cache = model.make_cache()
         self.assertEqual(type(cache[0]).__name__, "ArraysCache")
+        self.assertEqual(type(cache[1]).__name__, "KVCache")
+
+    def test_cohere2_moe_language_model(self):
+        from mlx_vlm.models import cohere2_moe
+
+        config = cohere2_moe.ModelConfig(
+            model_type="cohere2_moe",
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            layer_norm_eps=1e-5,
+            sliding_window=8,
+            layer_types=["sliding_attention", "full_attention"],
+            num_experts=4,
+            num_experts_per_tok=2,
+            norm_topk_prob=True,
+            moe_num_shared_experts=1,
+            logit_scale=1.0,
+        )
+
+        model = cohere2_moe.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.model_type,
+            config.vocab_size,
+            config.num_hidden_layers,
+        )
+
+        inputs = mx.array([[1, 2, 3]])
+        embeddings = model.get_input_embeddings(inputs)
+        self.assertEqual(embeddings.inputs_embeds.shape, (1, 3, config.hidden_size))
+
+        cache = model.make_cache()
+        self.assertEqual(type(cache[0]).__name__, "RotatingKVCache")
         self.assertEqual(type(cache[1]).__name__, "KVCache")
 
     def test_lfm2_moe_sanitize_stacks_experts(self):
@@ -742,6 +782,81 @@ class TestModels(unittest.TestCase):
             config.vision_config.num_channels,
             (config.vision_config.image_size, config.vision_config.image_size),
         )
+
+    def test_locateanything(self):
+        from mlx_vlm.models import locateanything
+
+        text_config = locateanything.TextConfig(
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            vocab_size=128,
+            rms_norm_eps=1e-6,
+            rope_theta=1000000.0,
+            max_position_embeddings=512,
+            tie_word_embeddings=True,
+        )
+
+        vision_config = locateanything.VisionConfig(
+            hidden_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            intermediate_size=64,
+            patch_size=14,
+            init_pos_emb_height=8,
+            init_pos_emb_width=8,
+            num_channels=3,
+            merge_kernel_size=[2, 2],
+        )
+
+        config = locateanything.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            image_token_index=5,
+            vocab_size=128,
+        )
+
+        model = locateanything.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        model = locateanything.Model(config)
+        pixels = mx.random.uniform(shape=(16, 14, 14, 3))
+        image_features = model.vision_tower(
+            pixels,
+            grid_thw=mx.array([[4, 4]]),
+            grid_shapes=[(4, 4)],
+        )
+        self.assertEqual(len(image_features), 1)
+        self.assertEqual(image_features[0].shape, (4, 4, 32))
+
+        projected = model.multi_modal_projector(image_features)
+        self.assertEqual(projected.shape, (4, 64))
+
+        input_ids = mx.array([[5, 5, 5, 5, 1, 2, 3]])
+        pixel_values = mx.random.uniform(shape=(16, 3, 14, 14))
+        embeddings = model.get_input_embeddings(
+            input_ids,
+            pixel_values=pixel_values,
+            image_grid_hws=mx.array([[4, 4]]),
+            _grid_shapes=[(4, 4)],
+        )
+        self.assertEqual(embeddings.inputs_embeds.shape, (1, 7, 64))
+
+        out = model(
+            input_ids,
+            pixel_values=pixel_values,
+            image_grid_hws=mx.array([[4, 4]]),
+            _grid_shapes=[(4, 4)],
+        )
+        self.assertEqual(out.logits.shape, (1, 7, 128))
 
     def test_smolvlm_text_config_infers_heads_from_head_dim(self):
         from mlx_vlm.models import smolvlm
@@ -1708,6 +1823,28 @@ class TestModels(unittest.TestCase):
                 )
                 self.assertEqual(explicit.eos_token_id, 248046)
 
+    def test_phi3_v_model_config_uses_chat_control_eos_token_ids(self):
+        from mlx_vlm.models import phi3_v
+
+        config = phi3_v.ModelConfig.from_dict(
+            {
+                "model_type": "phi3_v",
+                "vocab_size": 32064,
+                "eos_token_id": 2,
+            }
+        )
+        self.assertEqual(config.eos_token_id, [2, 32000, 32007])
+
+        explicit = phi3_v.ModelConfig(
+            model_type="phi3_v",
+            vocab_size=32064,
+            eos_token_id=[2, 32007, 32000],
+        )
+        self.assertEqual(explicit.eos_token_id, [2, 32007, 32000])
+
+        tiny = phi3_v.ModelConfig(model_type="phi3_v", vocab_size=1000)
+        self.assertIsNone(tiny.eos_token_id)
+
     def test_qwen3_vl_moe(self):
         from mlx_vlm.models import qwen3_vl_moe
 
@@ -1821,6 +1958,209 @@ class TestModels(unittest.TestCase):
         self._assert_mrope_decode_uses_cache_idx(
             model.language_model, config.text_config.hidden_size
         )
+
+    def test_qwen3_vl_deepstack_mask_aligned_on_decode(self):
+        from mlx_vlm.models import qwen3_vl, qwen3_vl_moe
+
+        cases = [
+            (
+                qwen3_vl,
+                qwen3_vl.TextConfig(
+                    model_type="qwen3_vl_text",
+                    hidden_size=8,
+                    num_hidden_layers=1,
+                    intermediate_size=16,
+                    num_attention_heads=2,
+                    num_key_value_heads=1,
+                    rms_norm_eps=1e-5,
+                    head_dim=4,
+                    vocab_size=32,
+                    rope_theta=1000,
+                    max_position_embeddings=1000,
+                    tie_word_embeddings=False,
+                    rope_scaling={"rope_type": "mrope", "mrope_section": [2, 1, 1]},
+                ),
+            ),
+            (
+                qwen3_vl_moe,
+                qwen3_vl_moe.TextConfig(
+                    model_type="qwen3_vl_moe_text",
+                    hidden_size=8,
+                    num_hidden_layers=1,
+                    intermediate_size=16,
+                    num_attention_heads=2,
+                    num_key_value_heads=1,
+                    rms_norm_eps=1e-5,
+                    head_dim=4,
+                    vocab_size=32,
+                    decoder_sparse_step=1,
+                    mlp_only_layers=[],
+                    num_experts_per_tok=1,
+                    num_experts=1,
+                    moe_intermediate_size=8,
+                    rope_theta=1000,
+                    max_position_embeddings=1000,
+                    tie_word_embeddings=False,
+                    rope_scaling={"rope_type": "mrope", "mrope_section": [2, 1, 1]},
+                ),
+            ),
+        ]
+
+        class Recorder(nn.Module):
+            def __init__(self, hidden_size):
+                super().__init__()
+                self.hidden_size = hidden_size
+                self.visual_pos_masks = None
+
+            def __call__(
+                self,
+                inputs,
+                *,
+                visual_pos_masks=None,
+                **kwargs,
+            ):
+                self.visual_pos_masks = visual_pos_masks
+                return mx.zeros(
+                    (inputs.shape[0], inputs.shape[1], self.hidden_size),
+                    dtype=mx.float32,
+                )
+
+        for model_module, text_config in cases:
+            with self.subTest(model_type=text_config.model_type):
+                language_model = model_module.LanguageModel(text_config)
+                recorder = Recorder(text_config.hidden_size)
+                language_model.model = recorder
+                full_visual_mask = mx.array(
+                    [[False, True, True, False, True, False, False]]
+                )
+
+                language_model(
+                    mx.array([[9]]),
+                    inputs_embeds=mx.zeros((1, 1, text_config.hidden_size)),
+                    cache=[SimpleNamespace(offset=5)],
+                    position_ids=mx.zeros((3, 1, 1), dtype=mx.int64),
+                    visual_pos_masks=full_visual_mask,
+                    deepstack_visual_embeds=[
+                        mx.zeros(
+                            (
+                                int(full_visual_mask.sum().item()),
+                                text_config.hidden_size,
+                            )
+                        )
+                    ],
+                )
+
+                self.assertEqual(recorder.visual_pos_masks.shape, (1, 1))
+                self.assertEqual(recorder.visual_pos_masks.tolist(), [[False]])
+
+    def test_qwen3_vl_deepstack_embeds_aligned_on_chunked_prefill(self):
+        """Chunked prefill must realign deepstack embeds per window; otherwise later
+        chunks reuse the first chunk's embeds (offset resets to 0). #856 / #1323."""
+        from types import SimpleNamespace
+
+        from mlx_vlm.models import qwen3_vl, qwen3_vl_moe
+
+        cases = [
+            (
+                qwen3_vl,
+                qwen3_vl.TextConfig(
+                    model_type="qwen3_vl_text",
+                    hidden_size=8,
+                    num_hidden_layers=1,
+                    intermediate_size=16,
+                    num_attention_heads=2,
+                    num_key_value_heads=1,
+                    rms_norm_eps=1e-5,
+                    head_dim=4,
+                    vocab_size=32,
+                    rope_theta=1000,
+                    max_position_embeddings=1000,
+                    tie_word_embeddings=False,
+                    rope_scaling={"rope_type": "mrope", "mrope_section": [2, 1, 1]},
+                ),
+            ),
+            (
+                qwen3_vl_moe,
+                qwen3_vl_moe.TextConfig(
+                    model_type="qwen3_vl_moe_text",
+                    hidden_size=8,
+                    num_hidden_layers=1,
+                    intermediate_size=16,
+                    num_attention_heads=2,
+                    num_key_value_heads=1,
+                    rms_norm_eps=1e-5,
+                    head_dim=4,
+                    vocab_size=32,
+                    decoder_sparse_step=1,
+                    mlp_only_layers=[],
+                    num_experts_per_tok=1,
+                    num_experts=1,
+                    moe_intermediate_size=8,
+                    rope_theta=1000,
+                    max_position_embeddings=1000,
+                    tie_word_embeddings=False,
+                    rope_scaling={"rope_type": "mrope", "mrope_section": [2, 1, 1]},
+                ),
+            ),
+        ]
+
+        class Recorder(nn.Module):
+            def __init__(self, hidden_size):
+                super().__init__()
+                self.hidden_size = hidden_size
+                self.visual_pos_masks = None
+                self.deepstack_visual_embeds = None
+
+            def __call__(
+                self,
+                inputs,
+                *,
+                visual_pos_masks=None,
+                deepstack_visual_embeds=None,
+                **kwargs,
+            ):
+                self.visual_pos_masks = visual_pos_masks
+                self.deepstack_visual_embeds = deepstack_visual_embeds
+                return mx.zeros(
+                    (inputs.shape[0], inputs.shape[1], self.hidden_size),
+                    dtype=mx.float32,
+                )
+
+        H = 8
+        # 10 positions, vision tokens at {1,2,4,5,7}; marker embed row i == i+1.
+        full_mask = mx.array(
+            [[False, True, True, False, True, True, False, True, False, False]]
+        )
+        embeds = mx.concatenate(
+            [mx.full((1, H), float(i + 1)) for i in range(5)], axis=0
+        )
+
+        for model_module, text_config in cases:
+            with self.subTest(model_type=text_config.model_type):
+                language_model = model_module.LanguageModel(text_config)
+                language_model.model = Recorder(H)
+
+                # Second chunk: window [4:7); 2 vision tokens precede it -> embeds[2:4].
+                start, window = 4, 3
+                language_model(
+                    mx.zeros((1, window), dtype=mx.int64),
+                    inputs_embeds=mx.zeros((1, window, H)),
+                    cache=[SimpleNamespace(offset=start)],
+                    position_ids=mx.zeros((3, 1, window), dtype=mx.int64),
+                    visual_pos_masks=full_mask,
+                    deepstack_visual_embeds=[embeds],
+                )
+
+                recorder = language_model.model
+                self.assertEqual(recorder.visual_pos_masks.shape, (1, window))
+                self.assertEqual(
+                    recorder.visual_pos_masks.tolist(), [[True, True, False]]
+                )
+                self.assertEqual(recorder.deepstack_visual_embeds[0].shape, (2, H))
+                self.assertEqual(
+                    recorder.deepstack_visual_embeds[0].tolist(),
+                    embeds[2:4].tolist(),
+                )
 
     def _run_deepstack_multi_image_assertions(self, deepstack_fn):
         """Shared assertions for qwen3_vl / qwen3_vl_moe `_deepstack_process`.
@@ -2191,7 +2531,7 @@ class TestModels(unittest.TestCase):
         # TODO: Add vision test runner for lfm2_vl
         # Rewrite inputs to be defined by the test classes
 
-    def test_lfm2_vl_initializes_projector_layernorm_even_when_disabled(self):
+    def test_lfm2_vl_skips_projector_layernorm_when_disabled(self):
         from mlx_vlm.models import lfm2_vl
 
         text_config = lfm2_vl.TextConfig(layer_types=["full_attention"])
@@ -2203,17 +2543,14 @@ class TestModels(unittest.TestCase):
         )
         model = lfm2_vl.Model(config)
 
-        self.assertIsInstance(model.multi_modal_projector.layer_norm, nn.LayerNorm)
-        self.assertIn("weight", model.multi_modal_projector.layer_norm.parameters())
-        self.assertIn("bias", model.multi_modal_projector.layer_norm.parameters())
+        self.assertIsNotNone(model.multi_modal_projector.layer_norm)
+        self.assertFalse(model.multi_modal_projector.projector_use_layernorm)
+        parameters = model.multi_modal_projector.parameters()
+        self.assertIn("layer_norm", parameters)
 
     def test_lfm2_vl_projector_skips_disabled_layernorm_branch(self):
         from mlx_vlm.models import lfm2_vl
         from mlx_vlm.models.lfm2_vl.lfm2_vl import Lfm2VlMultiModalProjector
-
-        class ExplodingLayerNorm(nn.Module):
-            def __call__(self, x):
-                raise AssertionError("layernorm branch should be disabled")
 
         text_config = lfm2_vl.TextConfig(
             hidden_size=4,
@@ -2232,8 +2569,12 @@ class TestModels(unittest.TestCase):
             projector_use_layernorm=False,
         )
         projector = Lfm2VlMultiModalProjector(config)
-        projector.layer_norm = ExplodingLayerNorm()
 
+        class FailingLayerNorm(nn.Module):
+            def __call__(self, x):
+                raise AssertionError("layer_norm should be skipped")
+
+        projector.layer_norm = FailingLayerNorm()
         output = projector(mx.zeros((1, 1, 1, 2)))
 
         self.assertEqual(output.shape, (1, 1, 1, 4))
@@ -2823,6 +3164,70 @@ class TestModels(unittest.TestCase):
         self.assertEqual(
             output.logits.shape,
             (1, 6, config_with_audio.text_config.vocab_size),
+        )
+
+        shared_text_config = gemma4.TextConfig(
+            model_type="gemma4_text",
+            hidden_size=16,
+            num_hidden_layers=4,
+            intermediate_size=32,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            global_head_dim=8,
+            vocab_size=32,
+            vocab_size_per_layer_input=32,
+            hidden_size_per_layer_input=8,
+            num_kv_shared_layers=2,
+            sliding_window=32,
+            sliding_window_pattern=2,
+        )
+        shared_model = gemma4.Model(
+            gemma4.ModelConfig(
+                text_config=shared_text_config,
+                vision_config=vision_config,
+                model_type="gemma4",
+                vocab_size=config.vocab_size,
+                image_token_id=config.image_token_id,
+                audio_config=None,
+            )
+        )
+
+        weights = shared_model.sanitize(
+            {
+                "model.language_model.layers.1.self_attn.k_proj.weight": mx.zeros(
+                    (8, 16)
+                ),
+                "model.language_model.layers.2.self_attn.k_proj.weight": mx.zeros(
+                    (8, 16)
+                ),
+                "model.language_model.layers.2.self_attn.v_proj.weight": mx.zeros(
+                    (8, 16)
+                ),
+                "model.language_model.layers.2.self_attn.k_norm.weight": mx.zeros((8,)),
+                "model.language_model.layers.2.self_attn.q_proj.weight": mx.zeros(
+                    (16, 16)
+                ),
+                "model.language_model.layers.3.self_attn.v_proj.weight": mx.zeros(
+                    (8, 16)
+                ),
+            }
+        )
+        weights = shared_model.language_model.sanitize(weights)
+
+        self.assertIn("language_model.model.layers.1.self_attn.k_proj.weight", weights)
+        self.assertIn("language_model.model.layers.2.self_attn.q_proj.weight", weights)
+        self.assertNotIn(
+            "language_model.model.layers.2.self_attn.k_proj.weight", weights
+        )
+        self.assertNotIn(
+            "language_model.model.layers.2.self_attn.v_proj.weight", weights
+        )
+        self.assertNotIn(
+            "language_model.model.layers.2.self_attn.k_norm.weight", weights
+        )
+        self.assertNotIn(
+            "language_model.model.layers.3.self_attn.v_proj.weight", weights
         )
 
     def test_gemma4_unified(self):
@@ -5505,6 +5910,54 @@ class TestGetInputEmbeddings(unittest.TestCase):
         )
         self._check_returns_input_embeddings_features(model, "lfm2_vl")
 
+    def test_lfm2_vl_disabled_projector_layernorm_weights_load(self):
+        from mlx_vlm.models import lfm2_vl
+
+        model = lfm2_vl.Model(
+            lfm2_vl.ModelConfig(
+                text_config=lfm2_vl.TextConfig(
+                    model_type="lfm2",
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    num_key_value_heads=2,
+                    vocab_size=32,
+                    layer_types=["full_attention"],
+                    block_dim=16,
+                    block_ff_dim=32,
+                    conv_dim=16,
+                    conv_dim_out=16,
+                ),
+                vision_config=lfm2_vl.VisionConfig(
+                    model_type="lfm2_vl",
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_hidden_layers=1,
+                    num_attention_heads=2,
+                    image_size=28,
+                    patch_size=14,
+                ),
+                model_type="lfm2-vl",
+                projector_hidden_size=16,
+                projector_use_layernorm=False,
+            )
+        )
+
+        self.assertIsNotNone(model.multi_modal_projector.layer_norm)
+        self.assertFalse(model.multi_modal_projector.projector_use_layernorm)
+
+        model.multi_modal_projector.load_weights(
+            [
+                ("layer_norm.weight", mx.ones((64,))),
+                ("layer_norm.bias", mx.zeros((64,))),
+                ("linear_1.weight", mx.ones((16, 64))),
+                ("linear_1.bias", mx.zeros((16,))),
+                ("linear_2.weight", mx.ones((16, 16))),
+                ("linear_2.bias", mx.zeros((16,))),
+            ]
+        )
+
     def test_molmo2_input_embeddings(self):
         from mlx_vlm.models import molmo2
 
@@ -5573,6 +6026,97 @@ class TestGetInputEmbeddings(unittest.TestCase):
             )
         )
         self._check_returns_input_embeddings_features(model, "paddleocr_vl")
+
+    def test_paddleocr_vl_text_only_clears_mrope_state(self):
+        from mlx_vlm.models import paddleocr_vl
+
+        model = paddleocr_vl.Model(
+            paddleocr_vl.ModelConfig(
+                text_config=paddleocr_vl.TextConfig(
+                    model_type="paddleocr_vl",
+                    hidden_size=4,
+                    num_hidden_layers=1,
+                    intermediate_size=8,
+                    num_attention_heads=2,
+                    num_key_value_heads=1,
+                    vocab_size=10,
+                    head_dim=2,
+                ),
+                vision_config=paddleocr_vl.VisionConfig(
+                    model_type="paddleocr_vl",
+                    hidden_size=4,
+                    intermediate_size=8,
+                    num_hidden_layers=1,
+                    num_attention_heads=2,
+                ),
+                model_type="paddleocr_vl",
+                image_token_id=9,
+                vision_start_token_id=8,
+            )
+        )
+
+        model.language_model._position_ids = mx.array([[[0, 1]]], dtype=mx.int32)
+        model.language_model._rope_deltas = mx.array([[4]], dtype=mx.int32)
+
+        model.get_input_embeddings(mx.array([[1, 2]], dtype=mx.int32))
+
+        self.assertIsNone(model.language_model._position_ids)
+        self.assertIsNone(model.language_model._rope_deltas)
+
+    def test_paddleocr_vl_prefill_recomputes_stale_position_ids(self):
+        from mlx_vlm.models import paddleocr_vl
+
+        text_config = paddleocr_vl.TextConfig(
+            model_type="paddleocr_vl",
+            hidden_size=4,
+            num_hidden_layers=1,
+            intermediate_size=8,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            vocab_size=10,
+            head_dim=2,
+        )
+        config = paddleocr_vl.ModelConfig(
+            text_config=text_config,
+            vision_config=paddleocr_vl.VisionConfig(
+                model_type="paddleocr_vl",
+                hidden_size=4,
+                intermediate_size=8,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+            ),
+            model_type="paddleocr_vl",
+            image_token_id=9,
+            vision_start_token_id=8,
+        )
+        lm = paddleocr_vl.LanguageModel(text_config, config)
+
+        captured = {}
+
+        class _CapturingInnerModel:
+            class _Embed:
+                def __call__(self, inputs):
+                    return mx.zeros((inputs.shape[0], inputs.shape[1], 4))
+
+            embed_tokens = _Embed()
+
+            def __call__(self, inputs, inputs_embeds=None, position_ids=None, **kwargs):
+                captured["position_ids"] = position_ids
+                return mx.zeros((inputs.shape[0], inputs.shape[1], 4))
+
+        lm.model = _CapturingInnerModel()
+        lm.lm_head = lambda x: x
+        lm._position_ids = mx.array([[[0, 1, 2]]], dtype=mx.int32)
+        lm._rope_deltas = mx.array([[3]], dtype=mx.int32)
+
+        class _Cache:
+            _idx = 0
+            offset = mx.array(0)
+
+        lm(mx.array([[1, 2], [3, 4]], dtype=mx.int32), cache=[_Cache()])
+
+        self.assertEqual(captured["position_ids"].shape, (3, 2, 2))
+        self.assertEqual(lm._rope_deltas.tolist(), [[0], [0]])
 
     def test_phi3_v_input_embeddings(self):
         from mlx_vlm.models import phi3_v
@@ -6277,6 +6821,98 @@ class TestChunkedPrefillRoPE(unittest.TestCase):
             outputs.logits.shape,
             (1, chunked_input_ids.shape[1], text_config.vocab_size),
         )
+
+
+class TestMultiImageMRoPE(unittest.TestCase):
+    """Regression tests for multi-image prompts in ``get_rope_index``.
+
+    The original M-RoPE port summed all vision-start indices into a single
+    scalar (``mx.sum(mx.where(...))``), so prompts with two or more images
+    mis-counted the image tokens and assigned flat text positions to every
+    image after the first.  qwen3_vl/qwen3_5 received the corrected token
+    scan in the MRoPE refactor; these tests pin the same behavior across
+    every family that shares the implementation.
+    """
+
+    _FAMILIES = [
+        "glm4v",
+        "glm4v_moe",
+        "paddleocr_vl",
+        "qwen2_5_vl",
+        "qwen2_vl",
+        "qwen3_5",
+        "qwen3_omni_moe",
+        "qwen3_vl",
+        "qwen3_vl_moe",
+    ]
+
+    # Prompt layout: text(3 incl. vision_start) | 4 image tokens | text(2 incl.
+    # vision_start) | 4 image tokens | text(1) — two (1, 4, 4) grids at
+    # spatial_merge_size 2, i.e. four merged tokens per image.
+    _INPUT_IDS = [1, 2, 99, 100, 100, 100, 100, 5, 99, 100, 100, 100, 100, 7]
+    _IMAGE_GRID_THW = [[1, 4, 4], [1, 4, 4]]
+
+    # Expected positions follow the HF reference: a text block advances all
+    # three dims together; each image block expands t/h/w over the merged
+    # (1, 2, 2) grid starting one past the previous maximum.
+    _EXPECTED_T = [0, 1, 2, 3, 3, 3, 3, 5, 6, 7, 7, 7, 7, 9]
+    _EXPECTED_H = [0, 1, 2, 3, 3, 4, 4, 5, 6, 7, 7, 8, 8, 9]
+    _EXPECTED_W = [0, 1, 2, 3, 4, 3, 4, 5, 6, 7, 8, 7, 8, 9]
+    _EXPECTED_DELTA = 9 + 1 - len(_INPUT_IDS)
+
+    @staticmethod
+    def _rope_index(family, input_ids, image_grid_thw, attention_mask=None):
+        module = importlib.import_module(f"mlx_vlm.models.{family}.language")
+        stub = SimpleNamespace(
+            config=SimpleNamespace(
+                vision_config=SimpleNamespace(spatial_merge_size=2),
+                image_token_id=100,
+                video_token_id=101,
+                vision_start_token_id=99,
+            )
+        )
+        return module.LanguageModel.get_rope_index(
+            stub,
+            input_ids,
+            image_grid_thw=image_grid_thw,
+            attention_mask=attention_mask,
+        )
+
+    def test_two_image_prompt_positions(self):
+        input_ids = mx.array([self._INPUT_IDS])
+        image_grid_thw = mx.array(self._IMAGE_GRID_THW)
+
+        for family in self._FAMILIES:
+            with self.subTest(model=family):
+                position_ids, deltas = self._rope_index(
+                    family, input_ids, image_grid_thw
+                )
+                self.assertEqual(position_ids.shape, (3, 1, len(self._INPUT_IDS)))
+                self.assertEqual(position_ids[0, 0].tolist(), self._EXPECTED_T)
+                self.assertEqual(position_ids[1, 0].tolist(), self._EXPECTED_H)
+                self.assertEqual(position_ids[2, 0].tolist(), self._EXPECTED_W)
+                self.assertEqual(
+                    int(deltas.reshape(-1)[0].item()), self._EXPECTED_DELTA
+                )
+
+    def test_two_image_prompt_with_left_padding(self):
+        pad = 2
+        input_ids = mx.array([[0] * pad + self._INPUT_IDS])
+        attention_mask = mx.array([[0] * pad + [1] * len(self._INPUT_IDS)])
+        image_grid_thw = mx.array(self._IMAGE_GRID_THW)
+
+        for family in self._FAMILIES:
+            with self.subTest(model=family):
+                position_ids, deltas = self._rope_index(
+                    family, input_ids, image_grid_thw, attention_mask
+                )
+                valid = position_ids[:, 0, pad:]
+                self.assertEqual(valid[0].tolist(), self._EXPECTED_T)
+                self.assertEqual(valid[1].tolist(), self._EXPECTED_H)
+                self.assertEqual(valid[2].tolist(), self._EXPECTED_W)
+                self.assertEqual(
+                    int(deltas.reshape(-1)[0].item()), self._EXPECTED_DELTA
+                )
 
 
 class TestMiniCPMV4_6(unittest.TestCase):

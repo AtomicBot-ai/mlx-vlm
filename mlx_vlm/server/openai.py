@@ -33,6 +33,7 @@ from .generation import (
     _count_prompt_tokens,
 )
 from .responses_state import (
+    ThinkingStreamState,
     _normalize_response_input,
     _response_chain_items,
     _response_items_to_chat,
@@ -93,6 +94,14 @@ _count_thinking_tag_tokens = None
 _make_logprob_content = None
 _AUDIO_REFERENCE_PREFIXES = ("http://", "https://", "file://", "/", "./", "../")
 _AUDIO_REFERENCE_SUFFIXES = (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".webm")
+
+
+def _runtime_cache_get(key, default=None, *, kind=None):
+    cache = runtime.model_cache
+    try:
+        return cache.get(key, default, kind=kind)
+    except TypeError:
+        return cache.get(key, default)
 
 
 def _looks_like_audio_reference(value: str) -> bool:
@@ -350,7 +359,7 @@ async def images_generations_endpoint(request: Request):
         model, _, _ = get_cached_model(
             image_request.model, model_kind="image_generation"
         )
-        generation_lock = runtime.model_cache.get("generation_lock")
+        generation_lock = _runtime_cache_get("generation_lock", kind="image_generation")
 
         def _generate_all():
             results = []
@@ -374,6 +383,13 @@ async def images_generations_endpoint(request: Request):
                         count=image_request.n,
                         seed=seed,
                     )
+                    extra = {}
+                    if image_request.auto_json_caption is not None:
+                        extra["auto_json_caption"] = image_request.auto_json_caption
+                    if image_request.prompt_expansion_model is not None:
+                        extra["prompt_expansion_model"] = (
+                            image_request.prompt_expansion_model
+                        )
                     core_request = CoreImageGenerationRequest(
                         prompt=image_request.prompt,
                         seed=seed,
@@ -382,6 +398,7 @@ async def images_generations_endpoint(request: Request):
                         height=height,
                         guidance=image_request.guidance,
                         output_format=image_request.output_format,
+                        extra=extra,
                     )
                     result = generate_image(
                         model,
@@ -399,6 +416,7 @@ async def images_generations_endpoint(request: Request):
                 height=result.height,
                 seed=result.seed,
                 path=str(result.path) if result.path is not None else None,
+                revised_prompt=result.metadata.get("revised_prompt"),
             )
             if image_request.response_format == "b64_json":
                 item.b64_json = result.to_b64_json()
@@ -472,7 +490,7 @@ async def images_edits_endpoint(request: Request):
     )
     try:
         model, _, _ = get_cached_model(image_request.model, model_kind="image_edit")
-        generation_lock = runtime.model_cache.get("generation_lock")
+        generation_lock = _runtime_cache_get("generation_lock", kind="image_edit")
 
         def _generate_all():
             results = []
@@ -892,7 +910,7 @@ async def responses_endpoint(request: Request):
                             token = await asyncio.to_thread(_next_token_resp_stream)
                             if token is None:
                                 break
-                            output_tokens += 1
+                            output_tokens += getattr(token, "token_count", 1)
                             delta = token.text
                             full_text += delta
                             in_tool_call, delta = suppress_tool_call_content(
@@ -953,6 +971,8 @@ async def responses_endpoint(request: Request):
                             tool_module,
                             chat_tools,
                             tool_registry,
+                            gen_args.thinking_start_token,
+                            gen_args.thinking_end_token,
                         )
                     )
                     tool_output_items = [
@@ -1168,6 +1188,8 @@ async def responses_endpoint(request: Request):
                         tool_module,
                         chat_tools,
                         tool_registry,
+                        gen_args.thinking_start_token,
+                        gen_args.thinking_end_token,
                     )
                 )
                 if output_finish_reason == "tool_calls":
@@ -1352,6 +1374,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 msg["tool_call_id"] = message.tool_call_id
             if message.name is not None:
                 msg["name"] = message.name
+            if message.reasoning is not None:
+                msg["reasoning"] = message.reasoning
 
             processed_messages.append(msg)
 
@@ -1433,23 +1457,20 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                         output_tokens = 0
                         request_id = f"chatcmpl-{uuid.uuid4()}"
-                        # Track thinking state for reasoning/content split.
-                        #
-                        # Atomic-Chat fork: many chat templates (Qwen3, Gemma
-                        # 3/4, GLM 4.5, …) inject the opening `<think>` /
-                        # `<|channel>thought` marker into the *prompt itself*
-                        # as a generation primer, so the model never re-emits
-                        # the opening tag in its streamed output — it just
-                        # writes the chain of thought directly and eventually
-                        # closes with `</think>`. Without seeding `in_thinking`
-                        # from the rendered prompt, the entire CoT leaks into
-                        # `delta.content` and the trailing `</think>` becomes
-                        # visible text to the user.
-                        prompt_tail = (formatted_prompt or "").rstrip()
-                        in_thinking = prompt_tail.endswith(
-                            "<think>"
-                        ) or prompt_tail.endswith("<|channel>thought")
-                        accumulated = ""
+                        # Thinking/content split is handled by upstream's
+                        # ThinkingStreamState, which seeds ``in_thinking`` from
+                        # ``enable_thinking``. This natively covers the
+                        # Atomic-Chat fork case where the chat template primes
+                        # the opening ``<think>`` / ``<|channel>thought`` marker
+                        # into the prompt itself (the model then streams the CoT
+                        # without re-emitting the opening tag): when thinking is
+                        # enabled the state machine already expects to be inside
+                        # a thought and waits for the close marker.
+                        thinking_state = ThinkingStreamState(
+                            gen_args.enable_thinking,
+                            gen_args.thinking_start_token,
+                            gen_args.thinking_end_token,
+                        )
                         full_output = ""  # raw output for tool call parsing
                         # Track tool-call state to suppress markup from content
                         in_tool_call = False
@@ -1466,36 +1487,14 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             token = await asyncio.to_thread(_next_token)
                             if token is None:
                                 break
-                            output_tokens += 1
-                            accumulated += token.text
+                            output_tokens += getattr(token, "token_count", 1)
                             full_output += token.text
                             metrics.record_chunk(token)
 
                             # Detect thinking boundaries
-                            delta_reasoning = None
-                            delta_content = None
-
-                            if not in_thinking and (
-                                "<|channel>thought" in accumulated
-                                or "<think>" in accumulated
-                            ):
-                                in_thinking = True
-                                accumulated = ""
-                                # Don't emit opening tag tokens
-                            elif in_thinking and (
-                                "<channel|>" in accumulated or "</think>" in accumulated
-                            ):
-                                in_thinking = False
-                                accumulated = ""
-                                # Don't emit closing tag tokens
-                            elif in_thinking:
-                                delta_reasoning = token.text
-                            elif not in_thinking and (
-                                "<|channel>" in accumulated or "<think" in accumulated
-                            ):
-                                pass  # Partial tag, don't emit yet
-                            else:
-                                delta_content = token.text
+                            thinking_delta = thinking_state.feed(token.text)
+                            delta_reasoning = thinking_delta.reasoning
+                            delta_content = thinking_delta.content
 
                             # Suppress tool-call markup from content
                             in_tool_call, delta_content = suppress_tool_call_content(
@@ -1519,8 +1518,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                             # Skip empty deltas (e.g. suppressed tool-call tokens)
                             has_payload = (
-                                delta_content is not None
-                                or delta_reasoning is not None
+                                bool(delta_content)
+                                or bool(delta_reasoning)
                                 or chunk_logprobs is not None
                             )
                             if has_payload:
@@ -1604,6 +1603,11 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                         request_id = f"chatcmpl-{uuid.uuid4()}"
                         output_text = ""
+                        thinking_state = ThinkingStreamState(
+                            gen_args.enable_thinking,
+                            gen_args.thinking_start_token,
+                            gen_args.thinking_end_token,
+                        )
                         for chunk in token_iterator:
                             if chunk is None or not hasattr(chunk, "text"):
                                 continue
@@ -1616,11 +1620,14 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             if chunk_finish is not None:
                                 finish_reason = chunk_finish
 
-                            if chunk.text:
+                            thinking_delta = thinking_state.feed(chunk.text)
+                            if thinking_delta.content or thinking_delta.reasoning:
                                 choices = [
                                     ChatStreamChoice(
                                         delta=ChatMessage(
-                                            role="assistant", content=chunk.text
+                                            role="assistant",
+                                            content=thinking_delta.content,
+                                            reasoning=thinking_delta.reasoning,
                                         )
                                     )
                                 ]
@@ -1653,7 +1660,13 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                     metrics_text = full_output or output_text
                     completion_tokens = max(
-                        0, output_tokens - _count_thinking_tag_tokens(metrics_text)
+                        0,
+                        output_tokens
+                        - _count_thinking_tag_tokens(
+                            metrics_text,
+                            gen_args.thinking_start_token,
+                            gen_args.thinking_end_token,
+                        ),
                     )
                     envelope = _build_metrics_envelope(
                         endpoint="/chat/completions",
@@ -1777,7 +1790,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         pt = ctx.prompt_tokens
                         for token in token_iter:
                             text += token.text
-                            gt += 1
+                            gt += getattr(token, "token_count", 1)
                             metrics.record_chunk(token)
                             if request.logprobs and token.finish_reason != "stop":
                                 logprobs.append(
@@ -1822,11 +1835,17 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 mx.clear_cache()
                 gc.collect()
 
-                reasoning, content = _split_thinking(full_text)
+                reasoning, content = _split_thinking(
+                    full_text,
+                    gen_args.thinking_start_token,
+                    gen_args.thinking_end_token,
+                )
 
                 # Count raw generated tokens minus thinking tag tokens
                 completion_tokens = output_tokens - _count_thinking_tag_tokens(
-                    full_text
+                    full_text,
+                    gen_args.thinking_start_token,
+                    gen_args.thinking_end_token,
                 )
 
                 usage_stats = UsageStats.from_metrics(
@@ -1844,7 +1863,11 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     if tc["calls"]:
                         parsed_tool_calls = tc["calls"]
                         # Clean thinking tags and control tokens from remaining text
-                        _, clean_remaining = _split_thinking(tc["remaining_text"] or "")
+                        _, clean_remaining = _split_thinking(
+                            tc["remaining_text"] or "",
+                            gen_args.thinking_start_token,
+                            gen_args.thinking_end_token,
+                        )
                         if clean_remaining:
                             # Strip model control tokens
                             clean_remaining = re.sub(

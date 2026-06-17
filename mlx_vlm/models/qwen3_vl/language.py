@@ -484,8 +484,6 @@ class LanguageModel(nn.Module):
         deepstack_visual_embeds: Optional[mx.array] = None,
         **kwargs,
     ):
-        n_to_process = kwargs.get("n_to_process", None)
-
         position_ids = kwargs.pop("position_ids", None)
         pixel_values = kwargs.pop("pixel_values", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
@@ -506,15 +504,29 @@ class LanguageModel(nn.Module):
             if isinstance(c0.offset, mx.array) and c0.offset.ndim > 0:
                 cache_offset_array = c0.offset
 
-        if n_to_process is not None and visual_pos_masks is not None:
-            # Align the full-prompt visual mask with the current prefill window.
+        if (
+            visual_pos_masks is not None
+            and visual_pos_masks.shape[-1] != inputs.shape[-1]
+        ):
+            # Align the full-prompt visual mask with the current model window.
             if cache_offset_array is None:
                 start = (
                     int(cache_offset.item())
                     if isinstance(cache_offset, mx.array)
                     else int(cache_offset)
                 )
-                visual_pos_masks = visual_pos_masks[:, start : start + inputs.shape[1]]
+                window = inputs.shape[1]
+                # Slice deepstack embeds to this window too; _deepstack_process reads from offset 0.
+                if deepstack_visual_embeds is not None:
+                    n_before = int(visual_pos_masks[:, :start].sum().item())
+                    n_window = int(
+                        visual_pos_masks[:, start : start + window].sum().item()
+                    )
+                    deepstack_visual_embeds = [
+                        embeds[n_before : n_before + n_window]
+                        for embeds in deepstack_visual_embeds
+                    ]
+                visual_pos_masks = visual_pos_masks[:, start : start + window]
             else:
                 rows = []
                 for b in range(visual_pos_masks.shape[0]):
@@ -532,7 +544,11 @@ class LanguageModel(nn.Module):
         if position_ids is None and (rope_mask is None or rope_mask.ndim == 2):
             # Calculate RoPE index once per generation in the pre-fill stage only
             recalc_condition = (
-                (cache is not None and cache[0] is not None and (cache_offset == 0))
+                (
+                    cache is not None
+                    and cache[0] is not None
+                    and (cache_offset_array is None and cache_offset == 0)
+                )
                 or self._rope_deltas is None
                 or cache is None
             )

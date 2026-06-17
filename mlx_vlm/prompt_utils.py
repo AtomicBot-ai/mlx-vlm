@@ -1,3 +1,4 @@
+import inspect
 import json
 from enum import Enum
 from functools import partial
@@ -60,10 +61,12 @@ MODEL_CONFIG = {
     "nemotronh_nano_omni_reasoning_v3": MessageFormat.LIST_WITH_IMAGE_TYPE,
     "kimi_vl": MessageFormat.LIST_WITH_IMAGE,
     "kimi_k25": MessageFormat.LIST_WITH_IMAGE,
+    "locateanything": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "gemma3": MessageFormat.START_IMAGE_TOKEN,
     "gemma3n": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
     "gemma4": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
     "gemma4_unified": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
+    "diffusion_gemma": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
     "llama4": MessageFormat.LIST_WITH_IMAGE,
     "smolvlm": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "llava": MessageFormat.LIST_WITH_IMAGE,
@@ -308,11 +311,12 @@ class MessageFormatter:
             MessageFormat.NUMBERED_IMAGE_TOKENS: self._format_numbered_tokens,
             MessageFormat.PROMPT_ONLY: lambda *args, **kw: prompt,
             MessageFormat.TEXT_ONLY: self._format_text_only,
-            MessageFormat.PROMPT_WITH_IMAGE_TOKEN: lambda *args, **kw: "<image>"
-            * num_images
-            + prompt,
-            MessageFormat.PROMPT_WITH_START_IMAGE_TOKEN: lambda *args, **kw: prompt
-            + "<start_of_image>" * num_images,
+            MessageFormat.PROMPT_WITH_IMAGE_TOKEN: lambda *args, **kw: (
+                "<image>" * num_images + prompt
+            ),
+            MessageFormat.PROMPT_WITH_START_IMAGE_TOKEN: lambda *args, **kw: (
+                prompt + "<start_of_image>" * num_images
+            ),
             MessageFormat.VIDEO_WITH_TEXT: self._format_video_message,
         }
 
@@ -429,7 +433,7 @@ class MessageFormatter:
             content = f"{prefix}{content}" if image_first else f"{content}{prefix}"
 
         if role == "user" and not skip_audio_token and num_audios > 0:
-            audio_prefix = "".join([f"<|audio_{i+1}|>" for i in range(num_audios)])
+            audio_prefix = "".join([f"<|audio_{i + 1}|>" for i in range(num_audios)])
             content = f"{audio_prefix}{content}"
 
         return {"role": role, "content": content}
@@ -455,11 +459,11 @@ class MessageFormatter:
             prefix_parts = []
             if not skip_image_token and num_images > 0:
                 prefix_parts.append(
-                    "".join([f"<|image_{i+1}|>" for i in range(num_images)])
+                    "".join([f"<|image_{i + 1}|>" for i in range(num_images)])
                 )
             if not skip_audio_token and num_audios > 0:
                 prefix_parts.append(
-                    "".join([f"<|audio_{i+1}|>" for i in range(num_audios)])
+                    "".join([f"<|audio_{i + 1}|>" for i in range(num_audios)])
                 )
             if prefix_parts:
                 content = f"{''.join(prefix_parts)}{content}"
@@ -665,6 +669,17 @@ def get_chat_template(
 
     chat_template_override = kwargs.get("chat_template", None)
 
+    def _supports_template_kw(template_processor: Any, name: str) -> bool:
+        try:
+            signature = inspect.signature(template_processor.apply_chat_template)
+        except (TypeError, ValueError):
+            return False
+
+        return name in signature.parameters or any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+
     try:
         template_processor = None
         if (
@@ -697,12 +712,18 @@ def get_chat_template(
         if template_processor is None:
             return _messages_to_plain_prompt()
 
+        template_kwargs = dict(kwargs)
+        if "enable_thinking" not in template_kwargs and _supports_template_kw(
+            template_processor, "enable_thinking"
+        ):
+            template_kwargs["enable_thinking"] = False
+
         try:
             return template_processor.apply_chat_template(
                 messages,
                 tokenize=tokenize,
                 add_generation_prompt=add_generation_prompt,
-                **kwargs,
+                **template_kwargs,
             )
         except ValueError as e:
             if chat_template_override is None and _missing_template_error(e):

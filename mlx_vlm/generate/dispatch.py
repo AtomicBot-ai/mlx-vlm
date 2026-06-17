@@ -52,12 +52,7 @@ DEFAULT_THINKING_END_TOKEN = "</think>"
 DEFAULT_QUANTIZED_KV_START = 5000
 DEFAULT_PREFILL_STEP_SIZE = 2048
 DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH = 64
-DEFAULT_MASKED_DIFFUSION_THRESHOLD = 0.7
-DEFAULT_MASKED_DIFFUSION_EDITING_THRESHOLD = 0.5
-DEFAULT_MASKED_DIFFUSION_MAX_POST_STEPS = 16
-DEFAULT_MASKED_DIFFUSION_NUM_TO_TRANSFER = 1
-DEFAULT_MASKED_DIFFUSION_STABILITY_STEPS = 2
-DEFAULT_MASKED_DIFFUSION_MIN_THRESHOLD = DEFAULT_MASKED_DIFFUSION_THRESHOLD
+DEFAULT_DIFFUSION_MAX_DENOISING_STEPS = 48
 
 
 def parse_arguments():
@@ -109,13 +104,25 @@ def parse_arguments():
         "--seed",
         type=int,
         default=None,
-        help="Seed for image generation/editing. Defaults to a random 32-bit seed.",
+        help=(
+            "PRNG seed for reproducible sampling and diffusion canvas init. "
+            "Image generation/editing defaults to a random 32-bit seed."
+        ),
     )
     parser.add_argument(
         "--guidance",
         type=float,
         default=DEFAULT_IMAGE_GUIDANCE,
         help="Classifier-free guidance for image generation/editing.",
+    )
+    parser.add_argument(
+        "--prompt-expansion-model",
+        type=str,
+        default=None,
+        help=(
+            "Text model path or Hugging Face repo used to expand plain image "
+            "prompts into Ideogram 4 JSON captions."
+        ),
     )
     parser.add_argument(
         "--adapter-path",
@@ -180,7 +187,13 @@ def parse_arguments():
         "--max-denoising-steps",
         type=int,
         default=None,
-        help="Maximum denoising steps for diffusion generation.",
+        help=(
+            "Maximum denoising steps for diffusion generation. "
+            "Default: the checkpoint's generation config (typically "
+            f"{DEFAULT_DIFFUSION_MAX_DENOISING_STEPS}). Adaptive stopping "
+            "usually converges canvases earlier; set lower to hard-cap "
+            "throughput."
+        ),
     )
     parser.add_argument(
         "--block-length",
@@ -236,9 +249,19 @@ def parse_arguments():
         ),
     )
     parser.add_argument(
+        "--diffusion-max-canvas-length",
+        type=int,
+        default=None,
+        help=(
+            "Maximum active canvas length for diffusion generation. Default: the "
+            "checkpoint canvas length; set lower to trade quality for "
+            "throughput."
+        ),
+    )
+    parser.add_argument(
         "--diffusion-sampler",
-        choices=["auto-regressive-euler", "confidence-threshold"],
-        default="auto-regressive-euler",
+        choices=["entropy-bound", "confidence-threshold"],
+        default="entropy-bound",
         help="Canvas update sampler for diffusion generation.",
     )
     parser.add_argument(
@@ -247,7 +270,8 @@ def parse_arguments():
         default=None,
         help=(
             "Token probability threshold for diffusion confidence transfer. "
-            "Default: 0.9 for confidence-threshold sampling, 0.7 for masked text."
+            "Default: 0.9 for confidence-threshold sampling; masked-diffusion "
+            "models use their checkpoint reference defaults."
         ),
     )
     parser.add_argument(
@@ -603,14 +627,13 @@ from .diffusion import (
     DiffusionOutputHandler,
     diffusion_kwargs_from_args,
     is_diffusion_model,
-    print_diffusion_stats,
+    is_masked_diffusion_model,
     stream_diffusion_generate_from_kwargs,
 )
 
 
 def is_masked_diffusion_text_model(model: nn.Module) -> bool:
-    config = getattr(model, "config", None)
-    return getattr(config, "mask_token_id", None) is not None
+    return is_masked_diffusion_model(model)
 
 
 def _use_masked_diffusion_text_path(model: nn.Module, kwargs: Dict[str, Any]) -> bool:
@@ -774,30 +797,26 @@ def stream_generate(
             max_denoising_steps = kwargs.get(
                 "steps", getattr(config, "default_diffusion_steps", 32)
             )
-        num_to_transfer = kwargs.get(
-            "num_to_transfer", DEFAULT_MASKED_DIFFUSION_NUM_TO_TRANSFER
-        )
         config = getattr(model, "config", None)
-        if getattr(config, "default_generation_mode", None) == "ar":
-            threshold = kwargs.get(
-                "threshold", getattr(config, "default_diffusion_threshold", None)
-            )
-            min_threshold = kwargs.get("min_threshold")
-        else:
-            threshold = kwargs.get("threshold", DEFAULT_MASKED_DIFFUSION_THRESHOLD)
-            min_threshold = kwargs.get(
-                "min_threshold", DEFAULT_MASKED_DIFFUSION_MIN_THRESHOLD
-            )
-        editing_threshold = kwargs.get(
-            "editing_threshold", DEFAULT_MASKED_DIFFUSION_EDITING_THRESHOLD
-        )
-        max_transfer_per_step = kwargs.get("max_transfer_per_step")
-        max_post_steps = kwargs.get(
-            "max_post_steps", DEFAULT_MASKED_DIFFUSION_MAX_POST_STEPS
-        )
-        stability_steps = kwargs.get(
-            "stability_steps", DEFAULT_MASKED_DIFFUSION_STABILITY_STEPS
-        )
+        # Sampler knobs resolve as: explicit kwarg > config default_diffusion_*
+        # attribute > the model generate()'s own reference defaults (omitted
+        # here). Forcing shared defaults broke checkpoints whose reference
+        # generation differs (e.g. LLaDA2.0 corrupts with editing enabled).
+        tuned_kwargs = {}
+        for key, config_attr in (
+            ("threshold", "default_diffusion_threshold"),
+            ("min_threshold", "default_diffusion_min_threshold"),
+            ("editing_threshold", "default_diffusion_editing_threshold"),
+            ("num_to_transfer", "default_diffusion_num_to_transfer"),
+            ("max_transfer_per_step", "default_diffusion_max_transfer_per_step"),
+            ("max_post_steps", "default_diffusion_max_post_steps"),
+            ("stability_steps", "default_diffusion_stability_steps"),
+        ):
+            value = kwargs.get(key)
+            if value is None:
+                value = getattr(config, config_attr, None)
+            if value is not None:
+                tuned_kwargs[key] = value
 
         generation_stats = {}
         handled_generation_kwargs = {
@@ -831,17 +850,11 @@ def stream_generate(
             top_p=None if top_p is None or top_p >= 1.0 else top_p,
             top_k=None if top_k is None or top_k <= 0 else top_k,
             eos_early_stop=True,
-            threshold=threshold,
-            min_threshold=min_threshold,
-            editing_threshold=editing_threshold,
-            max_post_steps=max_post_steps,
-            num_to_transfer=num_to_transfer,
-            max_transfer_per_step=max_transfer_per_step,
-            stability_steps=stability_steps,
             visualize=verbose,
             tokenizer=tokenizer,
             skip_special_tokens=skip_special_tokens,
             stats=generation_stats,
+            **tuned_kwargs,
             **model_generate_kwargs,
         )
         mx.eval(generated)
@@ -892,6 +905,27 @@ def stream_generate(
     apc_extra_hash = 0
     apc_mode: Optional[str] = None
 
+    multimodal_token_ids = _apc.multimodal_token_ids_from_config(model.config)
+    apc_safe_prefix_min = _apc.media_safe_prefix_min(
+        full_input_ids_list,
+        multimodal_token_ids,
+    )
+    apc_safe_prefix_lookup_min = max(0, apc_safe_prefix_min - 1)
+
+    def _apc_suffix_is_text_only(prefix_len: int) -> bool:
+        return _apc.prefix_leaves_text_only_suffix(
+            full_input_ids_list,
+            prefix_len,
+            multimodal_token_ids,
+        )
+
+    def _apc_prefix_has_media_tokens(prefix_len: int) -> bool:
+        return _apc.prefix_contains_media_tokens(
+            full_input_ids_list,
+            prefix_len,
+            multimodal_token_ids,
+        )
+
     if is_diffusion_model(model):
         yield from stream_diffusion_generate_from_kwargs(
             model,
@@ -917,21 +951,14 @@ def stream_generate(
     if prompt_cache_state is not None and prompt_cache_state.cache is not None:
         prefix_len = prompt_cache_state.find_prefix_length(full_input_ids_list)
         if prefix_len > 0 and prefix_len < input_ids.shape[1]:
-            if _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
+            if _apc_suffix_is_text_only(prefix_len) and _prime_cached_prefix_rope_state(
+                model, input_ids, mask, kwargs
+            ):
                 reused_prefix_len = prefix_len
                 # Trim to only new tokens
                 input_ids = input_ids[:, prefix_len:]
-                # Only skip vision if no image tokens in the new (trimmed) tokens
-                image_token_id = getattr(
-                    model.config, "image_token_id", None
-                ) or getattr(model.config, "image_token_index", None)
-                new_ids = input_ids.flatten().tolist()
-                has_image_in_new = (
-                    image_token_id is not None and image_token_id in new_ids
-                )
-                if not has_image_in_new:
-                    pixel_values = None
-                    kwargs.pop("cached_image_features", None)
+                pixel_values = None
+                kwargs.pop("cached_image_features", None)
                 # Reuse the saved KV cache (trimmed to prefix length)
                 kv_cache = prompt_cache_state.cache
                 # Trim cache to prefix_len in case it includes generated tokens
@@ -952,34 +979,35 @@ def stream_generate(
             exact_prompt_cache, exact_prefix_len = apc_manager.lookup_exact_cache(
                 full_input_ids_list,
                 extra_hash=apc_extra_hash,
+                min_prefix_tokens=apc_safe_prefix_lookup_min,
             )
             if (
                 exact_prompt_cache is not None
                 and exact_prefix_len > 0
                 and exact_prefix_len < input_ids.shape[1]
+                and _apc_suffix_is_text_only(exact_prefix_len)
                 and _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs)
             ):
                 reused_prefix_len = exact_prefix_len
                 input_ids = input_ids[:, exact_prefix_len:]
-                image_token_id = getattr(
-                    model.config, "image_token_id", None
-                ) or getattr(model.config, "image_token_index", None)
-                new_ids = input_ids.flatten().tolist()
-                if image_token_id is None or image_token_id not in new_ids:
-                    pixel_values = None
-                    kwargs.pop("cached_image_features", None)
+                pixel_values = None
+                kwargs.pop("cached_image_features", None)
                 kwargs["prompt_cache"] = exact_prompt_cache
         else:
             matched_blocks, prefix_len = apc_manager.lookup_prefix(
                 full_input_ids_list, extra_hash=apc_extra_hash
             )
+            if prefix_len > 0 and _apc_prefix_has_media_tokens(prefix_len):
+                apc_manager.release(matched_blocks)
+                matched_blocks = []
+                prefix_len = 0
             exact_prompt_cache = None
             exact_prefix_len = 0
             if prefix_len < input_ids.shape[1]:
                 exact_prompt_cache, exact_prefix_len = apc_manager.lookup_exact_cache(
                     full_input_ids_list,
                     extra_hash=apc_extra_hash,
-                    min_prefix_tokens=prefix_len,
+                    min_prefix_tokens=max(prefix_len, apc_safe_prefix_lookup_min),
                 )
             disk_prompt_cache = None
             disk_prefix_len = 0
@@ -988,7 +1016,11 @@ def stream_generate(
                     apc_manager.lookup_prefix_disk_cache(
                         full_input_ids_list,
                         extra_hash=apc_extra_hash,
-                        min_prefix_tokens=max(prefix_len, exact_prefix_len),
+                        min_prefix_tokens=max(
+                            prefix_len,
+                            exact_prefix_len,
+                            apc_safe_prefix_lookup_min,
+                        ),
                         allow_memory_overlap=max(prefix_len, exact_prefix_len) > 0,
                     )
                 )
@@ -998,45 +1030,36 @@ def stream_generate(
             ):
                 if matched_blocks:
                     apc_manager.release(matched_blocks)
-                if _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
+                if _apc_suffix_is_text_only(
+                    disk_prefix_len
+                ) and _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
                     reused_prefix_len = disk_prefix_len
                     input_ids = input_ids[:, disk_prefix_len:]
-                    image_token_id = getattr(
-                        model.config, "image_token_id", None
-                    ) or getattr(model.config, "image_token_index", None)
-                    new_ids = input_ids.flatten().tolist()
-                    if image_token_id is None or image_token_id not in new_ids:
-                        pixel_values = None
-                        kwargs.pop("cached_image_features", None)
+                    pixel_values = None
+                    kwargs.pop("cached_image_features", None)
                     kwargs["prompt_cache"] = disk_prompt_cache
             elif (
                 exact_prefix_len > prefix_len and exact_prefix_len < input_ids.shape[1]
             ):
                 if matched_blocks:
                     apc_manager.release(matched_blocks)
-                if _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
+                if _apc_suffix_is_text_only(
+                    exact_prefix_len
+                ) and _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
                     reused_prefix_len = exact_prefix_len
                     input_ids = input_ids[:, exact_prefix_len:]
-                    image_token_id = getattr(
-                        model.config, "image_token_id", None
-                    ) or getattr(model.config, "image_token_index", None)
-                    new_ids = input_ids.flatten().tolist()
-                    if image_token_id is None or image_token_id not in new_ids:
-                        pixel_values = None
-                        kwargs.pop("cached_image_features", None)
+                    pixel_values = None
+                    kwargs.pop("cached_image_features", None)
                     kwargs["prompt_cache"] = exact_prompt_cache
             elif prefix_len > 0 and prefix_len < input_ids.shape[1]:
-                if _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
+                if _apc_suffix_is_text_only(
+                    prefix_len
+                ) and _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
                     apc_blocks_in_use = matched_blocks
                     reused_prefix_len = prefix_len
                     input_ids = input_ids[:, prefix_len:]
-                    image_token_id = getattr(
-                        model.config, "image_token_id", None
-                    ) or getattr(model.config, "image_token_index", None)
-                    new_ids = input_ids.flatten().tolist()
-                    if image_token_id is None or image_token_id not in new_ids:
-                        pixel_values = None
-                        kwargs.pop("cached_image_features", None)
+                    pixel_values = None
+                    kwargs.pop("cached_image_features", None)
                     kwargs["prompt_cache"] = _apc.make_warm_kv_cache(
                         matched_blocks,
                         min_capacity_tokens=prefix_len + input_ids.shape[1] + 1,
@@ -1081,10 +1104,14 @@ def stream_generate(
         exact_checkpoint_len = None
         exact_checkpoint = None
         if apc_manager is not None and apc_mode == "exact" and reused_prefix_len == 0:
-            exact_checkpoint_len = max(
-                1,
+            exact_checkpoint_len = _apc.adjust_prefix_to_text_suffix_boundary(
+                full_input_ids_list,
                 len(full_input_ids_list) - apc_manager.exact_cache_guard_tokens,
+                multimodal_token_ids,
+                max_prefix_tokens=len(full_input_ids_list) - 1,
             )
+            if exact_checkpoint_len <= 0:
+                exact_checkpoint_len = None
 
             def exact_checkpoint(prefix_len: int, prompt_cache: List[Any]) -> None:
                 apc_manager.store_exact_cache(
@@ -1337,7 +1364,6 @@ def generate(
             f"Generation: {last_response.generation_tokens} tokens, "
             f"{last_response.generation_tps:.3f} tokens-per-sec"
         )
-        print_diffusion_stats(last_response)
         print(f"Peak memory: {last_response.peak_memory:.3f} GB")
 
     return GenerationResult(
@@ -1367,11 +1393,15 @@ def main():
         run_image_generation_cli(args)
         return
 
+    if getattr(args, "seed", None) is not None:
+        mx.random.seed(args.seed)
+
     diffusion_arg_defaults = {
         "max_denoising_steps": None,
         "diffusion_full_canvas": False,
         "diffusion_min_canvas_length": None,
-        "diffusion_sampler": "auto-regressive-euler",
+        "diffusion_max_canvas_length": None,
+        "diffusion_sampler": "entropy-bound",
         "threshold": None,
         "min_threshold": None,
         "block_length": None,
@@ -1429,6 +1459,11 @@ def main():
             args.draft_kind = None
 
     prompt = args.prompt
+
+    if args.system:
+        prompt = [{"role": "system", "content": args.system}] + (
+            prompt if isinstance(prompt, list) else [prompt]
+        )
 
     num_images = len(args.image) if args.image is not None else 0
     num_audios = len(args.audio) if args.audio is not None else 0
