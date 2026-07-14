@@ -507,6 +507,36 @@ def test_get_model_and_args_does_not_route_vision_configs_to_text_only():
         )
 
 
+def test_get_model_and_args_routes_vlm_wrapper_without_multimodal_weights():
+    model_class, model_type = get_model_and_args(
+        {
+            "model_type": "qwen3_5",
+            "architectures": ["OrnithForConditionalGeneration"],
+            "text_config": {"model_type": "qwen3_5_moe"},
+            "vision_config": {"hidden_size": 1024},
+            "image_token_id": 248056,
+        },
+        weights={"language_model.model.embed_tokens.weight": mx.zeros((1,))},
+    )
+
+    assert model_class.__name__ == "mlx_vlm.models.text_only"
+    assert model_type == "text_only"
+
+
+def test_get_model_and_args_keeps_vlm_path_when_weights_include_vision():
+    model_class, model_type = get_model_and_args(
+        {
+            "model_type": "qwen3_5",
+            "text_config": {"model_type": "qwen3_5_moe"},
+            "vision_config": {"hidden_size": 1024},
+        },
+        weights={"vision_tower.patch_embed.weight": mx.zeros((1,))},
+    )
+
+    assert model_class.__name__ == "mlx_vlm.models.qwen3_5"
+    assert model_type == "qwen3_5"
+
+
 def test_load_model_routes_text_models_through_existing_loader():
     safe_open = MagicMock()
     safe_open.__enter__.return_value.metadata.return_value = {"format": "mlx"}
@@ -534,6 +564,97 @@ def test_load_model_routes_text_models_through_existing_loader():
         model = load_model(Path("/tmp/model"), lazy=True, strict=False)
 
     assert getattr(model, "_is_text_model", False) is True
+
+
+def test_load_model_uses_nested_text_model_type_for_vlm_wrapper():
+    safe_open = MagicMock()
+    safe_open.__enter__.return_value.metadata.return_value = {"format": "mlx"}
+
+    class FakeArgs:
+        @classmethod
+        def from_dict(cls, config):
+            return cls()
+
+    class FakeLM(nn.Module):
+        def __init__(self, args):
+            super().__init__()
+            self.model = nn.Linear(2, 2, bias=False)
+
+        def __call__(self, inputs, cache=None):
+            return self.model(inputs)
+
+    config = {
+        "model_type": "qwen3_5",
+        "architectures": ["OrnithForConditionalGeneration"],
+        "text_config": {"model_type": "qwen3_5_moe"},
+        "vision_config": {"hidden_size": 1024},
+    }
+    weights = {"model.weight": mx.zeros((2, 2))}
+
+    with (
+        patch("mlx_vlm.utils.load_config", return_value=config),
+        patch("mlx_vlm.utils.glob.glob", return_value=["/tmp/model/model.safetensors"]),
+        patch("mlx_vlm.utils._load_safetensors", return_value=weights),
+        patch("mlx_vlm.utils.safetensors.safe_open", return_value=safe_open),
+        patch(
+            "mlx_lm.utils._get_classes", return_value=(FakeLM, FakeArgs)
+        ) as get_classes,
+    ):
+        model = load_model(Path("/tmp/model"), lazy=True, strict=False)
+
+    assert getattr(model, "_is_text_model", False) is True
+    assert get_classes.call_args.args[0]["model_type"] == "qwen3_5_moe"
+
+
+def test_load_model_keeps_strict_loading_for_incomplete_vlm():
+    safe_open = MagicMock()
+    safe_open.__enter__.return_value.metadata.return_value = {"format": "mlx"}
+
+    class FakeConfig:
+        vision_config = SimpleNamespace()
+        text_config = SimpleNamespace()
+        audio_config = SimpleNamespace()
+
+        @classmethod
+        def from_dict(cls, config):
+            return cls()
+
+    class FakeModel(nn.Module):
+        def __init__(self, config):
+            super().__init__()
+
+        def load_weights(self, weights, strict=True):
+            assert strict is True
+            raise ValueError("Missing vision weights")
+
+    fake_model_class = SimpleNamespace(
+        ModelConfig=FakeConfig,
+        Model=FakeModel,
+        TextConfig=FakeConfig,
+        VisionConfig=FakeConfig,
+        AudioConfig=FakeConfig,
+    )
+    weights = {"vision_tower.patch_embed.weight": mx.zeros((1,))}
+
+    with (
+        patch(
+            "mlx_vlm.utils.load_config",
+            return_value={
+                "model_type": "fake_vlm",
+                "text_config": {"model_type": "llama"},
+                "vision_config": {"hidden_size": 16},
+            },
+        ),
+        patch("mlx_vlm.utils.glob.glob", return_value=["/tmp/model/model.safetensors"]),
+        patch("mlx_vlm.utils._load_safetensors", return_value=weights),
+        patch("mlx_vlm.utils.safetensors.safe_open", return_value=safe_open),
+        patch(
+            "mlx_vlm.utils.get_model_and_args",
+            return_value=(fake_model_class, "fake_vlm"),
+        ),
+    ):
+        with pytest.raises(ValueError, match="Missing vision weights"):
+            load_model(Path("/tmp/model"), lazy=True)
 
 
 def test_load_model_forwards_strict_to_load_weights():

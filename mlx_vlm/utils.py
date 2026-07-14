@@ -365,7 +365,7 @@ def get_class_predicate(skip_vision=False, weights=None, quantization_config=Non
     return predicate
 
 
-def get_model_and_args(config: dict):
+def get_model_and_args(config: dict, weights: Optional[Dict[str, mx.array]] = None):
     """
     Retrieve the model object based on the configuration.
 
@@ -375,6 +375,10 @@ def get_model_and_args(config: dict):
     Returns:
         A tuple containing the Model class and the ModelArgs class.
     """
+    if _is_text_only_checkpoint(config, weights):
+        arch = importlib.import_module("mlx_vlm.models.text_only")
+        return arch, "text_only"
+
     raw_model_type = config.get("model_type") or config.get("speculators_model_type")
     if raw_model_type is None:
         raise KeyError("model_type")
@@ -416,6 +420,58 @@ def _is_text_only_config(config: dict) -> bool:
         _has_config(config, key)
         for key in ("vision_config", "audio_config", "dflash_config")
     )
+
+
+def _is_multimodal_weight(name: str) -> bool:
+    normalized = name.lower()
+    return any(
+        marker in normalized
+        for marker in (
+            "vision_model",
+            "vision_tower",
+            "visual.",
+            "vl_connector",
+            "projector",
+            "image_newline",
+            "image_token",
+            "img_projector",
+            "multi_modal",
+            "multimodal",
+            "perceiver",
+            "audio_model",
+            "audio_tower",
+        )
+    )
+
+
+def _is_text_only_checkpoint(
+    config: dict, weights: Optional[Dict[str, mx.array]]
+) -> bool:
+    if _has_config(config, "dflash_config"):
+        return False
+    if _is_text_only_config(config):
+        return True
+
+    text_config = config.get("text_config")
+    if (
+        weights is None
+        or not isinstance(text_config, dict)
+        or not text_config.get("model_type")
+    ):
+        return False
+
+    return not any(_is_multimodal_weight(name) for name in weights)
+
+
+def _prepare_text_only_config(config: dict) -> dict:
+    text_config = config.get("text_config")
+    if not isinstance(text_config, dict) or not text_config.get("model_type"):
+        return config
+
+    effective_config = dict(config)
+    effective_config.update(text_config)
+    effective_config["text_config"] = text_config
+    return effective_config
 
 
 def get_model_path(
@@ -518,7 +574,9 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     with safetensors.safe_open(weight_files[0], framework="np") as f:
         is_mlx_format = f.metadata() and f.metadata().get("format") == "mlx"
 
-    model_class, _ = get_model_and_args(config=config)
+    model_class, model_type = get_model_and_args(config=config, weights=weights)
+    if model_type == "text_only":
+        config = _prepare_text_only_config(config)
 
     # Initialize text and vision configs if not present
     config.setdefault("text_config", config.pop("llm_config", {}))
