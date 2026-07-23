@@ -430,6 +430,8 @@ def _is_multimodal_weight(name: str) -> bool:
             "vision_model",
             "vision_tower",
             "visual.",
+            "embed_vision",
+            "vision_embedder",
             "vl_connector",
             "projector",
             "image_newline",
@@ -440,6 +442,7 @@ def _is_multimodal_weight(name: str) -> bool:
             "perceiver",
             "audio_model",
             "audio_tower",
+            "embed_audio",
         )
     )
 

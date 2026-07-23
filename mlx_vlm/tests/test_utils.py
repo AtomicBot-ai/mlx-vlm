@@ -537,6 +537,28 @@ def test_get_model_and_args_keeps_vlm_path_when_weights_include_vision():
     assert model_type == "qwen3_5"
 
 
+def test_get_model_and_args_keeps_gemma4_unified_multimodal_path():
+    config = {
+        "model_type": "gemma4_unified",
+        "text_config": {"model_type": "gemma4_unified_text"},
+        "vision_config": {"model_type": "gemma4_unified_vision"},
+        "audio_config": {"model_type": "gemma4_unified_audio"},
+    }
+
+    for weight_name in (
+        "embed_vision.embedding_projection.weight",
+        "vision_embedder.patch_dense.weight",
+        "embed_audio.embedding_projection.weight",
+    ):
+        model_class, model_type = get_model_and_args(
+            config,
+            weights={weight_name: mx.zeros((1,))},
+        )
+
+        assert model_class.__name__ == "mlx_vlm.models.gemma4_unified"
+        assert model_type == "gemma4_unified"
+
+
 def test_load_model_routes_text_models_through_existing_loader():
     safe_open = MagicMock()
     safe_open.__enter__.return_value.metadata.return_value = {"format": "mlx"}
