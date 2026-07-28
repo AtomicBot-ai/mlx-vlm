@@ -140,9 +140,19 @@ jobs:
         run: |
           echo "Signing mlx-server..."
           codesign --force --options runtime --timestamp \
+            --entitlements .github/mlx-server.entitlements \
             --sign "$CODESIGN_IDENTITY" dist/mlx-server
           codesign --verify --verbose dist/mlx-server
+          codesign --display --entitlements - dist/mlx-server
           echo "Code signing completed"
+
+      - name: Verify signed binary runs
+        run: |
+          # Must run after signing, and must not swallow failures: Library
+          # Validation only kicks in once the binary carries a Developer ID
+          # signature, so the pre-sign check cannot catch a broken seal.
+          ./dist/mlx-server --help > /dev/null
+          echo "Signed binary executes successfully"
 
       - name: Prepare release archive
         run: |
