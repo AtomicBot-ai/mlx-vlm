@@ -2,7 +2,7 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!-- The PyInstaller --onefile bootloader unpacks an ad-hoc signed
+    <!-- The PyInstaller onefile bootloader unpacks an ad-hoc signed
          Python.framework (plus wheel dylibs) into a temp dir and dlopen()s it.
          Hardened Runtime enables Library Validation, which rejects any library
          whose Team ID differs from the host process, so without this the binary
