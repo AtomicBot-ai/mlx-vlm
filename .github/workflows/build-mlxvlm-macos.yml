@@ -71,18 +71,16 @@ jobs:
           pip install pyinstaller
           pip install -e .
 
-      - name: Verify transformers is torch-free for Gemma4
+      - name: Verify the Gemma4 processor is torch-free
         run: |
-          # Regression guard: only transformers 5.9.0 guards the Gemma4 image
-          # processor behind is_vision_available() (PIL fallback). Both < 5.9.0
-          # and >= 5.10.0 unconditionally `import torch`, which crashes the
-          # torch-free MLX runtime (ModuleNotFoundError: No module named
-          # 'torch'). Importing the processor here reproduces the exact failing
-          # path version-agnostically, so a bad pin fails the build instead of
-          # shipping a broken binary.
+          # Regression guard: the shipped runtime has no torch, and
+          # transformers' own `image_processing_gemma4` still imports it
+          # unconditionally. mlx-vlm carries a numpy/PIL processor instead, so
+          # importing ours reproduces the exact runtime path and a regression
+          # fails the build instead of shipping a broken binary.
           python - <<'PY'
           import transformers
-          from transformers.models.gemma4 import processing_gemma4  # noqa: F401
+          from mlx_vlm.models.gemma4 import processing_gemma4  # noqa: F401
 
           print(f"OK: transformers {transformers.__version__}, Gemma4 processor imports cleanly")
           PY

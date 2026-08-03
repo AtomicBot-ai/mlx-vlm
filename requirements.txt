@@ -1,9 +1,5 @@
-mlx>=0.31.2
-# Pinned: 5.10.0+ reintroduced an unconditional `import torch` in the Gemma4
-# image processor, which breaks the torch-free MLX runtime. 5.9.0 guards it
-# behind is_vision_available() and falls back to the PIL processor.
-transformers==5.9.0
-datasets>=2.19.1
+mlx>=0.32.0
+transformers>=5.14.0
 miniaudio>=1.59
 tqdm>=4.66.2
 Pillow>=10.3.0
