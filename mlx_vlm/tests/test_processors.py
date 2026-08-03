@@ -1347,7 +1347,9 @@ class TestQwen3VLProcessor(_ProcessorTestBase, unittest.TestCase):
         capped_grid = processor(
             images=[image],
             max_pixels=1280 * 28 * 28,
-        )["image_grid_thw"][0]
+        )[
+            "image_grid_thw"
+        ][0]
 
         self.assertGreater(
             default_grid[1] * default_grid[2],

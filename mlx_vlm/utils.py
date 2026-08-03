@@ -52,6 +52,10 @@ MODEL_REMAPPING = {
     "inkling_mm_model": "inkling",
 }
 
+TEXT_ONLY_MODEL_REMAPPING = {
+    "qwen3_5_moe_text": "qwen3_5_moe",
+}
+
 MAX_FILE_SIZE_GB = 5
 
 MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
@@ -524,31 +528,34 @@ def get_model_and_args(config: dict, weights: Optional[Dict[str, mx.array]] = No
     Returns:
         A tuple containing the Model class and the ModelArgs class.
     """
+    raw_model_type = config.get("model_type") or config.get("speculators_model_type")
+    model_type = None
+    last_err: Optional[ImportError] = None
+
+    if raw_model_type is not None:
+        model_type = MODEL_REMAPPING.get(raw_model_type.lower(), raw_model_type.lower())
+
+        is_dflash = config.get("dflash_config", None) is not None
+        if is_dflash:
+            model_type += "_dflash"
+
+        # A drafter checkpoint holds no media weights by construction, so the
+        # text-only heuristic below would claim it and hand its config to a
+        # target backbone. Vendored drafters therefore win the dispatch.
+        arch, last_err = _import_arch("mlx_vlm.speculative.drafters", model_type)
+        if arch is not None:
+            return arch, model_type
+
     if _is_text_only_checkpoint(config, weights):
         arch = importlib.import_module("mlx_vlm.models.text_only")
         return arch, "text_only"
 
-    raw_model_type = config.get("model_type") or config.get("speculators_model_type")
-    if raw_model_type is None:
+    if model_type is None:
         raise KeyError("model_type")
-    model_type = raw_model_type.lower()
 
-    model_type = MODEL_REMAPPING.get(model_type, model_type)
-
-    is_dflash = config.get("dflash_config", None) is not None
-    if is_dflash:
-        model_type += "_dflash"
-
-    last_err: Optional[ImportError] = None
-    for pkg in ("mlx_vlm.models", "mlx_vlm.speculative.drafters"):
-        try:
-            arch = importlib.import_module(f"{pkg}.{model_type}")
-            return arch, model_type
-        except ImportError as e:
-            if model_type not in str(e):
-                raise
-            last_err = e
-            continue
+    arch, last_err = _import_arch("mlx_vlm.models", model_type)
+    if arch is not None:
+        return arch, model_type
 
     if _is_text_only_config(config):
         arch = importlib.import_module("mlx_vlm.models.text_only")
@@ -557,6 +564,18 @@ def get_model_and_args(config: dict, weights: Optional[Dict[str, mx.array]] = No
     msg = f"Model type {model_type} not supported. Error: {last_err}"
     logging.error(msg)
     raise ValueError(msg)
+
+
+def _import_arch(
+    package: str, model_type: str
+) -> Tuple[Optional[Any], Optional[ImportError]]:
+    """Import ``package.model_type``, or report that it isn't vendored there."""
+    try:
+        return importlib.import_module(f"{package}.{model_type}"), None
+    except ImportError as e:
+        if model_type not in str(e):
+            raise
+        return None, e
 
 
 def _has_config(config: dict, key: str) -> bool:
@@ -599,10 +618,15 @@ def _is_multimodal_weight(name: str) -> bool:
 def _is_text_only_checkpoint(
     config: dict, weights: Optional[Dict[str, mx.array]]
 ) -> bool:
+    """Detect a VLM-wrapper config whose checkpoint carries no media weights.
+
+    Only covers what the config alone cannot express; a config that declares no
+    multimodal parts is left to the text-only fallback in
+    ``get_model_and_args``, which first honours a natively vendored
+    architecture for that ``model_type``.
+    """
     if _has_config(config, "dflash_config"):
         return False
-    if _is_text_only_config(config):
-        return True
 
     text_config = config.get("text_config")
     if (
@@ -622,6 +646,9 @@ def _prepare_text_only_config(config: dict) -> dict:
 
     effective_config = dict(config)
     effective_config.update(text_config)
+    effective_config["model_type"] = TEXT_ONLY_MODEL_REMAPPING.get(
+        effective_config["model_type"], effective_config["model_type"]
+    )
     effective_config["text_config"] = text_config
     return effective_config
 

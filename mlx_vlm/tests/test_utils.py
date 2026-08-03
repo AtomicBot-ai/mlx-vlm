@@ -599,6 +599,21 @@ def test_get_model_and_args_keeps_gemma4_unified_multimodal_path():
         assert model_type == "gemma4_unified"
 
 
+def test_get_model_and_args_keeps_drafter_path_for_text_only_weights():
+    model_class, model_type = get_model_and_args(
+        {
+            "model_type": "gemma4_assistant",
+            "architectures": ["Gemma4AssistantForCausalLM"],
+            "backbone_hidden_size": 2560,
+            "text_config": {"model_type": "gemma4_text"},
+        },
+        weights={"model.layers.0.self_attn.q_proj.weight": mx.zeros((1,))},
+    )
+
+    assert model_class.__name__ == "mlx_vlm.speculative.drafters.gemma4_assistant"
+    assert model_type == "gemma4_assistant"
+
+
 def test_load_model_routes_text_models_through_existing_loader():
     class FakeArgs:
         @classmethod
@@ -628,9 +643,6 @@ def test_load_model_routes_text_models_through_existing_loader():
 
 
 def test_load_model_uses_nested_text_model_type_for_vlm_wrapper():
-    safe_open = MagicMock()
-    safe_open.__enter__.return_value.metadata.return_value = {"format": "mlx"}
-
     class FakeArgs:
         @classmethod
         def from_dict(cls, config):
@@ -656,7 +668,42 @@ def test_load_model_uses_nested_text_model_type_for_vlm_wrapper():
         patch("mlx_vlm.utils.load_config", return_value=config),
         patch("mlx_vlm.utils.glob.glob", return_value=["/tmp/model/model.safetensors"]),
         patch("mlx_vlm.utils._load_safetensors", return_value=weights),
-        patch("mlx_vlm.utils.safetensors.safe_open", return_value=safe_open),
+        patch(
+            "mlx_lm.utils._get_classes", return_value=(FakeLM, FakeArgs)
+        ) as get_classes,
+    ):
+        model = load_model(Path("/tmp/model"), lazy=True, strict=False)
+
+    assert getattr(model, "_is_text_model", False) is True
+    assert get_classes.call_args.args[0]["model_type"] == "qwen3_5_moe"
+
+
+def test_load_model_normalizes_ornith_nested_text_model_type():
+    class FakeArgs:
+        @classmethod
+        def from_dict(cls, config):
+            return cls()
+
+    class FakeLM(nn.Module):
+        def __init__(self, args):
+            super().__init__()
+            self.model = nn.Linear(2, 2, bias=False)
+
+        def __call__(self, inputs, cache=None):
+            return self.model(inputs)
+
+    config = {
+        "model_type": "qwen3_5_moe",
+        "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+        "text_config": {"model_type": "qwen3_5_moe_text"},
+        "image_token_id": 248056,
+    }
+    weights = {"model.weight": mx.zeros((2, 2))}
+
+    with (
+        patch("mlx_vlm.utils.load_config", return_value=config),
+        patch("mlx_vlm.utils.glob.glob", return_value=["/tmp/model/model.safetensors"]),
+        patch("mlx_vlm.utils._load_safetensors", return_value=weights),
         patch(
             "mlx_lm.utils._get_classes", return_value=(FakeLM, FakeArgs)
         ) as get_classes,
@@ -668,9 +715,6 @@ def test_load_model_uses_nested_text_model_type_for_vlm_wrapper():
 
 
 def test_load_model_keeps_strict_loading_for_incomplete_vlm():
-    safe_open = MagicMock()
-    safe_open.__enter__.return_value.metadata.return_value = {"format": "mlx"}
-
     class FakeConfig:
         vision_config = SimpleNamespace()
         text_config = SimpleNamespace()
@@ -708,7 +752,6 @@ def test_load_model_keeps_strict_loading_for_incomplete_vlm():
         ),
         patch("mlx_vlm.utils.glob.glob", return_value=["/tmp/model/model.safetensors"]),
         patch("mlx_vlm.utils._load_safetensors", return_value=weights),
-        patch("mlx_vlm.utils.safetensors.safe_open", return_value=safe_open),
         patch(
             "mlx_vlm.utils.get_model_and_args",
             return_value=(fake_model_class, "fake_vlm"),

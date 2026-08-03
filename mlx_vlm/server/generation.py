@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from queue import Empty as QueueEmpty
 from queue import Queue
 from threading import Event, Lock, Thread
-from typing import Any, Callable, Generator, List, Optional, Tuple
+from typing import Any, Callable, Collection, Generator, List, Optional, Tuple
 
 import mlx.core as mx
 from fastapi import HTTPException
@@ -1218,6 +1218,10 @@ class ResponseGenerator:
     higher throughput — same pattern as mlx-lm's server.
     """
 
+    # Filled in from generation_config.json when the model loads; declared here
+    # so instances built without __init__ still resolve it.
+    suppress_tokens: Collection[int] = ()
+
     def __init__(
         self,
         model_path: str,
@@ -1236,7 +1240,7 @@ class ResponseGenerator:
         self.processor = None
         self.config = None
         self.stop_tokens = set()
-        self.suppress_tokens: set[int] = set()
+        self.suppress_tokens = set()
         self.vision_cache = vision_cache
         self.draft_model = None
         self.kv_bits = kv_bits
