@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import struct
+import warnings
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
@@ -48,12 +49,15 @@ MODEL_REMAPPING = {
     "cohere2moe": "cohere2_moe",
     "unlimited-ocr": "unlimited_ocr",
     "mistral": "llama",
+    "phi-msft": "phixtral",
+    "falcon_mamba": "mamba",
+    "joyai_llm_flash": "deepseek_v3",
+    "kimi_k2": "deepseek_v3",
+    "minimax_m2": "minimax",
+    "iquestcoder": "llama",
     "nemotron-nas": "nemotron_nas",
     "inkling_mm_model": "inkling",
-}
-
-TEXT_ONLY_MODEL_REMAPPING = {
-    "qwen3_5_moe_text": "qwen3_5_moe",
+    "lille-130m": "lille_130m",
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -158,6 +162,68 @@ def _f32_to_e4m3(x: mx.array) -> mx.array:
 
     byte = mx.where(normal_valid, normal_byte, sub_byte)
     return byte.astype(mx.uint8)
+
+
+def _transform_modelopt_nvfp4_weights(
+    weights: Dict[str, mx.array],
+    quantization_config: Optional[Dict[str, Any]],
+) -> Tuple[Dict[str, mx.array], Optional[Dict[str, Any]]]:
+    if quantization_config is None:
+        return weights, None
+    if (
+        quantization_config.get("quant_method") != "modelopt"
+        or quantization_config.get("quant_algo") != "NVFP4"
+    ):
+        return weights, None
+
+    scale_2_suffix = ".weight_scale_2"
+    prefixes = {
+        key[: -len(scale_2_suffix)] for key in weights if key.endswith(scale_2_suffix)
+    }
+    if not prefixes:
+        return weights, None
+
+    consumed = {
+        f"{prefix}.{suffix}"
+        for prefix in prefixes
+        for suffix in ("weight", "weight_scale", "input_scale")
+    }
+    transformed = {}
+    for key, value in weights.items():
+        if key.endswith(scale_2_suffix):
+            prefix = key[: -len(scale_2_suffix)]
+            weight_key = f"{prefix}.weight"
+            scale_key = f"{prefix}.weight_scale"
+            if weight_key not in weights or scale_key not in weights:
+                raise ValueError(f"Missing ModelOpt NVFP4 tensors for {prefix}.")
+
+            weight = weights[weight_key]
+            scale = weights[scale_key]
+            if (
+                weight.dtype != mx.uint8
+                or scale.dtype != mx.uint8
+                or weight.ndim != 2
+                or scale.ndim != 2
+                or value.size != 1
+            ):
+                raise ValueError(f"Invalid ModelOpt NVFP4 tensors for {prefix}.")
+            if (
+                weight.shape[0] != scale.shape[0]
+                or weight.shape[1] != 8 * scale.shape[1]
+            ):
+                raise ValueError(f"Invalid ModelOpt NVFP4 scale shape for {prefix}.")
+
+            transformed[weight_key] = weight.view(mx.uint32)
+            decoded_scale = _E4M3_DECODE_LUT[scale.astype(mx.uint32)]
+            transformed[f"{prefix}.scales"] = _f32_to_e4m3(
+                decoded_scale * value.astype(mx.float32)
+            )
+        elif key in consumed:
+            continue
+        else:
+            transformed[key] = value
+
+    return transformed, {"group_size": 16, "bits": 4, "mode": "nvfp4"}
 
 
 def _transform_compressed_tensors_nvfp4_weights(
@@ -518,64 +584,33 @@ def get_class_predicate(skip_vision=False, weights=None, quantization_config=Non
     return predicate
 
 
-def get_model_and_args(config: dict, weights: Optional[Dict[str, mx.array]] = None):
-    """
-    Retrieve the model object based on the configuration.
-
-    Args:
-        config (dict): The model configuration.
-
-    Returns:
-        A tuple containing the Model class and the ModelArgs class.
-    """
+def get_model_and_args(config: dict):
+    """Resolve a model package and its normalized model type."""
     raw_model_type = config.get("model_type") or config.get("speculators_model_type")
-    model_type = None
-    last_err: Optional[ImportError] = None
-
-    if raw_model_type is not None:
-        model_type = MODEL_REMAPPING.get(raw_model_type.lower(), raw_model_type.lower())
-
-        is_dflash = config.get("dflash_config", None) is not None
-        if is_dflash:
-            model_type += "_dflash"
-
-        # A drafter checkpoint holds no media weights by construction, so the
-        # text-only heuristic below would claim it and hand its config to a
-        # target backbone. Vendored drafters therefore win the dispatch.
-        arch, last_err = _import_arch("mlx_vlm.speculative.drafters", model_type)
-        if arch is not None:
-            return arch, model_type
-
-    if _is_text_only_checkpoint(config, weights):
-        arch = importlib.import_module("mlx_vlm.models.text_only")
-        return arch, "text_only"
-
-    if model_type is None:
+    if raw_model_type is None:
         raise KeyError("model_type")
+    model_type = raw_model_type.lower()
 
-    arch, last_err = _import_arch("mlx_vlm.models", model_type)
-    if arch is not None:
-        return arch, model_type
+    model_type = MODEL_REMAPPING.get(model_type, model_type)
 
-    if _is_text_only_config(config):
-        arch = importlib.import_module("mlx_vlm.models.text_only")
-        return arch, "text_only"
+    is_dflash = config.get("dflash_config", None) is not None
+    if is_dflash:
+        model_type += "_dflash"
+
+    last_err: Optional[ImportError] = None
+    for pkg in ("mlx_vlm.models", "mlx_vlm.speculative.drafters"):
+        try:
+            arch = importlib.import_module(f"{pkg}.{model_type}")
+            return arch, model_type
+        except ImportError as e:
+            if model_type not in str(e):
+                raise
+            last_err = e
+            continue
 
     msg = f"Model type {model_type} not supported. Error: {last_err}"
     logging.error(msg)
     raise ValueError(msg)
-
-
-def _import_arch(
-    package: str, model_type: str
-) -> Tuple[Optional[Any], Optional[ImportError]]:
-    """Import ``package.model_type``, or report that it isn't vendored there."""
-    try:
-        return importlib.import_module(f"{package}.{model_type}"), None
-    except ImportError as e:
-        if model_type not in str(e):
-            raise
-        return None, e
 
 
 def _has_config(config: dict, key: str) -> bool:
@@ -620,10 +655,10 @@ def _is_text_only_checkpoint(
 ) -> bool:
     """Detect a VLM-wrapper config whose checkpoint carries no media weights.
 
-    Only covers what the config alone cannot express; a config that declares no
-    multimodal parts is left to the text-only fallback in
-    ``get_model_and_args``, which first honours a natively vendored
-    architecture for that ``model_type``.
+    Covers what ``_is_text_only_config`` cannot: the config still declares a
+    vision/audio tower, but the checkpoint ships none of its tensors. Callers
+    combine both checks and let ``_drop_modules_without_weights`` disable the
+    empty towers.
     """
     if _has_config(config, "dflash_config"):
         return False
@@ -639,18 +674,23 @@ def _is_text_only_checkpoint(
     return not any(_is_multimodal_weight(name) for name in weights)
 
 
-def _prepare_text_only_config(config: dict) -> dict:
-    text_config = config.get("text_config")
-    if not isinstance(text_config, dict) or not text_config.get("model_type"):
-        return config
+def _drop_modules_without_weights(model: nn.Module, weights: dict) -> None:
+    weighted_modules = {key.partition(".")[0] for key in weights}
+    dropped_modules = []
+    for name, child in list(model.items()):
+        if name == "language_model" or not isinstance(child, nn.Module):
+            continue
+        if not tree_flatten(child.parameters()) or name in weighted_modules:
+            continue
+        setattr(model, name, None)
+        dropped_modules.append(name)
 
-    effective_config = dict(config)
-    effective_config.update(text_config)
-    effective_config["model_type"] = TEXT_ONLY_MODEL_REMAPPING.get(
-        effective_config["model_type"], effective_config["model_type"]
-    )
-    effective_config["text_config"] = text_config
-    return effective_config
+    if dropped_modules:
+        logging.warning(
+            "Text-only checkpoint has no weights for VLM module(s): %s. "
+            "Disabling those modules.",
+            ", ".join(dropped_modules),
+        )
 
 
 def get_model_path(
@@ -679,6 +719,7 @@ def get_model_path(
                 allow_patterns=allow_patterns
                 or [
                     "*.json",
+                    "*.jsonl",
                     "*.safetensors",
                     "*.py",
                     "*.model",
@@ -763,9 +804,13 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     for wf in weight_files:
         weights.update(_load_safetensors(wf))
 
-    model_class, model_type = get_model_and_args(config=config, weights=weights)
-    if model_type == "text_only":
-        config = _prepare_text_only_config(config)
+    model_class, _ = get_model_and_args(config=config)
+    # ``_is_text_only_config`` only fires for configs that declare no vision or
+    # audio tower at all. Our conversions keep the full VLM wrapper config and
+    # simply ship no media tensors, so widen the check to the weights.
+    text_only_config = _is_text_only_config(config) or _is_text_only_checkpoint(
+        config, weights
+    )
 
     # Initialize text and vision configs if not present
     config.setdefault("text_config", config.pop("llm_config", {}))
@@ -790,9 +835,13 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         if quantization_config is not None:
             config["quantization_config"] = quantization_config
 
-    weights, transformed_quantization = _transform_compressed_tensors_weights(
+    weights, transformed_quantization = _transform_modelopt_nvfp4_weights(
         weights, quantization_config
     )
+    if transformed_quantization is None:
+        weights, transformed_quantization = _transform_compressed_tensors_weights(
+            weights, quantization_config
+        )
     if transformed_quantization is not None:
         config["quantization"] = transformed_quantization
         config["quantization_config"] = transformed_quantization
@@ -865,7 +914,11 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 from .models.deepseek_v4.language import make_quantization_config
 
                 quantization = make_quantization_config(model)
-            elif quant_method in ("awq", "gptq", "bitnet"):
+            elif quant_method == "fp8" and config.get("model_type") == "qwen3_5":
+                from .models.qwen3_5.fp8 import make_quantization_config
+
+                quantization = make_quantization_config(config)
+            elif quant_method in ("awq", "gptq"):
                 logging.warning(
                     "Quantization method %s is not supported in mlx_vlm.load_model()",
                     quant_method,
@@ -882,14 +935,12 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 config[quantization_key] = quantization_value
 
     if (quantization := config.get("quantization", None)) is not None:
-        # Handle legacy models which may or may not have vision quantized
+        # Handle legacy models which may or may not have vision quantized.
+        # text-only quants of unified VLM families set vision_config to null,
+        # so coerce None to {} to avoid AttributeError on the .get below.
         # TODO: Re-upload the models with the new quantization config and remove this
-        skip_vision = config.get("vision_config", {}).get("skip_vision", False)
-        quantized_model = (
-            model.language_model._model
-            if getattr(model, "_is_text_model", False)
-            else model
-        )
+        skip_vision = (config.get("vision_config") or {}).get("skip_vision", False)
+        quantized_model = model
 
         # Stock MLX rejects bits=1; route those layers to our Metal kernel.
         replace_one_bit_modules(quantized_model, quantization, weights)
@@ -906,9 +957,15 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             # Skip 1-bit layers already replaced above.
             if _quantization_for_path(config["quantization"], p).get("bits") == 1:
                 return False
-            # Handle custom per layer quantizations
-            if p in config["quantization"]:
-                return config["quantization"][p]
+            # Handle custom per layer quantizations. Config keys from the
+            # underlying text checkpoint omit the mlx-vlm ``language_model.``
+            # wrapper prefix that loaded module paths carry, so also match with
+            # that prefix stripped (e.g. per-layer 8-bit MoE router gates).
+            override = config["quantization"].get(p)
+            if override is None and p.startswith("language_model."):
+                override = config["quantization"].get(p[len("language_model.") :])
+            if isinstance(override, dict):
+                return override
             if not hasattr(m, "to_quantized"):
                 return False
             # Skip layers not divisible by 64
@@ -932,6 +989,9 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 "Please use a quantized model with mode 'nvfp4' or 'mxfp8'."
             )
         model = quantize_activations(model)
+
+    if text_only_config:
+        _drop_modules_without_weights(model, weights)
 
     model.load_weights(list(weights.items()), strict=strict)
 
@@ -1219,7 +1279,11 @@ def load_processor(
         )
 
         # Create and assign the StoppingCriteria
-        criteria = StoppingCriteria(final_eos_token_ids, tokenizer_obj)
+        criteria = StoppingCriteria(
+            final_eos_token_ids,
+            tokenizer_obj,
+            additional_eos_token_ids=getattr(processor, "additional_eos_token_ids", ()),
+        )
         if hasattr(processor, "tokenizer"):
             processor.tokenizer.stopping_criteria = criteria
         else:
@@ -1506,9 +1570,49 @@ def process_image(img, resize_shape, image_processor):
         img = load_image(img)
     if hasattr(img, "mode") and img.mode != "RGB":
         img = img.convert("RGB")
-    if resize_shape is not None and not isinstance(image_processor, BaseImageProcessor):
-        img = resize_image(img, resize_shape)
+    if resize_shape is not None:
+        if isinstance(image_processor, BaseImageProcessor):
+            # warnings (not logging) so repeated calls in a batch dedupe.
+            warnings.warn(
+                f"resize_shape={resize_shape} is ignored because "
+                f"{type(image_processor).__name__} handles its own image "
+                "sizing; use the processor's sizing options instead."
+            )
+        else:
+            img = resize_image(img, resize_shape)
     return img
+
+
+def estimate_num_image_tokens(processor, height: int, width: int, **size_overrides):
+    """Estimate how many language-model image tokens an image will produce.
+
+    Computed from the processor's own sizing math without loading or
+    processing any pixels, so it is cheap enough to run per candidate image
+    when sizing a prompt budget or choosing a ``max_pixels`` cap.
+
+    Args:
+        processor: A processor (or bare image processor). Wrapped processors
+            are unwrapped via their ``image_processor`` attribute.
+        height: Source image height in pixels.
+        width: Source image width in pixels.
+        **size_overrides: Optional per-call overrides forwarded to the image
+            processor's ``num_image_tokens``, e.g. ``max_pixels=1_000_000``.
+
+    Raises:
+        NotImplementedError: If the image processor does not expose
+            ``num_image_tokens``. Only dynamic-resolution processors support
+            estimation; fixed-resolution models produce a constant token
+            count regardless of image size.
+    """
+    image_processor = getattr(processor, "image_processor", processor)
+    counter = getattr(image_processor, "num_image_tokens", None)
+    if counter is None:
+        raise NotImplementedError(
+            f"{type(image_processor).__name__} does not expose "
+            "num_image_tokens; token estimation is only available for "
+            "dynamic-resolution image processors."
+        )
+    return int(counter(height, width, **size_overrides))
 
 
 def read_audio(file) -> tuple:
@@ -2101,14 +2205,17 @@ def group_images_by_shape(
 
 
 class StoppingCriteria:
-    def __init__(self, eos_token_ids: List[int], tokenizer=None):
-
-        if isinstance(eos_token_ids, int):
-            self.eos_token_ids = [eos_token_ids]
-        else:
-            self.eos_token_ids = list(eos_token_ids)
-
+    def __init__(
+        self,
+        eos_token_ids: List[int],
+        tokenizer=None,
+        additional_eos_token_ids: Optional[List[int]] = None,
+    ):
         self.tokenizer = tokenizer
+        self.additional_eos_token_ids = list(
+            dict.fromkeys(additional_eos_token_ids or ())
+        )
+        self.reset(eos_token_ids)
 
     def add_eos_token_ids(self, new_eos_token_ids: Union[int, List[int]] = None):
         """
@@ -2145,8 +2252,14 @@ class StoppingCriteria:
         if isinstance(eos_token_ids, int):
             eos_token_ids = [eos_token_ids]
 
-        if self.eos_token_ids != eos_token_ids:
-            self.eos_token_ids = list(eos_token_ids)
+        resolved = list(eos_token_ids)
+        resolved.extend(
+            token_id
+            for token_id in self.additional_eos_token_ids
+            if token_id not in resolved
+        )
+        if getattr(self, "eos_token_ids", None) != resolved:
+            self.eos_token_ids = resolved
 
     def __call__(self, input_ids: mx.array) -> bool:
         return input_ids in self.eos_token_ids
@@ -2167,10 +2280,12 @@ class ThinkingBudgetCriteria:
         thinking_end_token: str = "</think>",
         thinking_start_token: Optional[str] = None,
         enable_thinking: bool = False,
+        prompt_preopens_thinking: bool = False,
     ):
         self.tokenizer = tokenizer
         self.thinking_budget = thinking_budget
         self.enable_thinking = enable_thinking
+        self.prompt_preopens_thinking = prompt_preopens_thinking
 
         # Resolve token IDs from strings
         self.thinking_end_token_id = tokenizer.encode(
@@ -2188,14 +2303,14 @@ class ThinkingBudgetCriteria:
         self._forced_sequence.append(self.thinking_end_token_id)
         self._forced_index = 0
 
-        self.in_thinking = self.enable_thinking
+        self.in_thinking = self.enable_thinking and self.prompt_preopens_thinking
         self.thinking_token_count = 0
         self.budget_exceeded = False
         self.forced_token_id = None
 
     def reset_thinking_state(self):
         """Reset thinking state between generations."""
-        self.in_thinking = self.enable_thinking
+        self.in_thinking = self.enable_thinking and self.prompt_preopens_thinking
         self.thinking_token_count = 0
         self.budget_exceeded = False
         self._forced_index = 0
