@@ -92,6 +92,14 @@ jobs:
           # `src-tauri/resources/bin/mlx-server`). Heavy collect-all targets
           # are required because mlx-vlm resolves model + drafter modules
           # lazily via importlib at request time.
+          #
+          # llguidance is --collect-all, not --hidden-import: its
+          # `__init__.py` calls `importlib.metadata.version("llguidance")` at
+          # import time, so a bundle carrying the modules but not the
+          # dist-info raises PackageNotFoundError — a ModuleNotFoundError
+          # subclass. `mlx_vlm.structured` caught it as a plain ImportError
+          # and reported "llguidance is required", silently degrading every
+          # structured `response_format` request to unconstrained generation.
           pyinstaller \
             --onefile \
             --name mlx-server \
@@ -118,7 +126,7 @@ jobs:
             --hidden-import uvicorn.lifespan.on \
             --hidden-import huggingface_hub \
             --hidden-import miniaudio \
-            --hidden-import llguidance \
+            --collect-all llguidance \
             --hidden-import cv2 \
             --exclude-module gradio \
             --exclude-module jupyter \
@@ -151,6 +159,16 @@ jobs:
           # signature, so the pre-sign check cannot catch a broken seal.
           ./dist/mlx-server --help > /dev/null
           echo "Signed binary executes successfully"
+
+      - name: Verify structured output is available in the bundle
+        run: |
+          # Regression guard for a failure that used to ship silently: the
+          # llguidance stack only loads when a request carries
+          # `response_format`, so a bundle missing it answered 400 and degraded
+          # every structured request to unconstrained generation. Runs against
+          # the signed binary so a broken seal on the native extension is
+          # caught here too.
+          ./dist/mlx-server --selftest-structured
 
       - name: Prepare release archive
         run: |

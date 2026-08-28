@@ -264,9 +264,16 @@ def build_json_schema_logits_processor(tokenizer, schema: str | dict[str, Any]):
         import llguidance as llg
         import llguidance.hf
     except ImportError as exc:
+        # Keep the underlying error in the message. A frozen build that carries
+        # the llguidance modules but not its dist-info fails here with
+        # PackageNotFoundError (a ModuleNotFoundError subclass) raised by
+        # llguidance's own `importlib.metadata.version` call -- indistinguishable
+        # from a genuinely missing install unless the cause is surfaced, and the
+        # caller only ever sees this message.
         raise ImportError(
             "llguidance is required for structured response_format generation. "
-            "Install mlx-vlm with llguidance available."
+            "Install mlx-vlm with llguidance available. "
+            f"Underlying import error: {exc!r}"
         ) from exc
 
     llg_tokenizer = _llg_tokenizer_cache.get(id(tokenizer))
