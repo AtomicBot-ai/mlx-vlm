@@ -52,5 +52,5 @@ from .vlm import (
 from .vlm.config import SFTTrainConfig, VLMTrainConfig, VLMTrainingArgs
 from .vlm.dpo.config import DPOTrainConfig, DPOTrainingArgs
 from .vlm.grpo import GRPOTrainConfig, GRPOTrainingArgs, GRPOVisionDataset
-from .vlm.orpo.config import ORPOTrainConfig, ORPOTrainingArgs
 from .vlm.mtp import attach_mtp_head
+from .vlm.orpo.config import ORPOTrainConfig, ORPOTrainingArgs

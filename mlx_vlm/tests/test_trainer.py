@@ -187,7 +187,9 @@ def test_training_updates_and_saves(monkeypatch, missing_adapter):
         labels=mx.array([[0, 1, 2]] * 4),
     )
     save, optimizer = Mock(), MagicMock(learning_rate=1e-4)
-    monkeypatch.setattr("mlx_vlm.trainer.vlm.cross_entropy.trainer.mx.save_safetensors", save)
+    monkeypatch.setattr(
+        "mlx_vlm.trainer.vlm.cross_entropy.trainer.mx.save_safetensors", save
+    )
     monkeypatch.setattr(
         "mlx_vlm.trainer.vlm.cross_entropy.trainer.iterate_batches",
         Mock(return_value=iter([batch])),

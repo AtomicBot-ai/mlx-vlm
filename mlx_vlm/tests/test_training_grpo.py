@@ -17,8 +17,8 @@ from mlx.utils import tree_flatten
 
 from mlx_vlm.train import parse_args, run
 from mlx_vlm.trainer import GRPOTrainingArgs, Trainer
-from mlx_vlm.trainer.vlm.grpo.dataset import GRPOVisionDataset
 from mlx_vlm.trainer.losses.grpo import grpo_objective
+from mlx_vlm.trainer.vlm.grpo.dataset import GRPOVisionDataset
 from mlx_vlm.trainer.vlm.grpo.loss import completion_logps
 from mlx_vlm.trainer.vlm.grpo.rewards import calculate_rewards_and_advantages
 from mlx_vlm.trainer.vlm.grpo.trainer import generate_grpo
@@ -466,8 +466,8 @@ def test_qwen35_chunked_projection_matches_dense_scores_and_gradients(vision, ti
     from mlx_vlm.tests.test_models import _qwen_patch_model
     from mlx_vlm.trainer import prepare_model_for_training
     from mlx_vlm.trainer.losses.cross_entropy import token_cross_entropy
-    from mlx_vlm.trainer.vlm.grpo.trainer import _cache_frozen_vision
     from mlx_vlm.trainer.vlm.cross_entropy.runtime import forward_vlm_logits
+    from mlx_vlm.trainer.vlm.grpo.trainer import _cache_frozen_vision
 
     model, _ = _qwen_patch_model()
     model.config.image_token_index = model.config.image_token_id = 7
@@ -592,7 +592,8 @@ def test_prompt_length_sorting_reuses_preprocessing_cache(tmp_path):
     helpers = helper_fixtures()
     with (
         patch(
-            "mlx_vlm.trainer.vlm.cross_entropy.dataset._load_vlm_helpers", return_value=helpers
+            "mlx_vlm.trainer.vlm.cross_entropy.dataset._load_vlm_helpers",
+            return_value=helpers,
         ),
         patch(
             "mlx_vlm.trainer.vlm.grpo.dataset.GRPOVisionDataset.process", wraps=None

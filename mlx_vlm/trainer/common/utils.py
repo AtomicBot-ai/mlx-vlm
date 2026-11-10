@@ -320,9 +320,7 @@ def apply_final_accumulated_gradients(
     if gradients is None or partial_steps == 0:
         return 0
 
-    apply_accumulated_gradients(
-        model, optimizer, gradients, partial_steps, grad_clip
-    )
+    apply_accumulated_gradients(model, optimizer, gradients, partial_steps, grad_clip)
     mx.eval(model.state, optimizer.state)
     return partial_steps
 

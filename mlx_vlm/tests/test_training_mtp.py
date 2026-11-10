@@ -315,8 +315,8 @@ def test_cli_exposes_mtp_options():
 
 @pytest.mark.parametrize("algorithm", ["dpo", "orpo"])
 def test_preference_mtp_supervises_only_chosen_policy(algorithm, monkeypatch):
-    from mlx_vlm.trainer.vlm.preference.loss import dpo_vlm_loss, orpo_vlm_loss
     from mlx_vlm.trainer.vlm.mtp import vlm_mtp_loss
+    from mlx_vlm.trainer.vlm.preference.loss import dpo_vlm_loss, orpo_vlm_loss
 
     model = tiny_model()
     pairs = {

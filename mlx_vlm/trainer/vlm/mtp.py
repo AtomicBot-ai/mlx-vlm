@@ -8,6 +8,7 @@ from mlx.utils import tree_flatten
 from mlx_vlm.trainer.common.mtp import mtp_head_dir, split_mtp_weights
 from mlx_vlm.trainer.losses.mtp import mtp_objective
 
+
 def attach_mtp_head(model, head, *, checkpoint_path=None):
     """Attach an unbound Qwen3.5 dense/MoE MTP head after base training setup.
 

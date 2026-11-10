@@ -282,7 +282,8 @@ class DataAndCLITest(unittest.TestCase):
         helpers = ({}, template, prepare, None)
         processor = SimpleNamespace(pad_token_id=7)
         with mock.patch(
-            "mlx_vlm.trainer.vlm.cross_entropy.dataset._load_vlm_helpers", return_value=helpers
+            "mlx_vlm.trainer.vlm.cross_entropy.dataset._load_vlm_helpers",
+            return_value=helpers,
         ):
             for mode, cls in (("sft", VLMTrainingArgs), ("orpo", ORPOTrainingArgs)):
                 with self.subTest(mode=mode):

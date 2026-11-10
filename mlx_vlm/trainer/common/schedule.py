@@ -20,12 +20,18 @@ def build_schedule(schedule_config: dict):
     """
     name = schedule_config.get("name")
     if name not in SCHEDULE_NAMES:
-        raise ValueError(f"lr schedule name must be one of {', '.join(SCHEDULE_NAMES)}.")
+        raise ValueError(
+            f"lr schedule name must be one of {', '.join(SCHEDULE_NAMES)}."
+        )
     arguments = schedule_config.get("arguments")
     if not isinstance(arguments, (list, tuple)) or not arguments:
         raise ValueError("lr schedule requires a non-empty 'arguments' list.")
     initial_lr = arguments[0]
-    if not isinstance(initial_lr, (int, float)) or not math.isfinite(initial_lr) or initial_lr <= 0:
+    if (
+        not isinstance(initial_lr, (int, float))
+        or not math.isfinite(initial_lr)
+        or initial_lr <= 0
+    ):
         raise ValueError("lr schedule initial learning rate must be positive.")
     warmup_steps = schedule_config.get("warmup", 0)
     warmup_init = schedule_config.get("warmup_init", 0.0)
@@ -35,7 +41,9 @@ def build_schedule(schedule_config: dict):
         raise ValueError("lr schedule warmup_init must be nonnegative and finite.")
     bound = getattr(opt.schedulers, name)(*arguments)
     if warmup_steps:
-        warmup_fn = opt.schedulers.linear_schedule(warmup_init, initial_lr, warmup_steps)
+        warmup_fn = opt.schedulers.linear_schedule(
+            warmup_init, initial_lr, warmup_steps
+        )
         return opt.schedulers.join_schedules([warmup_fn, bound], [warmup_steps + 1])
     return bound
 

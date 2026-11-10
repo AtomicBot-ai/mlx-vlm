@@ -78,7 +78,9 @@ def build_parser(task="vlm", algorithm=None):
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--beta1", type=float, default=0.9, help="Adam/AdamW beta1.")
     parser.add_argument("--beta2", type=float, default=0.999, help="Adam/AdamW beta2.")
-    parser.add_argument("--optimizer-eps", type=float, default=1e-8, help="Adam/AdamW epsilon.")
+    parser.add_argument(
+        "--optimizer-eps", type=float, default=1e-8, help="Adam/AdamW epsilon."
+    )
     parser.add_argument(
         "--bias-correction",
         action=argparse.BooleanOptionalAction,
@@ -249,7 +251,11 @@ def parse_args(argv=None, *, task="vlm"):
     for name in ("beta1", "beta2"):
         if not 0 <= getattr(args, name) < 1:
             parser.error(f"{name} must be in [0, 1).")
-    if args.warmup_steps < 0 or not math.isfinite(args.warmup_init) or args.warmup_init < 0:
+    if (
+        args.warmup_steps < 0
+        or not math.isfinite(args.warmup_init)
+        or args.warmup_init < 0
+    ):
         parser.error("warmup_steps and warmup_init must be nonnegative.")
     if not math.isfinite(args.min_learning_rate) or args.min_learning_rate < 0:
         parser.error("min_learning_rate must be nonnegative and finite.")
@@ -257,7 +263,9 @@ def parse_args(argv=None, *, task="vlm"):
         (args.beta1, args.beta2, args.optimizer_eps, args.bias_correction)
         != (0.9, 0.999, 1e-8, False)
     ):
-        parser.error("beta1, beta2, optimizer_eps and bias_correction need adam or adamw.")
+        parser.error(
+            "beta1, beta2, optimizer_eps and bias_correction need adam or adamw."
+        )
     try:
         config = resolve_schedule_config(
             args.lr_schedule,
@@ -383,7 +391,6 @@ def build_optimizer(args, iters, accumulation_steps=1):
 def run(args, settings, training_callback=None):
     """Load resources and call the same Trainer used in notebooks."""
     import mlx.core as mx
-    import mlx.optimizers as optim
 
     from mlx_vlm.trainer.common.callbacks import WandBCallback
 
@@ -439,7 +446,9 @@ def run(args, settings, training_callback=None):
             ],
             "reward_weights": args.reward_weights,
         }
-    optimizer = build_optimizer(args, settings.iters, settings.gradient_accumulation_steps)
+    optimizer = build_optimizer(
+        args, settings.iters, settings.gradient_accumulation_steps
+    )
     trainer = Trainer(
         model,
         settings,

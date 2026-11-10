@@ -285,9 +285,23 @@ def test_cli_builds_scheduled_adamw_over_updates():
 
     args, settings = parse_args(
         [
-            "--model", "m", "--warmup-steps", "2", "--lr-schedule", "cosine_decay",
-            "--learning-rate", "1e-3", "--beta2", "0.95", "--optimizer-eps", "1e-6",
-            "--bias-correction", "--grad-clip", "1.0", "--gradient-accumulation-steps", "2",
+            "--model",
+            "m",
+            "--warmup-steps",
+            "2",
+            "--lr-schedule",
+            "cosine_decay",
+            "--learning-rate",
+            "1e-3",
+            "--beta2",
+            "0.95",
+            "--optimizer-eps",
+            "1e-6",
+            "--bias-correction",
+            "--grad-clip",
+            "1.0",
+            "--gradient-accumulation-steps",
+            "2",
         ]
     )
     assert settings.grad_clip == 1.0

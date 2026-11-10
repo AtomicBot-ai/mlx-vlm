@@ -4,8 +4,8 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from mlx_vlm.trainer.core import TrainingArgs
-from mlx_vlm.trainer.vlm.orpo.trainer import ORPOTrainer, ORPOTrainingArgs
 from mlx_vlm.trainer.vlm.cross_entropy.trainer import SFTTrainer
+from mlx_vlm.trainer.vlm.orpo.trainer import ORPOTrainer, ORPOTrainingArgs
 
 
 class TrainerFacadeTest(unittest.TestCase):

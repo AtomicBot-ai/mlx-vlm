@@ -22,11 +22,7 @@ from ...common.metrics import (
 )
 from ...core import Colors, TrainingArgs, grad_checkpoint, save_adapter
 from ...losses.cross_entropy import cross_entropy
-from .runtime import (
-    model_uses_padding_mask,
-    vlm_batch_metrics,
-    vlm_vision_mask,
-)
+from .runtime import model_uses_padding_mask, vlm_batch_metrics, vlm_vision_mask
 
 
 def _squeeze_leading_batch_dim(value):
@@ -121,9 +117,7 @@ def vision_language_loss_fn(
         if k not in ["input_ids", "pixel_values", "attention_mask", "completion_mask"]
     }
 
-    model_attention_mask = (
-        attention_mask if model_uses_padding_mask(model) else None
-    )
+    model_attention_mask = attention_mask if model_uses_padding_mask(model) else None
     outputs = model(input_ids, pixel_values, model_attention_mask, **kwargs)
     logits = outputs.logits.astype(mx.float32)
 

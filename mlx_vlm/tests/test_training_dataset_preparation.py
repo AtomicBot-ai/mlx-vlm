@@ -5,8 +5,8 @@ from unittest.mock import patch
 
 import mlx.core as mx
 
-from mlx_vlm.trainer.vlm.preference.dataset import PreferenceVisionDataset
 from mlx_vlm.trainer.vlm.cross_entropy.dataset import VisionDataset
+from mlx_vlm.trainer.vlm.preference.dataset import PreferenceVisionDataset
 
 
 class VisionPreparationTest(unittest.TestCase):
@@ -103,7 +103,9 @@ class VisionPreparationTest(unittest.TestCase):
             dataset[i]
 
         messages, kwargs = rendered[0]
-        self.assertEqual([m["role"] for m in messages], ["user", "assistant", "assistant"])
+        self.assertEqual(
+            [m["role"] for m in messages], ["user", "assistant", "assistant"]
+        )
         self.assertEqual(messages[0]["from"], "human")
         self.assertEqual(messages[1]["reasoning_content"], "think")
         self.assertEqual(messages[2]["content"], "")

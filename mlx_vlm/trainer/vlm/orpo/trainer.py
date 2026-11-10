@@ -101,8 +101,11 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
 def _legacy_task(args, loss_fn, train_on_completions, assistant_id):
     """Adapt historical batches and score-based losses to the common engine."""
     from ...common.task import TrainingTask
+    from ..cross_entropy.runtime import (
+        _enable_vlm_gradient_checkpointing,
+        _save_vlm_weights,
+    )
     from ..mtp import add_mtp_loss
-    from ..cross_entropy.runtime import _enable_vlm_gradient_checkpointing, _save_vlm_weights
 
     def objective(model, batch):
         chosen, rejected = batch["chosen"], batch["rejected"]
