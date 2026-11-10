@@ -343,6 +343,11 @@ def test_cli_builds_scheduled_adamw_over_updates():
     lr = optimizer._schedulers["learning_rate"]
     assert float(lr(0)) == 0.0 and float(lr(2)) == pytest.approx(1e-3, rel=1e-2)
     assert float(lr(4)) < 1e-3
+    rates = []
+    for _ in range(4):
+        optimizer.update({}, {})
+        rates.append(float(optimizer.learning_rate))
+    assert rates == pytest.approx([0.0, 5e-4, 1e-3, 5e-4])
 
 
 @pytest.mark.parametrize(

@@ -44,7 +44,7 @@ def build_schedule(schedule_config: dict):
         warmup_fn = opt.schedulers.linear_schedule(
             warmup_init, initial_lr, warmup_steps
         )
-        return opt.schedulers.join_schedules([warmup_fn, bound], [warmup_steps + 1])
+        return opt.schedulers.join_schedules([warmup_fn, bound], [warmup_steps])
     return bound
 
 
