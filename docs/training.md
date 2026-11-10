@@ -536,6 +536,10 @@ adapters when present, and saves the config and processor assets. It derives
 quantization metadata from the exported layers. The live training model is
 restored after saving. The result is a standalone inference model.
 
+An attached MTP head is saved separately in the export's `mtp/` directory using
+its training weights. Load the target with `load(export_path)` and the head with
+`load_drafter(str(export_path / "mtp"), kind="mtp")`.
+
 For non-QAT training the same function keeps the current float/packed layout.
 Force quantization of compatible float layers with:
 

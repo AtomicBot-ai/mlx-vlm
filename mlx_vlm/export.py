@@ -17,6 +17,9 @@ def export_model(
 ):
     """Save a standalone inference model without changing the live training model.
 
+    An attached MTP head is saved separately in ``output_path/mtp`` using its
+    training weights, so the target model and drafter can each load strictly.
+
     Args:
         model: Loaded or trained MLX model. LoRA/DoRA adapters are fused on export.
         processor: Processor returned by load.
@@ -35,7 +38,7 @@ def export_model(
         Path loadable directly with mlx_vlm.load.
     """
     from mlx import nn
-    from mlx.utils import tree_unflatten
+    from mlx.utils import tree_flatten, tree_unflatten
 
     from .trainer.common.qat import QATLinear
     from .trainer.peft import (
@@ -69,7 +72,10 @@ def export_model(
         if replacements:
             model.update_modules(tree_unflatten(replacements))
 
+    head = None
     try:
+        # Keep the training head out of target conversion, weights, and metadata.
+        head = model.pop("mtp_head", None)
         adapters = (
             LoRALinear,
             DoRALinear,
@@ -154,10 +160,18 @@ def export_model(
             config["quantization"] = {**next(iter(parameters.values())), **parameters}
             config["quantization_config"] = config["quantization"]
         save_weights(destination, model)
+        if head is not None:
+            from .trainer.common.mtp import save_mtp_head
+
+            save_mtp_head(
+                head, dict(tree_flatten(head.parameters())), destination / "mtp"
+            )
     finally:
         for originals in reversed(stages):
             if originals:
                 model.update_modules(tree_unflatten(originals))
+        if head is not None:
+            model.mtp_head = head
 
     for pattern in ("*.json", "*.py", "*.txt", "*.jinja", "*.model", "*.tiktoken"):
         for asset in source.glob(pattern):

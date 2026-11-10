@@ -243,3 +243,63 @@ def test_full_checkpoint_restores_qat_detection_automatically(
         "group_size": 32,
         "mode": "affine",
     }
+
+
+@pytest.mark.parametrize("train_type", ["full", "lora"])
+@pytest.mark.parametrize("quantize", [None, True, False])
+def test_export_splits_mtp_head_into_loadable_drafter(tmp_path, train_type, quantize):
+    from mlx_vlm.speculative.drafters import load_drafter
+    from mlx_vlm.tests.test_training_mtp import tiny_model
+
+    (tmp_path / "config.json").write_text("{}")
+    model = prepare_model_for_training(
+        tiny_model(), train_type=train_type, verbose=False
+    )
+    head = model.mtp_head
+    head.fc.weight = head.fc.weight + 0.125
+    output = export_model(
+        model,
+        object(),
+        tmp_path / "export",
+        model_path=str(tmp_path),
+        quantize=quantize,
+        **({"group_size": 32} if quantize else {}),
+    )
+    assert model.mtp_head is head
+    weights = mx.load(str(output / "model.safetensors"))
+    assert not any(name.startswith("mtp_head.") for name in weights)
+    config = json.loads((output / "config.json").read_text())
+    assert not any(
+        name.startswith("mtp_head.") for name in config.get("quantization", {})
+    )
+    target = tiny_model()
+    del target["mtp_head"]
+    target = load_model_weights(target, config, weights, output, strict=True)
+    assert mx.isfinite(target(mx.array([[1, 2, 3]])).logits).all().item()
+
+    restored_head, kind = load_drafter(str(output / "mtp"), strict=True)
+    assert kind == "mtp"
+    restored_weights = dict(tree_flatten(restored_head.parameters()))
+    for name, weight in tree_flatten(head.parameters()):
+        assert mx.array_equal(restored_weights[name], weight).item()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["mlx_vlm.utils.save_weights", "mlx_vlm.trainer.common.mtp.save_mtp_head"],
+)
+def test_failed_mtp_export_restores_training_model(tmp_path, failure):
+    from mlx_vlm.tests.test_training_mtp import tiny_model
+
+    (tmp_path / "config.json").write_text("{}")
+    model = prepare_model_for_training(tiny_model(), verbose=False)
+    head = model.mtp_head
+    original_modules = dict(model.named_modules())
+    with (
+        patch(failure, side_effect=OSError("disk full")),
+        pytest.raises(OSError, match="disk full"),
+    ):
+        export_model(model, object(), tmp_path / "export", model_path=str(tmp_path))
+    assert model.mtp_head is head
+    for name, module in model.named_modules():
+        assert module is original_modules[name]
