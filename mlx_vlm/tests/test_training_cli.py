@@ -257,6 +257,38 @@ def test_cli_qat_export_runs_after_training(tmp_path, qat, force):
         parse_args(["--model", "unused", "--export-quantize"])
 
 
+@pytest.mark.parametrize("qat_flag", [[], ["--qat"]])
+def test_cli_qat_resume_restores_nondefault_quantization(tmp_path, qat_flag):
+    from mlx_vlm.train import _configure_model
+    from mlx_vlm.trainer import prepare_model_for_training
+    from mlx_vlm.trainer.peft import save_adapter
+
+    model = prepare_model_for_training(
+        TinyVLM(),
+        train_type="full",
+        qat=True,
+        quantization_bits=8,
+        quantization_group_size=32,
+        verbose=False,
+    )
+    checkpoint = tmp_path / "weights.safetensors"
+    save_adapter(model, checkpoint)
+    args, _ = parse_args(
+        [
+            "--model",
+            "unused",
+            "--train-type",
+            "full",
+            "--resume-adapter-file",
+            str(checkpoint),
+            *qat_flag,
+        ]
+    )
+    restored = _configure_model(TinyVLM(), args)
+    assert restored.projection.bits == 8
+    assert restored.projection.group_size == 32
+
+
 def test_schedule_warmup_and_updates_count():
     from mlx_vlm.trainer.common.schedule import build_schedule
 

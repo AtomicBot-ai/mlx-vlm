@@ -209,8 +209,18 @@ def test_export_preserves_existing_packed_layers(tmp_path):
 
 
 @pytest.mark.parametrize("restore_adapters", [False, True])
+@pytest.mark.parametrize("qat", [False, True])
+@pytest.mark.parametrize(
+    "quantization",
+    [
+        {},
+        {"quantization_bits": 8},
+        {"quantization_group_size": 32},
+        {"quantization_bits": 8, "quantization_group_size": 32},
+    ],
+)
 def test_full_checkpoint_restores_qat_detection_automatically(
-    tmp_path, restore_adapters
+    tmp_path, restore_adapters, qat, quantization
 ):
     from mlx_vlm.trainer.peft import load_adapters, save_adapter
 
@@ -228,8 +238,10 @@ def test_full_checkpoint_restores_qat_detection_automatically(
     restored = prepare_model_for_training(
         TinyModel(),
         train_type="full",
+        qat=qat,
         checkpoint_path=checkpoint,
         verbose=False,
+        **quantization,
     )
     assert isinstance(restored.projection, QATLinear)
     if restore_adapters:
@@ -243,6 +255,44 @@ def test_full_checkpoint_restores_qat_detection_automatically(
         "group_size": 32,
         "mode": "affine",
     }
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"quantization_bits": 4},
+        {"quantization_group_size": 64},
+        {"quantization_bits": 8, "quantization_group_size": 128},
+    ],
+)
+def test_qat_resume_rejects_conflicting_settings_before_mutating_model(
+    tmp_path, settings
+):
+    from mlx_vlm.trainer.peft import save_adapter
+
+    model = prepare_model_for_training(
+        TinyModel(),
+        train_type="full",
+        qat=True,
+        quantization_bits=8,
+        quantization_group_size=32,
+        verbose=False,
+    )
+    checkpoint = tmp_path / "weights.safetensors"
+    save_adapter(model, checkpoint)
+    fresh = TinyModel()
+    original = fresh.projection.weight
+    with pytest.raises(ValueError, match="QAT settings differ"):
+        prepare_model_for_training(
+            fresh,
+            train_type="full",
+            qat=True,
+            checkpoint_path=checkpoint,
+            verbose=False,
+            **settings,
+        )
+    assert type(fresh.projection) is nn.Linear
+    assert fresh.projection.weight is original
 
 
 @pytest.mark.parametrize("train_type", ["full", "lora"])

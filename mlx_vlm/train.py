@@ -149,7 +149,11 @@ def build_parser(task="vlm", algorithm=None):
         help="Optionally quantize the base before adapter training.",
     )
     parser.add_argument(
-        "--quantization-group-size", type=int, choices=(32, 64, 128), default=64
+        "--quantization-group-size",
+        type=int,
+        choices=(32, 64, 128),
+        default=None,
+        help="Quantization group size (saved QAT setting on resume, otherwise 64).",
     )
     parser.add_argument(
         "--resume-adapter-file",
@@ -312,7 +316,7 @@ def _configure_model(model, args):
         lora_dropout=getattr(args, "lora_dropout", 0),
         target_modules=getattr(args, "target_modules", None),
         quantization_bits=getattr(args, "quantization_bits", None),
-        quantization_group_size=getattr(args, "quantization_group_size", 64),
+        quantization_group_size=getattr(args, "quantization_group_size", None),
         checkpoint_path=getattr(args, "resume_adapter_file", None),
     )
     if getattr(args, "train_vision", False):

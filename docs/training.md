@@ -556,6 +556,8 @@ keep their trained settings unless `bits`/`group_size` are explicitly supplied.
 packed layers remain packed. Forced quantization skips incompatible float layers.
 Full QAT checkpoints now record their QAT settings, so preparation restores them
 automatically on resume. Older checkpoints need explicit QAT settings.
+Saved settings are also restored when `qat=True` or `--qat` is supplied. Explicit
+bit/group settings must match the checkpoint; omit them to restore its settings.
 
 All QAT notebooks end with `export_model(...)`. CLI training supports
 `--export-model-path inference` (the old `--export-qat-path` remains an alias).
