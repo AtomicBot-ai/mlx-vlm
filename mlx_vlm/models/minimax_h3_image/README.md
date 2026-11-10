@@ -5,11 +5,22 @@ Native MLX text-to-image generation and image editing for
 The model uses a Qwen3-VL conditioner, a 33B diffusion transformer with six
 step-specific output heads, and a tiled image VAE.
 
+## Models
+
+| Checkpoint | Download size |
+| --- | ---: |
+| [MiniMaxAI/MiniMax-H3-Image (BF16)](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image) | 135.3 GB |
+| [nativ-community/MiniMax-H3-Image-8bit](https://huggingface.co/nativ-community/MiniMax-H3-Image-8bit) | 77.3 GB |
+| [nativ-community/MiniMax-H3-Image-4bit](https://huggingface.co/nativ-community/MiniMax-H3-Image-4bit) | 54.5 GB |
+
+The 4-bit and 8-bit conversions use affine quantization with group size 64.
+The VAE and sensitive transformer projections retain their original precision.
+
 ## Generate
 
 ```sh
 mlx_vlm.generate --output-modality image \
-  --model MiniMaxAI/MiniMax-H3-Image \
+  --model nativ-community/MiniMax-H3-Image-4bit \
   --prompt "A red ceramic teapot on a wooden table beside a sunlit window, soft morning light, detailed natural textures" \
   --size 4096x4096 --seed 42 --output teapot.png
 ```
@@ -17,7 +28,7 @@ mlx_vlm.generate --output-modality image \
 ```python
 from mlx_vlm.generate import generate_image, load_image_generation_model
 
-model = load_image_generation_model("MiniMaxAI/MiniMax-H3-Image")
+model = load_image_generation_model("nativ-community/MiniMax-H3-Image-4bit")
 result = generate_image(
     model,
     "A red ceramic teapot on a wooden table beside a sunlit window",
@@ -30,7 +41,7 @@ result = generate_image(
 
 ```sh
 mlx_vlm.generate --output-modality image --task edit \
-  --model MiniMaxAI/MiniMax-H3-Image \
+  --model nativ-community/MiniMax-H3-Image-4bit \
   --image teapot.png \
   --prompt "Make the teapot in <Picture 1> blue, preserving its shape, the room, and the lighting" \
   --size 4096x4096 --seed 42 --output blue-teapot.png
@@ -62,7 +73,7 @@ Use an already expanded caption without another expansion:
 
 ```sh
 mlx_vlm.generate --output-modality image \
-  --model MiniMaxAI/MiniMax-H3-Image \
+  --model nativ-community/MiniMax-H3-Image-4bit \
   --prompt "A detailed caption that is ready for the image model" \
   --gen-kwargs '{"upsample_prompt":false}' \
   --size 4096x4096 --output image.png
@@ -107,6 +118,6 @@ invalid answers raise an error before image generation starts.
   Internal canvas dimensions round to multiples of 32.
 
 Weights use the [MiniMax H3 Image Community License](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image/blob/main/LICENSE).
-The bundled prompt-expansion templates come from
+The prompt-expansion templates are embedded in Python and come from
 [MiniMax-H3-Image-PE](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image-PE/tree/main/prompt)
 under the same MiniMax H3 Image Community License as the model weights.
