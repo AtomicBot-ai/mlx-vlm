@@ -152,8 +152,9 @@ def prepare_model_for_training(
     lora_alpha: float = 16.0,
     lora_dropout: float = 0.0,
     target_modules: Sequence[str] | None = None,
+    qat: bool = False,
     quantization_bits: int | None = None,
-    quantization_group_size: int = 64,
+    quantization_group_size: int | None = None,
     checkpoint_path: str | Path | None = None,
     verbose: bool = True,
 ) -> nn.Module:
@@ -168,10 +169,12 @@ def prepare_model_for_training(
         lora_dropout: Adapter input dropout for a new adapter.
         target_modules: Optional Linear suffixes or qualified module names.
             Defaults to the language/embedding transformer's Linear layers.
+        qat: Enable weight-only affine QAT for full training. Defaults to 4 bits.
         quantization_bits: Optionally quantize eligible Linear/Embedding layers
             before attaching adapters. None keeps the loaded representation,
             or restores the saved representation when loading a checkpoint.
         quantization_group_size: Group size for optional affine quantization.
+            None restores saved QAT settings or defaults to 64 for a new run.
         checkpoint_path: Saved weights file or folder. Adapter checkpoints
             restore their saved LoRA/DoRA settings; full checkpoints restore
             all model weights. Optimizer state is not restored.
@@ -182,15 +185,18 @@ def prepare_model_for_training(
     """
     if train_type not in {"lora", "dora", "full"}:
         raise ValueError("train_type must be 'lora', 'dora', or 'full'.")
+    if qat:
+        if train_type != "full":
+            raise ValueError("QAT requires train_type='full'.")
     if quantization_bits is not None:
         if quantization_bits not in {4, 8}:
             raise ValueError("quantization_bits must be 4 or 8, or None.")
-        if quantization_group_size not in {32, 64, 128}:
-            raise ValueError("quantization_group_size must be 32, 64, or 128.")
-        if train_type == "full":
-            raise ValueError(
-                "Full training needs floating-point weights; leave quantization_bits=None."
-            )
+    if quantization_group_size is not None and quantization_group_size not in {
+        32,
+        64,
+        128,
+    }:
+        raise ValueError("quantization_group_size must be 32, 64, 128, or None.")
 
     import mlx.nn as nn
 
@@ -209,6 +215,36 @@ def prepare_model_for_training(
             checkpoint_path, require_config=train_type != "full"
         )
 
+    saved_qat = (config or {}).get("qat") if train_type == "full" else None
+    if saved_qat:
+        if (
+            not isinstance(saved_qat, dict)
+            or saved_qat.get("bits") not in {4, 8}
+            or saved_qat.get("group_size") not in {32, 64, 128}
+        ):
+            raise ValueError("Invalid QAT settings in checkpoint metadata.")
+        if (
+            quantization_bits is not None and quantization_bits != saved_qat["bits"]
+        ) or (
+            quantization_group_size is not None
+            and quantization_group_size != saved_qat["group_size"]
+        ):
+            raise ValueError(
+                "QAT settings differ from the saved checkpoint; leave "
+                "quantization_bits and quantization_group_size=None to restore them."
+            )
+        qat = True
+        quantization_bits = saved_qat["bits"]
+        quantization_group_size = saved_qat["group_size"]
+    if qat and quantization_bits is None:
+        quantization_bits = 4
+    if quantization_group_size is None:
+        quantization_group_size = 64
+    if train_type == "full" and quantization_bits is not None and not qat:
+        raise ValueError(
+            "Full training needs floating-point weights; leave quantization_bits=None."
+        )
+
     if train_type == "full":
         if config is not None and config.get("fine_tune_type") != "full":
             raise ValueError(
@@ -217,8 +253,18 @@ def prepare_model_for_training(
         _dequantize_model(model)
         if weights is not None:
             model.load_weights(str(weights), strict=True)
+        if qat:
+            from .qat import apply_qat
+
+            apply_qat(model, bits=quantization_bits, group_size=quantization_group_size)
         model.unfreeze()
-        _record_adapter_config(model, {"fine_tune_type": "full"})
+        metadata = {"fine_tune_type": "full"}
+        if qat:
+            metadata["qat"] = {
+                "bits": quantization_bits,
+                "group_size": quantization_group_size,
+            }
+        _record_adapter_config(model, metadata)
     else:
         if config is not None and config.get("fine_tune_type") == "full":
             raise ValueError(
