@@ -151,6 +151,8 @@ jobs:
               tests/test_flux3_upsampler.py
               tests/test_image_generation_models.py
               tests/test_llada_image.py
+              tests/test_minimax_h3_image.py
+              tests/test_minimax_h3_prompt_expansion.py
               tests/test_moss_image.py
               tests/test_muse_spark_video.py
               tests/test_three_d.py

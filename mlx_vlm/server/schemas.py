@@ -106,12 +106,13 @@ class ImageGenerationRequest(FlexibleBaseModel):
     prompt_expansion_model: Optional[str] = Field(
         None,
         description=(
-            "Model path or Hugging Face repo for prompt expansion. Flux3 uses "
-            "its default upsampler when omitted; Ideogram 4 expansion is optional."
+            "Model path or Hugging Face repo for prompt expansion. Flux3 and MiniMax-H3-Image use "
+            "their default upsamplers when omitted; Ideogram 4 expansion is optional."
         ),
     )
     upsample_prompt: bool | None = Field(
-        None, description="For Flux3, expand prompts automatically; enabled by default."
+        None,
+        description="For Flux3 and MiniMax-H3-Image, expand prompts automatically; enabled by default.",
     )
     boxes: list[dict[str, Any]] | None = Field(
         None,
@@ -194,11 +195,11 @@ class ImageEditRequest(FlexibleBaseModel):
     )
     prompt_expansion_model: str | None = Field(
         None,
-        description="For Flux3, override the default prompt upsampler with a model path or Hub ID.",
+        description="For Flux3 and MiniMax-H3-Image, override the default prompt upsampler with a model path or Hub ID.",
     )
     upsample_prompt: bool | None = Field(
         None,
-        description="For Flux3, expand the instruction using reference images; enabled by default.",
+        description="For Flux3 and MiniMax-H3-Image, expand the instruction using reference images; enabled by default.",
     )
     boxes: list[dict[str, Any]] | None = Field(
         None,

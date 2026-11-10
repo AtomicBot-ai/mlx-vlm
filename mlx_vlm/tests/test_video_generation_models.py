@@ -872,7 +872,7 @@ def test_official_layout_conversion_and_strict_reload(tmp_path, monkeypatch):
     t2_plan = h3.download_plan("t2va")
     fl_plan = h3.download_plan("fl2va")
     ref_plan = h3.download_plan("ref2va")
-    assert t2_plan.revision == "b3c7290e66afdf293bef3b9077b7a266ef421f34"
+    assert t2_plan.revision == "main"
     assert h3.download_plan("t2va", repo_id="test-org/minimax-h3").revision is None
     assert t2_plan.partition == "fl2va"
     assert t2_plan.components == fl_plan.components

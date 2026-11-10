@@ -43,6 +43,7 @@ exclude = ["mlx_vlm.tests*"]
 
 [tool.setuptools.package-data]
 mlx_vlm = ["py.typed"]
+"mlx_vlm.models.minimax_h3_image" = ["prompts/**/*.txt", "prompts/**/*.json"]
 
 [tool.setuptools.dynamic]
 version = {attr = "mlx_vlm.version.__version__"}

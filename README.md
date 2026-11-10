@@ -83,6 +83,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | Gemma 4 | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/gemma4/README.md) |
 | Muse Spark Open | [Docs](mlx_vlm/models/muse_spark/README.md) |
 | MiniMax M3 / M3.1 Flash | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/minimax_m3_vl/README.md) |
+| MiniMax-H3-Image | [Docs](mlx_vlm/models/minimax_h3_image/README.md) |
 | Falcon-OCR | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/falcon_ocr/README.md) |
 | IndicOCR | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/indic_ocr/README.md) |
 | PP-DocLayoutV3 | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/pp_doclayout_v3/README.md) |
