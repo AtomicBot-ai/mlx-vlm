@@ -4,6 +4,7 @@ import importlib
 import json
 from contextlib import nullcontext
 from copy import deepcopy
+from dataclasses import replace
 from itertools import product
 from math import prod
 from pathlib import Path
@@ -339,7 +340,9 @@ def test_mistral_dspark_admits_requests_while_batch_is_active(cancel, sampling, 
         generator.close()
 
 
-@parametrize("family", ["dflash2", "dspark-lfm2", "mistral", "gemma"])
+@parametrize(
+    "family", ["dflash2", "ricursive-dflash2", "dspark-lfm2", "mistral", "gemma"]
+)
 @parametrize("pause_after", [1, 8])
 @parametrize("sampling", [False, True])
 @parametrize("phased", [False, True])
@@ -1182,6 +1185,12 @@ def language(family, *, inference=False, **overrides):
 
 
 def dflash_target(family):
+    if family == "ricursive-dflash2":
+        arch = module("models.ricursive")
+        target = arch.Model(build_config(arch, model_case("ricursive")["config"]))
+        target.set_dtype(mx.bfloat16)
+        target.eval()
+        return target
     if family in ("dflash2", "dspark-qwen"):
         model, _ = language("qwen")
         model.set_dtype(mx.bfloat16)
@@ -1228,11 +1237,15 @@ def dflash_drafter(family):
     arch, name = get_model_and_args(config)
     expected = (
         "dflash2"
-        if family == "dflash2"
+        if family in ("dflash2", "ricursive-dflash2")
         else "muse_glimmer_assistant" if family == "glimmer" else "dspark"
     )
     assert name == expected
-    return arch.Model(arch.ModelConfig.from_dict(config))
+    drafter = arch.Model(arch.ModelConfig.from_dict(config))
+    if family == "ricursive-dflash2":
+        drafter.set_dtype(mx.bfloat16)
+        drafter.eval()
+    return drafter
 
 
 def mtp_drafter(family, config):
@@ -1391,7 +1404,15 @@ def generated(target, drafter=None, *, seed=41, temperature=0, prefill_step_size
 
 
 @parametrize(
-    "family", ["dflash2", "glimmer", "dspark-lfm2", "dspark-lfm2-moe", "dspark-qwen"]
+    "family",
+    [
+        "dflash2",
+        "ricursive-dflash2",
+        "glimmer",
+        "dspark-lfm2",
+        "dspark-lfm2-moe",
+        "dspark-qwen",
+    ],
 )
 @parametrize("temperature,seed", [(0, 41), (0.5, 41), (1.0, 41), (0.7, None)])
 def test_generation_and_request_reset(family, temperature, seed):
@@ -1408,6 +1429,296 @@ def test_generation_and_request_reset(family, temperature, seed):
         assert 999 not in drafter.accept_lens + drafter.draft_lens
         drafter.accept_lens.append(999)
         drafter.draft_lens.append(999)
+
+
+def test_ricursive_dflash_capture_order_and_shared_weights():
+    mx.random.seed(53)
+    target = dflash_target("ricursive-dflash2")
+    model = target.language_model
+    drafter = dflash_drafter("ricursive-dflash2")
+    drafter.bind(target)
+    assert drafter.embed_tokens is model.model.embed_tokens
+    assert drafter.lm_head is model.lm_head
+    # The released drafter shares the raw embedding table, before target scaling.
+    assert drafter.embed_scale == 1.0
+    ids = mx.array([[1, 2, 3, 4, 5, 6, 7, 8, 9]])
+    actual = model(ids, capture_layer_ids=[4, 0, 2])
+    captured = model(ids, capture_layer_ids=list(range(5))).hidden_states
+    equal(actual.hidden_states, [captured[index] for index in [4, 0, 2]])
+    for invalid in ([0, 0], [-1], [5], [True]):
+        with pytest.raises(ValueError, match="capture_layer_ids"):
+            model(ids, capture_layer_ids=invalid)
+
+
+@parametrize("layer_index", [0, 1])
+def test_ricursive_dflash_no_rope_and_four_tap_convolution(layer_index):
+    drafter = dflash_drafter("ricursive-dflash2")
+    layer = drafter.layers[layer_index]
+    calls = []
+
+    def rope(x, offset=0):
+        calls.append(offset)
+        return drafter.rope(x, offset=offset)
+
+    assert drafter.config.no_rope_layers == [1]
+    assert layer.attention_conv.base_kernel.shape == (2, 4, 64)
+    output = layer(
+        mx.ones((1, 3, 64), dtype=mx.bfloat16),
+        mx.ones((1, 6, 64), dtype=mx.bfloat16),
+        rope,
+        KVCache(),
+    )
+    assert mx.isfinite(output).all().item()
+    assert len(calls) == (3 if layer_index == 0 else 0)
+
+
+@parametrize("quantized_weights", [False, True])
+@parametrize("batch", [1, 2])
+@parametrize("prefix,length", [(0, 3), (7, 10)])
+def test_ricursive_dflash_verification_and_rotating_rollback(
+    quantized_weights, batch, prefix, length
+):
+    mx.random.seed(73)
+    target = dflash_target("ricursive-dflash2")
+    model = target.language_model
+    if quantized_weights:
+        # Exercise the fused affine kernel as well as native batch fallback.
+        model = type(model)(
+            replace(model.config, hidden_size=512, intermediate_size=1024, head_dim=128)
+        )
+        model.set_dtype(mx.bfloat16)
+        nn.quantize(model, group_size=64, bits=4)
+        model.eval()
+    caches = [
+        model.make_cache() if batch == 1 else _make_cache(model, [0] * batch)
+        for _ in range(2)
+    ]
+    prompt = mx.random.randint(0, 128, (batch, prefix))
+    if prefix:
+        for cache in caches:
+            mx.eval(model(prompt, cache=cache).logits)
+    for accepted in (0, length // 2, length - 1):
+        block = mx.random.randint(0, 128, (batch, length))
+        serial_cache = deepcopy(caches[0])
+        serial = [
+            model(
+                block[:, index : index + 1],
+                cache=serial_cache,
+                capture_layer_ids=[0, 2, 4],
+            )
+            for index in range(length)
+        ]
+        actual = model(
+            block, cache=caches[1], capture_layer_ids=[0, 2, 4], speculative_verify=True
+        )
+        equal(actual.logits, mx.concatenate([part.logits for part in serial], axis=1))
+        equal(
+            actual.hidden_states,
+            [
+                mx.concatenate(parts, axis=1)
+                for parts in zip(*(part.hidden_states for part in serial))
+            ],
+        )
+        model.rollback_speculative_cache(caches[1], actual.gdn_states, accepted, length)
+        assert not actual.gdn_states.active
+        for index in range(accepted + 1):
+            mx.eval(model(block[:, index : index + 1], cache=caches[0]).logits)
+        probe = mx.random.randint(0, 128, (batch, 1))
+        equal(
+            model(probe, cache=caches[0]).logits, model(probe, cache=caches[1]).logits
+        )
+        for reference, restored in zip(*caches):
+            equal(mx.array(reference.offset), mx.array(restored.offset))
+        aborted = model(
+            block, cache=caches[1], capture_layer_ids=[0, 2, 4], speculative_verify=True
+        )
+        mx.eval(aborted.logits)
+        aborted.gdn_states.abort()
+        equal(
+            model(probe, cache=caches[0]).logits, model(probe, cache=caches[1]).logits
+        )
+
+
+@parametrize("family", ["dflash2", "ricursive-dflash2"])
+@parametrize("batch", [1, 2, 4])
+def test_dflash2_batched_drafting_keeps_independent_caches(family, batch):
+    mx.random.seed(103)
+    target, draft = dflash_target(family), dflash_drafter(family)
+    target.language_model.set_dtype(mx.float32)
+    draft.set_dtype(mx.float32)
+    draft.bind(target)
+    draft.eval()
+    for layer in draft.layers:
+        for conv in (layer.attention_conv, layer.mlp_conv):
+            conv.base_kernel = mx.random.normal(conv.base_kernel.shape) * 0.05
+    serial_caches = [draft.make_cache() for _ in range(batch)]
+    batch_caches = [draft.make_cache() for _ in range(batch)]
+    width = draft.config.hidden_size * len(draft.config.target_layer_ids)
+    for step in range(3):
+        hidden = [
+            mx.random.normal((1, (11 - row) if step == 0 else row + 1, width))
+            for row in range(batch)
+        ]
+        anchors = list(range(1 + step, batch + 1 + step))
+        expected = mx.concatenate(
+            [
+                draft.draft_block(anchor, h, cache, 3, greedy)
+                for anchor, h, cache in zip(anchors, hidden, serial_caches)
+            ]
+        )
+        actual = draft.draft_batch(anchors, hidden, batch_caches, 3, greedy, mx.int32)
+        equal(actual, expected)
+        for actual_row, expected_row in zip(batch_caches, serial_caches):
+            for actual_cache, expected_cache in zip(actual_row, expected_row):
+                assert actual_cache.offset == expected_cache.offset
+                equal(actual_cache.state, expected_cache.state, atol=2e-5, rtol=2e-5)
+
+
+@parametrize("prefix,padding", [(0, 0), (3, 0), (3, 2), (9, 0), (9, 2)])
+def test_ricursive_ragged_verification_matches_independent_requests(prefix, padding):
+    mx.random.seed(127)
+    model = dflash_target("ricursive-dflash2").language_model
+    model.set_dtype(mx.float32)
+    cache = _make_cache(model, [0, padding])
+    if prefix:
+        mx.eval(model(mx.random.randint(1, 30, (2, prefix)), cache=cache).logits)
+    references = [deepcopy(cache) for _ in range(2)]
+    for i, row in enumerate(references):
+        for entry in row:
+            entry.filter(mx.array([i], mx.int32))
+    for accepted in ([1, 3], [4, 2], [2, 4]):
+        ids = mx.random.randint(1, 30, (2, 4))
+        expected = []
+        for i, row in enumerate(references):
+            temporary = deepcopy(row)
+            outputs = [
+                model(ids[i : i + 1, t : t + 1], cache=temporary).logits
+                for t in range(4)
+            ]
+            expected.append(mx.concatenate(outputs, axis=1))
+        actual = model(
+            ids, cache=cache, capture_layer_ids=[0, 2, 4], speculative_verify=True
+        )
+        equal(actual.logits, mx.concatenate(expected), atol=3e-5, rtol=3e-5)
+        actual.gdn_states.commit(accepted)
+        for i, (row, count) in enumerate(zip(references, accepted)):
+            for t in range(count):
+                mx.eval(model(ids[i : i + 1, t : t + 1], cache=row).logits)
+            for a, e in zip(cache, row):
+                a, e = a.extract(i), e.extract(0)
+                assert a.offset == e.offset
+                equal(a.state, e.state, atol=3e-5, rtol=3e-5)
+
+
+@parametrize("window", [None, 8])
+def test_ricursive_cache_batch_lifecycle(window):
+    arch = module("models.ricursive.cache")
+
+    def single():
+        return arch.KVCache() if window is None else arch.RotatingKVCache(window)
+
+    def content(cache):
+        if window is None:
+            return cache.state
+        return tuple(
+            cache._temporal_order(getattr(cache, name))[..., -window:, :]
+            for name in ("keys", "values")
+        )
+
+    original = single()
+    k = mx.arange(20, dtype=mx.float32).reshape(1, 1, 5, 4)
+    original.update_and_fetch(k, k * 2)
+    warm = original.to_batch([3])
+    equal(content(warm.extract(0)), content(original))
+    with pytest.raises(ValueError):
+        original.to_batch([0, 0])
+    batch = original.prefix_cache_merge([original, original], [5, 5])
+    transaction = start_speculative_cache([batch], 4)
+    for t in range(4):
+        block = mx.full((2, 1, 1, 4), t + 20, mx.float32)
+        batch.update_and_fetch(block, block * 2)
+    transaction.commit([1, 3])
+    references = [batch.extract(i) for i in range(2)] + [original]
+    batch = type(batch).from_state(batch.state, batch.meta_state)
+    batch.extend(warm)
+    batch.filter(mx.array([2, 0, 1], mx.int32))
+    for i, reference in enumerate([references[j] for j in [2, 0, 1]]):
+        equal(content(batch.extract(i)), content(reference))
+    batch.prepare(lengths=[1, 2, 3], right_padding=[2, 1, 0])
+    block = mx.full((3, 1, 3, 4), 42, mx.float32)
+    batch.update_and_fetch(block, block * 2)
+    batch.finalize()
+    for i, (reference, n) in enumerate(
+        zip([references[j] for j in [2, 0, 1]], [1, 2, 3])
+    ):
+        reference.update_and_fetch(block[i : i + 1, :, :n], block[i : i + 1, :, :n] * 2)
+        assert batch.extract(i).offset == reference.offset
+        equal(content(batch.extract(i)), content(reference))
+
+    empty = single().to_batch([0, 1])
+    restored = type(empty).from_state(empty.state, empty.meta_state)
+    restored.update_and_fetch(block[:2], block[:2])
+    equal(restored.offset, mx.array([3, 2]))
+
+
+@parametrize("dtype", [mx.bfloat16, mx.float16])
+@parametrize("bits", [2, 4, 8])
+@parametrize("batch,length", [(2, 3), (4, 5), (8, 8)])
+def test_native_affine_batch_projection(dtype, bits, batch, length):
+    from mlx_vlm.models.quantized import native_affine_batch_linear
+
+    mx.random.seed(131)
+    for group_size, outputs in [(32, 67), (64, 1024), (128, 256)]:
+        layer = nn.Linear(512, outputs, bias=True)
+        layer.set_dtype(dtype)
+        layer = layer.to_quantized(group_size=group_size, bits=bits)
+        layer.eval()
+        inputs = mx.random.normal((batch, length, 512)).astype(dtype)
+        actual = native_affine_batch_linear(layer, inputs)
+        if actual is None:
+            pytest.skip("Native affine batch QMV is unavailable on this device")
+        expected = mx.concatenate(
+            [layer(mx.contiguous(inputs[:, t : t + 1])) for t in range(length)], axis=1
+        )
+        equal(actual, expected)
+
+
+@parametrize(
+    "dtype,kind",
+    [(dtype, "dense") for dtype in (mx.bfloat16, mx.float16)]
+    + list(
+        product(
+            (mx.bfloat16, mx.float16, mx.float32),
+            ("weight_scale_2", "weight_global_scale"),
+        )
+    ),
+)
+@parametrize("batch,length", [(1, 3), (2, 4), (4, 5), (8, 8)])
+def test_native_block_projection(dtype, batch, length, kind):
+    from mlx_vlm.models.linear import native_block_linear
+
+    mx.random.seed(1337)
+    for inputs, outputs in [(1024, 67), (1024, 2048), (4096, 512)]:
+        layer = nn.Linear(inputs, outputs, bias=kind != "dense")
+        layer.weight = mx.random.normal(layer.weight.shape)
+        layer.set_dtype(dtype)
+        if kind != "dense":
+            layer = ScaledQuantizedLinear(
+                layer.to_quantized(group_size=16, bits=4, mode="nvfp4"),
+                mx.array(0.027 if kind == "weight_scale_2" else 37.0),
+                kind,
+                pre_quant_scale=mx.random.uniform(0.5, 1.5, (inputs,)),
+            )
+        layer.eval()
+        x = mx.random.normal((batch, length, inputs)).astype(dtype)
+        actual = native_block_linear(layer, x)
+        if actual is None:
+            pytest.skip("Native block projection is unavailable on this device")
+        expected = mx.concatenate(
+            [layer(mx.contiguous(x[:, t : t + 1])) for t in range(length)], axis=1
+        )
+        equal(actual, expected)
+        equal(native_batch_linear(layer, x), expected)
 
 
 @parametrize(
@@ -2102,7 +2413,9 @@ def test_split_and_requantize_checkpoint(tmp_path, family, quant):
     assert (key + ".biases" in written) == (quant == "affine")
 
 
-@parametrize("family", ["dflash2", "glimmer", "dspark-lfm2", "dspark-qwen"])
+@parametrize(
+    "family", ["dflash2", "ricursive-dflash2", "glimmer", "dspark-lfm2", "dspark-qwen"]
+)
 def test_checkpoint_routing_and_validation(tmp_path, family):
     settings = dflash_config(family)
     (tmp_path / "config.json").write_text(json.dumps(settings))

@@ -163,17 +163,15 @@ def start_speculative_cache(
     transaction = SpeculativeCacheTransaction(entries, positions, leaves, length)
     try:
         for cache in leaves:
-            if isinstance(cache, (RotatingKVCache, BatchRotatingKVCache)):
-                # A block append may evict or rotate the serving window. Merely
-                # decrementing its cursor exposes rejected keys on the next
-                # decode. Retain the bounded window and replay accepted KV only.
-                transaction._rotating[id(cache)] = _RotatingCacheTransaction(cache)
-                continue
             start = getattr(cache, "start_speculation", None)
             if callable(start) and (
                 cache_types is None or isinstance(cache, cache_types)
             ):
                 entries.append((cache, start(length)))
+            elif isinstance(cache, (RotatingKVCache, BatchRotatingKVCache)):
+                # Native cache transactions take precedence; older rotating
+                # caches retain the bounded replay adapter.
+                transaction._rotating[id(cache)] = _RotatingCacheTransaction(cache)
             else:
                 read_position = _cache_position_reader(cache)
                 if read_position is not None and callable(getattr(cache, "trim", None)):

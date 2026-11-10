@@ -388,7 +388,10 @@ def exact_quantized_linear(linear, x: mx.array) -> Optional[mx.array]:
         return None
     if x.shape[1] <= 1:
         return linear(x)
-    return _exact_time_batch(linear, x)
+    from .quantized import native_affine_batch_linear
+
+    output = native_affine_batch_linear(linear, x)
+    return _exact_time_batch(linear, x) if output is None else output
 
 
 def singleton_quantized_linear(linear, x: mx.array) -> Optional[mx.array]:

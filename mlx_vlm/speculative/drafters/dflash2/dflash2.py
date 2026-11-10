@@ -8,6 +8,10 @@ from ..qwen3_dflash.dflash import DFlashDecoderLayer, DFlashDraftModel
 from .config import DFlash2Config
 
 
+def _no_rope(x, offset=0):
+    return x
+
+
 def _grouped_dynamic_convolve(
     hidden: mx.array,
     dynamic: mx.array,
@@ -65,6 +69,7 @@ class GroupedDynamicCausalConv(nn.Module):
 class DFlash2DecoderLayer(DFlashDecoderLayer):
     def __init__(self, config: DFlash2Config, layer_idx: int):
         super().__init__(config, layer_idx)
+        self.use_rope = layer_idx not in config.no_rope_layers
         self.attention_conv = GroupedDynamicCausalConv(
             config.hidden_size, config.conv_kernel_size, config.conv_group_size
         )
@@ -73,11 +78,31 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
         )
 
     def __call__(self, x, x_ctx, rope, cache, projected_context=None):
+        if not self.use_rope:
+            rope = _no_rope
+        return self._forward(
+            x, lambda h: self.self_attn(h, x_ctx, rope, cache, projected_context)
+        )
+
+    def forward_batch(self, x, contexts, rope, caches, projected_contexts):
+        if not self.use_rope:
+            rope = _no_rope
+        return self._forward(
+            x,
+            lambda h: mx.concatenate(
+                [
+                    self.self_attn(h[row : row + 1], context, rope, cache, projected)
+                    for row, (context, cache, projected) in enumerate(
+                        zip(contexts, caches, projected_contexts)
+                    )
+                ]
+            ),
+        )
+
+    def _forward(self, x, attend):
         residual = x
         x, kernel = self.attention_conv.prepare(self.input_layernorm(x))
-        x = residual + self.attention_conv.finish(
-            self.self_attn(x, x_ctx, rope, cache, projected_context), kernel
-        )
+        x = residual + self.attention_conv.finish(attend(x), kernel)
         residual = x
         x, kernel = self.mlp_conv.prepare(self.post_attention_layernorm(x))
         return residual + self.mlp_conv.finish(self.mlp(x), kernel)
@@ -159,6 +184,46 @@ class DFlash2DraftModel(DFlashDraftModel):
             softcap = self.config.final_logit_softcapping
             logits = mx.tanh(logits / softcap) * softcap
         return logits
+
+    def draft_batch(self, anchors, hidden, caches, block_size, sampler, token_dtype):
+        """Share dense draft work while retaining each request's attention cache."""
+        if len(anchors) == 1:
+            return self.draft_block(
+                anchors[0], hidden[0], caches[0], block_size, sampler, token_dtype
+            )
+        count = int(block_size) - 1
+        if count <= 0:
+            return mx.zeros((len(anchors), 0), dtype=token_dtype)
+        anchor = mx.array(anchors, dtype=token_dtype)
+        masks = mx.full(
+            (len(anchors), count), int(self.config.mask_token_id), dtype=token_dtype
+        )
+        x = self._embed_input_tokens(mx.concatenate([anchor[:, None], masks], axis=1))
+        context = self.hidden_norm(self.fc(mx.concatenate(hidden, axis=1)))
+        boundaries, offset = [], 0
+        for segment in hidden[:-1]:
+            offset += segment.shape[1]
+            boundaries.append(offset)
+        contexts = mx.split(context, boundaries, axis=1)
+        projected = self._project_context_kv(context)
+        for index, layer in enumerate(self.layers):
+            if projected is None:
+                layer_contexts = [None] * len(anchors)
+            else:
+                layer_contexts = list(
+                    zip(*(mx.split(v, boundaries, axis=1) for v in projected[index]))
+                )
+            x = layer.forward_batch(
+                x,
+                contexts,
+                self.rope,
+                [cache[index] for cache in caches],
+                layer_contexts,
+            )
+        x = self.norm(x)[:, 1:]
+        return self.candidate_selector.select(
+            x, self._logits(x), anchor, sampler
+        ).astype(token_dtype)
 
     def draft_block(
         self,

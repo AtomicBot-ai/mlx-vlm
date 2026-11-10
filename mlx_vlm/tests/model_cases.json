@@ -2,6 +2,36 @@
   "version": 2,
   "cases": [
     {
+      "id": "ricursive",
+      "module": "ricursive",
+      "config": {
+        "hidden_size": 64,
+        "intermediate_size": 128,
+        "num_hidden_layers": 5,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 32,
+        "vocab_size": 128,
+        "sliding_window": 4,
+        "use_valres": true,
+        "embed_scale": 8.0,
+        "ffn_clamp_threshold": 0.7
+      },
+      "checks": [
+        "language",
+        "input_embeddings",
+        "forward_cache"
+      ],
+      "forward_cache": {
+        "chunk_sizes": [
+          1,
+          2,
+          3,
+          6
+        ]
+      }
+    },
+    {
       "id": "mistral_large4",
       "module": "mistral_large4",
       "config": {
@@ -3986,6 +4016,31 @@
       "tie_word_embeddings": false
     },
     "dflash_variants": {
+      "ricursive-dflash2": {
+        "architectures": ["DFlash2DraftModel"],
+        "hidden_size": 64,
+        "intermediate_size": 128,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 32,
+        "vocab_size": 128,
+        "num_target_layers": 5,
+        "layer_types": ["sliding_attention", "full_attention"],
+        "sliding_window": 8,
+        "no_rope_layers": [1],
+        "dflash_config": {
+          "block_size": 16,
+          "runtime_block_size": 4,
+          "conv_group_size": 16,
+          "conv_kernel_size": 4,
+          "mask_token_id": 127,
+          "selector_rank": 8,
+          "selector_top_k": 8,
+          "target_layer_ids": [0, 2, 4]
+        },
+        "is_causal": false
+      },
       "dflash2": {
         "architectures": ["DFlash2DraftModel"],
         "dflash_config": {

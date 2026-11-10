@@ -26,6 +26,7 @@ class DFlash2Config(DFlashConfig):
     selector_rank: int = 0
     selector_top_k: int = 0
     is_causal: bool = False
+    no_rope_layers: list[int] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.layer_types:
