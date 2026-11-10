@@ -1087,6 +1087,33 @@ class ModelChecks:
         assert isinstance(result, InputEmbeddingsFeatures), model_name
         assert result.inputs_embeds is not None
 
+    def deepstack_eval_follows_mode(self, model, config):
+        vc = config.vision_config
+        patch_width = vc.in_channels * vc.temporal_patch_size * vc.patch_size**2
+        grid = (1, 4, 4)
+        count = math.prod(grid) // vc.spatial_merge_size**2
+        ids = mx.array(
+            [
+                [1, config.vision_start_token_id]
+                + [config.image_token_id] * count
+                + [config.vision_end_token_id, 2]
+            ]
+        )
+        media = {
+            "pixel_values": mx.random.normal((math.prod(grid), patch_width)),
+            "image_grid_thw": mx.array([grid]),
+        }
+        real_eval = mx.eval
+        for training in (False, True):
+            model.train(training)
+            with patch.object(mx, "eval", side_effect=real_eval) as spy:
+                features = model.get_input_embeddings(ids, **media)
+            evaluated = any(
+                call.args and call.args[0] is features.deepstack_visual_embeds
+                for call in spy.call_args_list
+            )
+            assert evaluated is not training
+
     def request_positions(self, model):
         language = model.language_model
         positions, deltas = mx.array([[[9, 9, 9]]], mx.int32), mx.array(
@@ -1415,6 +1442,8 @@ def check_arguments(kind, case, model, config):
         return (model, name), {}
     if kind == "audio":
         return (model, config, name), case.get("audio", {})
+    if kind == "deepstack_eval_follows_mode":
+        return (model, config), {}
     if kind in {"request_positions", "chunked_positions"}:
         return (model,), {}
     if kind == "language_hidden_states":
