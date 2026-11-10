@@ -39,10 +39,12 @@ _SIGNATURE_FIELDS = ("pixel_values", "image_embeds", *_AUDIO_VIDEO_FIELDS)
 # additive/non-causal mask (wrong at B=1, an error at B>1). Padding is on the
 # right, which cannot affect earlier real-token logits under causal attention,
 # so the default is to pass no mask and let the model build its causal mask.
-# Only models that read the 2D mask themselves (rope/position ids) and turn it
-# into a proper causal+padding mask keep it.
+# Models that consume the 2D mask themselves for positions or multimodal mask
+# construction keep it.
 PADDING_MASK_MODEL_TYPES = frozenset(
     {
+        "gemma3",
+        "paligemma",
         "qwen2_vl",
         "qwen2_5_vl",
         "qwen3_vl",
