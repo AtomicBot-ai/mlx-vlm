@@ -2288,6 +2288,7 @@
         "forward_cache",
         "multimodal",
         "input_embeddings",
+        "deepstack_eval_follows_mode",
         "request_positions",
         "chunked_positions"
       ],
@@ -2620,6 +2621,7 @@
       },
       "checks": [
         "input_embeddings",
+        "deepstack_eval_follows_mode",
         "multimodal",
         "request_positions",
         "chunked_positions"
