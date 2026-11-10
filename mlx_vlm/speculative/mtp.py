@@ -1068,7 +1068,8 @@ def _mtp_rounds(
                     **_mtp_draft_kwargs(draft_model, greedy_sampling, sampler),
                 )
 
-            verify.commit(lm, prompt_cache, accepted, bs)
+            with mx.stream(generation_stream):
+                verify.commit(lm, prompt_cache, accepted, bs)
         except BaseException:
             if verify is not None:
                 verify.abort()
@@ -1464,7 +1465,8 @@ def _mtp_rounds_batch(
                     **_mtp_draft_kwargs(draft_model, greedy_sampling, sampler),
                 )
 
-            verify.commit(lm, prompt_cache, accepted_list, bs)
+            with mx.stream(generation_stream):
+                verify.commit(lm, prompt_cache, accepted_list, bs)
         except BaseException:
             if verify is not None:
                 verify.abort()

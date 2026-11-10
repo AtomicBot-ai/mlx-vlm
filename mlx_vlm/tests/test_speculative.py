@@ -650,7 +650,7 @@ def test_mtp_ragged_acceptance_respects_remaining_token_budgets(monkeypatch):
         generator.close()
 
 
-@parametrize("family", ["qwen", "glm", "deepseek", "gemma"])
+@parametrize("family", ["qwen", "glm", "deepseek", "gemma", "ling"])
 @parametrize("pause_after", [1, 8])
 @parametrize("sampling", [False, True, "positioned"])
 @parametrize("phased", [False, True])
@@ -1412,7 +1412,13 @@ def test_generation_and_request_reset(family, temperature, seed):
 
 @parametrize(
     "family,failure",
-    [("qwen", False), ("glm", False), ("deepseek", False), ("glm", True)],
+    [
+        ("qwen", False),
+        ("glm", False),
+        ("deepseek", False),
+        ("ling", False),
+        ("glm", True),
+    ],
 )
 def test_mtp_generation(family, failure, monkeypatch):
     mx.random.seed(2127)
@@ -1463,10 +1469,14 @@ def test_mtp_generation(family, failure, monkeypatch):
     assert drafter._round_appended == 0
 
 
-@parametrize("family", ["qwen", "glm", "deepseek"])
+@parametrize(
+    "family,length",
+    [("qwen", 4), ("glm", 4), ("deepseek", 4), ("ling", 4), ("ling", 9)],
+)
 @parametrize("batch", [1, 2, 4])
 @parametrize("dtype", [mx.float32, mx.bfloat16])
-def test_verify_commit_matches_decode(family, batch, dtype):
+@parametrize("quantized", [False, True])
+def test_verify_commit_matches_decode(family, batch, dtype, quantized, length):
     mx.random.seed(2127)
     model, _ = language(family, inference=True)
     model.load_weights(
@@ -1475,6 +1485,20 @@ def test_verify_commit_matches_decode(family, batch, dtype):
             for key, value in tree_flatten(model.parameters())
         ]
     )
+    if quantized:
+        predicate = getattr(model, "quant_predicate", None) or (
+            lambda path, module: True
+        )
+        nn.quantize(
+            model,
+            bits=4,
+            group_size=32,
+            class_predicate=lambda path, module: (
+                hasattr(module, "to_quantized")
+                and module.weight.shape[-1] % 32 == 0
+                and predicate(path, module)
+            ),
+        )
     model.eval()
     reference, actual = [_make_cache(model, [0] * batch) for _ in range(2)]
     prefix = mx.broadcast_to((mx.arange(19)[None] % 30) + 1, (batch, 19))
@@ -1499,12 +1523,12 @@ def test_verify_commit_matches_decode(family, batch, dtype):
             assert mx.array_equal(actual, expected).item()
 
     # Each model owns its verifier; compare blocks with one-token verifier calls.
-    for retained in (1, 4, 3):
-        tokens = mx.broadcast_to(mx.array([[4, 5, 6, 7]]), (batch, 4))
+    for retained in (1, length, length - 1):
+        tokens = mx.broadcast_to(mx.arange(4, 4 + length)[None], (batch, length))
         oracle = deepcopy(reference)
         accepted = None
         hidden_steps, logit_steps = [], []
-        for i in range(4):
+        for i in range(length):
             hidden, logits, transaction = verify(tokens[:, i : i + 1], oracle)
             hidden_steps.append(hidden)
             logit_steps.append(logits)
@@ -1561,6 +1585,44 @@ def test_quantized_linear_and_argmax(mode, bits, size, batch):
     allowed = mx.arange(batch * 3, dtype=mx.int32).reshape(batch, 3) % 16
     mask = (mx.array(1, dtype=mx.int32) << allowed).reshape(-1, 1)
     equal(quantized.decode_quantized_argmax(linear, inputs, token_mask=mask), allowed)
+
+
+@parametrize("mode,bits,size", [("affine", 4, 64), ("affine", 5, 64), ("mxfp8", 8, 32)])
+@parametrize("sharding", ["all-to-sharded", "sharded-to-all"])
+@parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@parametrize("batch,width", [(1, 512), (2, 512), (1, 128)])
+def test_sharded_block_projection(
+    mode, bits, size, sharding, dtype, batch, width, monkeypatch
+):
+    from mlx.nn.layers.distributed import shard_linear
+
+    mx.random.seed(2130)
+    dense = nn.Linear(width, 32, bias=True)
+    dense.load_weights(
+        [(k, v.astype(dtype)) for k, v in tree_flatten(dense.parameters())]
+    )
+    layer = shard_linear(
+        nn.QuantizedLinear.from_linear(dense, mode=mode, bits=bits, group_size=size),
+        sharding,
+    )
+    layer.eval()
+    inputs = mx.random.normal((batch, 8, width)).astype(dtype)[:, ::2]
+    expected = mx.concatenate(
+        [layer(mx.contiguous(inputs[:, i : i + 1])) for i in range(4)], axis=1
+    )
+    mx.eval(expected)
+    if (
+        sharding == "all-to-sharded"
+        and batch == 1
+        and width == 512
+        and dtype != mx.float32
+    ):
+        # Column shards must enter the shared block kernel, not a per-token loop.
+        def fail(*args, **kwargs):
+            raise AssertionError("tokenwise fallback")
+
+        monkeypatch.setattr(type(layer), "__call__", fail)
+    equal(native_batch_linear(layer, inputs), expected)
 
 
 @parametrize("mode,bits,size", formats((32, 64, 128)))
@@ -1642,6 +1704,28 @@ def test_affine_switch_projection_parity(bits, dtype, projection):
         )
     assert actual is not None
     equal(actual, expected)
+
+
+@parametrize("width,intermediate", [(512, 64), (4096, 640)])
+@parametrize("batch", [1, 4])
+@parametrize("length", [2, 4])
+@parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_switch_glu_block_matches_decode(width, intermediate, batch, length, dtype):
+    mx.random.seed(2527)
+    mlp = SwitchGLU(width, intermediate, 8)
+    mlp.set_dtype(dtype)
+    nn.quantize(mlp, bits=4, group_size=64)
+    mlp.eval()
+    inputs = mx.random.normal((batch, length, width)).astype(dtype)
+    indices = mx.broadcast_to(mx.arange(8), (batch, length, 8))
+    expected = mx.concatenate(
+        [
+            mlp(mx.contiguous(inputs[:, i : i + 1]), indices[:, i : i + 1])
+            for i in range(length)
+        ],
+        axis=1,
+    )
+    equal(mlp(inputs, indices), expected)
 
 
 @parametrize("bits", [4, 5, 8])
@@ -1966,7 +2050,16 @@ def test_sampler_rng_isolation():
     assert first.shape == (1,) and mx.array_equal(first, second).item()
 
 
-@parametrize("family,quant", [("qwen", "mxfp8"), ("glm", "affine"), ("glm", "mxfp8")])
+@parametrize(
+    "family,quant",
+    [
+        ("qwen", "mxfp8"),
+        ("glm", "affine"),
+        ("glm", "mxfp8"),
+        ("ling", "affine"),
+        ("ling", "mxfp8"),
+    ],
+)
 def test_split_and_requantize_checkpoint(tmp_path, family, quant):
     name = TINY_MODELS[family]["module"]
     text = tiny_config(family)
@@ -1977,7 +2070,10 @@ def test_split_and_requantize_checkpoint(tmp_path, family, quant):
         else f"model.language_model.layers.{text.num_hidden_layers}.eh_proj"
     )
     key = "layers.0.mlp.down_proj" if family == "qwen" else "eh_proj"
-    fp8 = family == "qwen" or quant == "affine"
+    if family == "ling":
+        prefix = f"model.layers.{text.num_hidden_layers}.attention.q_b_proj"
+        key = "mtp.attention.q_b_proj"
+    fp8 = family in ("qwen", "ling") or quant == "affine"
     config = dict(model_type=name, text_config=text.to_dict())
     weights = {prefix + ".weight": mx.ones((128, 128), dtype=mx.bfloat16)}
     if fp8:
@@ -2325,6 +2421,7 @@ def test_bundled_qwen_mtp_kind_and_standalone_loading(tmp_path, type_key, model_
 @parametrize(
     "family, model_type",
     [
+        ("ling", "bailing_hybrid"),
         ("glm", "glm5_next"),
         ("glm", "glm5_next_text"),
         ("deepseek", "deepseek_v4"),
@@ -2359,7 +2456,26 @@ def test_load_registered_native_drafter(
     reference.set_dtype(mx.bfloat16)
     weights = {}
     for key, value in tree_flatten(reference.parameters()):
-        if family == "glm":
+        if family == "ling":
+            if key == "mtp.attention.unembed_out.weight":
+                continue
+            if key == "mtp.attention.embed_q.weight":
+                value = mx.concatenate(
+                    [
+                        value.swapaxes(-1, -2),
+                        reference.mtp.attention.unembed_out.weight,
+                    ],
+                    axis=1,
+                ).reshape(-1, text["kv_lora_rank"])
+                key = "mtp.attention.kv_b_proj.weight"
+            key = f"model.layers.{text['num_hidden_layers']}." + key.removeprefix(
+                "mtp."
+            )
+            if ".switch_mlp." in key:
+                for expert, tensor in enumerate(value):
+                    weights[key.replace(".switch_mlp.", f".experts.{expert}.")] = tensor
+                continue
+        elif family == "glm":
             key = key.removeprefix("mtp_block.")
             key = key.replace("shared_head_norm.", "shared_head.norm.")
             key = f"model.language_model.layers.{text['num_hidden_layers']}.{key}"
@@ -2734,6 +2850,80 @@ def test_deepseek_dspark_split_load_and_draft(tmp_path):
     mx.eval(tokens)
     assert tokens.shape == (1, 4)
     assert all(0 <= token < 32 for token in tokens[0].tolist())
+
+
+@parametrize("dtype", [mx.float32, mx.bfloat16])
+@parametrize("batch", [1, 2])
+@parametrize("quantized", [False, True])
+def test_ling_mtp_verified_cache_skips_past_expert_outputs(
+    dtype, batch, quantized, monkeypatch
+):
+    mx.random.seed(109)
+    target, cfg = language("ling", inference=True)
+    target.set_dtype(dtype)
+    draft = mtp_drafter("ling", cfg)
+    reference = mtp_drafter("ling", cfg)
+    for model in (draft, reference):
+        model.set_dtype(dtype)
+        if quantized:
+            nn.quantize(
+                model,
+                bits=8,
+                group_size=32,
+                mode="mxfp8",
+                class_predicate=lambda path, module: (
+                    hasattr(module, "to_quantized")
+                    and module.weight.shape[-1] % 32 == 0
+                    and model.quant_predicate(path, module)
+                ),
+            )
+        model.eval()
+    padding = None if batch == 1 else [2, 0]
+    draft.reset(target, left_padding=padding)
+    prompt = mx.broadcast_to(mx.array([[1, 2, 3, 4, 5]]), (batch, 5))
+    hidden = mx.random.normal((batch, 5, cfg.hidden_size)).astype(dtype)
+    bonus = mx.full((batch,), 6, mx.int32)
+    draft.prefill_from_target_hidden(prompt, hidden, bonus, greedy, greedy=True)
+    mx.eval(draft.parameters(), draft.draft_eval_state())
+
+    reference.load_weights(tree_flatten(draft.parameters()))
+    reference.reset(target, left_padding=padding)
+    reference._cache = deepcopy(draft._cache)
+    reference._next_position = draft._next_position
+    experts = Mock(wraps=draft.mtp.mlp)
+    monkeypatch.setattr(draft.mtp, "mlp", experts)
+
+    for step, accepted in enumerate((0, 1, 3, 2)):
+        tokens = draft.draft_block(bonus, hidden[:, -1:], None, 4, greedy, greedy=True)
+        mx.eval(tokens, draft.draft_eval_state())
+        experts.reset_mock()
+        verified = mx.random.normal((batch, 4, cfg.hidden_size)).astype(dtype)
+        next_bonus = mx.full((batch, 1), 7 + step, mx.int32)
+        kept = mx.concatenate([tokens[:, :accepted], next_bonus], axis=1)
+
+        # The oracle runs the whole NEXTN layer for the verified prefix.
+        if accepted:
+            reference._forward_tokens(
+                tokens[:, :accepted], verified[:, :accepted], mx.int32
+            )
+        logits, expected_hidden = reference._forward_tokens(
+            next_bonus, verified[:, accepted : accepted + 1], mx.int32
+        )
+        reference._set_seed_from_hidden(logits, greedy, True)
+        reference._seed_hidden = expected_hidden
+        draft.accept_verified_tokens_batch(
+            verified, tokens, [accepted] * batch, kept.tolist(), greedy, mx.int32, True
+        )
+        mx.eval(draft.draft_eval_state(), reference.draft_eval_state())
+        equal(draft._cache[0].state, reference._cache[0].state)
+        equal(draft._seed_hidden, reference._seed_hidden)
+        equal(draft._seed_token, reference._seed_token)
+        equal(draft._cache[0].offset, reference._cache[0].offset)
+        assert draft._next_position == reference._next_position
+        assert draft._round_appended == 0
+        experts.assert_called_once()
+        assert experts.call_args.args[0].shape[:2] == (batch, 1)
+        bonus = next_bonus[:, 0]
 
 
 @parametrize("accepted", [0, 2])
@@ -3664,7 +3854,7 @@ def test_lfm_ragged_rollback_matches_committed_prefixes():
     equal(model(probes, cache=caches).logits, mx.concatenate(expected), atol=1e-4)
 
 
-@parametrize("family", ["glm", "qwen"])
+@parametrize("family", ["glm", "qwen", "ling"])
 @parametrize("step", [1, 2, 5])
 def test_temporal_layers_commit_each_row_prefix(family, step):
     mx.random.seed(2127)
@@ -3674,10 +3864,15 @@ def test_temporal_layers_commit_each_row_prefix(family, step):
     layer = (
         arch.Glm5NextLinearAttention(cfg)
         if family == "glm"
-        else arch.Qwen3_5GatedDeltaNet(cfg)
+        else (
+            arch.KimiDeltaAttention(cfg)
+            if family == "ling"
+            else arch.Qwen3_5GatedDeltaNet(cfg)
+        )
     )
     layer.eval()
-    cache = ArraysCache(2, left_padding=[0] * 3)
+    slots = 4 if family == "ling" else 2
+    cache = ArraysCache(slots, left_padding=[0] * 3)
     cache.prepare(lengths=[100] * 3)
     mx.eval(layer(mx.random.normal((3, 4, cfg.hidden_size)), cache=cache), cache.state)
     for retained in ([0, 2, 5], [3, 1, 4]):
@@ -3691,7 +3886,7 @@ def test_temporal_layers_commit_each_row_prefix(family, step):
         for i in range(0, 5, step):
             mx.eval(layer(inputs[:, i : i + step], cache=cache))
         transaction.commit(retained)
-        for slot in range(2):
+        for slot in range(slots):
             expected = mx.concatenate(
                 [states[n][slot][row : row + 1] for row, n in enumerate(retained)]
             )

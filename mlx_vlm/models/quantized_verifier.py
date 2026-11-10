@@ -5,6 +5,7 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn.layers.distributed import sum_gradients
 
 from .switch_layers import QuantizedSwitchLinear
 
@@ -14,6 +15,7 @@ FIXED_FORMATS = {
     "mxfp8": (8, 32),
     "nvfp4": (4, 16),
 }
+_QUANTIZED_LINEARS = (nn.QuantizedLinear, nn.QuantizedAllToShardedLinear)
 
 _QUANTIZED_MOE_HC_HEADER = r"""
 #include <metal_simdgroup>
@@ -353,7 +355,7 @@ if (matrix_row < HC) {
 
 def supports_quantization(module) -> bool:
     """Return whether ``module`` uses one of MLX's native weight formats."""
-    if not isinstance(module, (nn.QuantizedLinear, QuantizedSwitchLinear)):
+    if not isinstance(module, (*_QUANTIZED_LINEARS, QuantizedSwitchLinear)):
         return False
     if module.mode == "affine":
         return module.bits in AFFINE_BITS and module.group_size in (32, 64, 128)
@@ -379,7 +381,7 @@ def exact_quantized_linear(linear, x: mx.array) -> Optional[mx.array]:
     """General BxT quantized projection with decode-equivalent arithmetic."""
     if (
         not supports_quantization(linear)
-        or not isinstance(linear, nn.QuantizedLinear)
+        or not isinstance(linear, _QUANTIZED_LINEARS)
         or x.ndim != 3
         or x.shape[-1] != _input_dims(linear)
     ):
@@ -393,12 +395,14 @@ def singleton_quantized_linear(linear, x: mx.array) -> Optional[mx.array]:
     """Fuse a runtime-sized batch while retaining singleton qmv arithmetic."""
     if (
         not supports_quantization(linear)
-        or not isinstance(linear, nn.QuantizedLinear)
+        or not isinstance(linear, _QUANTIZED_LINEARS)
         or x.ndim != 3
         or x.shape[-1] != _input_dims(linear)
     ):
         return None
 
+    if isinstance(linear, nn.QuantizedAllToShardedLinear):
+        x = sum_gradients(linear.group)(x)
     indices = mx.zeros((*x.shape[:2], 1), dtype=mx.int32)
     projected = mx.expand_dims(mx.contiguous(x), (-2, -3))
     output = (

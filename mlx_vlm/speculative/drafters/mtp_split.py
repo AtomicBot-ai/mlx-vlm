@@ -325,6 +325,7 @@ class MTPSplitter:
 
 # base model_type -> "module_path:ClassName" (lazy so importing this module is cheap)
 MTP_SPLITTERS: Dict[str, str] = {
+    "bailing_hybrid": "mlx_vlm.speculative.drafters.bailing_hybrid_mtp.split:BailingHybridMTPSplitter",
     "mistral_large4": "mlx_vlm.speculative.drafters.mistral_large4_dspark.split:MistralLarge4DsparkSplitter",
     "mistral_large4_text": "mlx_vlm.speculative.drafters.mistral_large4_dspark.split:MistralLarge4DsparkSplitter",
     "nemotron_h": "mlx_vlm.speculative.drafters.nemotron_h_mtp.split:NemotronHMTPSplitter",
