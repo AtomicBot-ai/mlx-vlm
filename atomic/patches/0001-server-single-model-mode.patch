@@ -1,0 +1,56 @@
+From: Atomic Chat <noreply@atomic.chat>
+Subject: [PATCH] server: keep serving the loaded model in single-model mode
+
+Atomic Chat's core starts mlx-server with MLX_VLM_SINGLE_MODEL=1 and loads
+exactly one model; it never hot-swaps. Clients put arbitrary labels in the
+request's `model` field (a catalog id, a repo short name), and upstream treats
+any label that differs from the cached one as a new model: it unloads the loaded
+one and tries to fetch the label from Hugging Face, which fails (401 for a
+private or non-existent repo) and breaks the session. With
+MLX_VLM_SINGLE_MODEL=1 the requested label is ignored and the model cached in
+the request's cache group keeps serving.
+
+Used by: atomic-chat-core src/runtime/mlx/runtime.ts (sets the variable); the
+core forwards the request body as is, with its own model id in `model`.
+Released cores get every new build (the MLX manifest has no
+min_core_version), so the core cannot stop relying on it: keep it until
+upstream has an equivalent switch that every core in use already sets.
+Guarded by atomic/tests/test_patches.py::test_single_model_*.
+
+diff --git a/mlx_vlm/server/app.py b/mlx_vlm/server/app.py
+index ace5667c..f4357aa0 100644
+--- a/mlx_vlm/server/app.py
++++ b/mlx_vlm/server/app.py
+@@ -694,6 +694,32 @@ def get_cached_model(
+             cached_cache["config"],
+         )
+ 
++    # Atomic-Chat fork addition: in single-model mode the server is launched
++    # by a desktop app that pre-loads exactly one model and never expects
++    # hot-swap. Clients in the wild pass arbitrary labels (model_id, repo
++    # short-name, etc.) in the `model` field of the request body — without
++    # this guard we would unload and try to fetch them from HF, which 401s
++    # for non-existent / private repos and breaks the whole session. When
++    # `MLX_VLM_SINGLE_MODEL=1` is set, ignore the requested label and keep
++    # serving the model already cached in this cache group. Scoped to the
++    # current `cache_group` so it composes with upstream's per-group cache
++    # registry (text / audio / image); the desktop only drives text.
++    if os.environ.get("MLX_VLM_SINGLE_MODEL") == "1" and cached_cache:
++        cached_key = cached_cache.get("cache_key")
++        cached_path = cached_key[0] if cached_key else None
++        print(
++            f"Single-model mode: ignoring requested '{model_path}', "
++            f"serving cached '{cached_path}'."
++        )
++        if cache_group == "text_generation":
++            runtime.response_generator = cached_cache.get("response_generator")
++            runtime.apc_manager = cached_cache.get("apc_manager")
++        return (
++            cached_cache["model"],
++            cached_cache["processor"],
++            cached_cache["config"],
++        )
++
+     # If this kind has a different model cached, clear only that cache group.
+     if cached_cache:
+         logger.info("New %s model requested; clearing its existing cache.", cache_group)

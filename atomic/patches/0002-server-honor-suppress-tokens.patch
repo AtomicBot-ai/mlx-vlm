@@ -1,0 +1,121 @@
+From: Atomic Chat <noreply@atomic.chat>
+Subject: [PATCH] server: honor generation_config suppress_tokens
+
+Omni / multimodal Gemma 4 builds publish generation_config.json
+`suppress_tokens` (the image/audio soft-token ids, e.g. [258883, 258882]) that
+must never be sampled into text. Upstream ignores the field, so those control
+tokens leak into replies as <image> / <audio>. The patch reads the list when the
+model loads and applies it as a default logit_bias of -1e9 on every request; a
+bias the request sets for the same token wins.
+
+Used by: AtomicChat/gemma-4-12B-it-MLX-4bit in Atomic Chat's catalog
+(gemma4_unified, suppress_tokens [258883, 258882]).
+Drop it when upstream honors suppress_tokens.
+Guarded by atomic/tests/test_patches.py::test_suppress_tokens_*.
+
+diff --git a/mlx_vlm/server/generation.py b/mlx_vlm/server/generation.py
+index 59fe84e3..d0f437ca 100644
+--- a/mlx_vlm/server/generation.py
++++ b/mlx_vlm/server/generation.py
+@@ -1,3 +1,4 @@
++import json
+ import logging
+ import os
+ import time
+@@ -7,7 +8,7 @@ from dataclasses import dataclass, field
+ from queue import Empty as QueueEmpty
+ from queue import Queue
+ from threading import Event, Lock, Thread
+-from typing import Callable, Generator, List, Optional, Tuple
++from typing import Callable, Collection, Generator, List, Optional, Tuple
+ 
+ import mlx.core as mx
+ from fastapi import HTTPException
+@@ -64,6 +65,39 @@ METRICS_HISTORY_LIMIT = 100
+ METRICS_RECENT_LIMIT = 32
+ 
+ 
++# Logit offset large enough to drive a suppressed token's softmax probability to
++# ~0 across the temperature range we serve, while staying finite (avoids the
++# NaN risk of ``-inf`` after temperature division).
++_SUPPRESS_LOGIT_BIAS = -1e9
++
++
++def _collect_suppress_tokens(model_path: str) -> set[int]:
++    """Read ``generation_config.json::suppress_tokens`` for a model.
++
++    Omni / multimodal Gemma 4 builds publish a ``suppress_tokens`` list (the
++    image/audio soft-token ids, e.g. ``[258883, 258882]``) that must never be
++    sampled into text output. Upstream's server only mines this file for
++    ``eos_token_id``; without honouring ``suppress_tokens`` those control
++    tokens leak into the response (rendered as ``<image>`` / ``<audio>``). We
++    apply them as a default ``logit_bias`` on every request.
++    """
++    gen_cfg_path = os.path.join(model_path, "generation_config.json")
++    if not os.path.isfile(gen_cfg_path):
++        return set()
++    try:
++        with open(gen_cfg_path, encoding="utf-8") as f:
++            gen_cfg = json.load(f)
++    except (OSError, ValueError) as exc:
++        logger.warning(
++            "Failed to read %s: %s; skipping suppress_tokens.", gen_cfg_path, exc
++        )
++        return set()
++    value = gen_cfg.get("suppress_tokens")
++    if not isinstance(value, (list, tuple, set, frozenset)):
++        return set()
++    return {int(v) for v in value if isinstance(v, int) and not isinstance(v, bool)}
++
++
+ class PromptTooLongError(ValueError):
+     """Raised when a request exceeds the configured server context budget."""
+ 
+@@ -1049,6 +1083,10 @@ class ResponseGenerator:
+     higher throughput — same pattern as mlx-lm's server.
+     """
+ 
++    # Filled in from generation_config.json when the model loads; declared here
++    # so instances built without __init__ still resolve it.
++    suppress_tokens: Collection[int] = ()
++
+     def __init__(
+         self,
+         model_path: str,
+@@ -1074,6 +1112,7 @@ class ResponseGenerator:
+         self.processor = None
+         self.config = None
+         self.stop_tokens = set()
++        self.suppress_tokens = set()
+         self.vision_cache = vision_cache
+         self.draft_model_path = draft_model_path
+         self.draft_kind_override = draft_kind
+@@ -1213,6 +1252,9 @@ class ResponseGenerator:
+         self.processor = processor
+         self.config = config
+         self.stop_tokens = stop_tokens
++        # Control tokens (image/audio soft tokens) the model asks us never to
++        # emit; applied as a default logit_bias on every request below.
++        self.suppress_tokens = _collect_suppress_tokens(self.model_path)
+         self.draft_model = draft_model
+         self.draft_kind = draft_kind
+         self.tokenizer = (
+@@ -1584,8 +1626,17 @@ class ResponseGenerator:
+     def _make_logits_processors(
+         self, args: GenerationArguments, input_ids: Optional[mx.array] = None
+     ) -> List[Callable[[mx.array, mx.array], mx.array]]:
++        logit_bias = args.logit_bias
++        if self.suppress_tokens:
++            # Force the model's ``suppress_tokens`` (image/audio soft tokens)
++            # toward zero probability on every request. ``setdefault`` keeps any
++            # explicit per-token bias the caller already supplied.
++            merged = dict(logit_bias) if logit_bias else {}
++            for token_id in self.suppress_tokens:
++                merged.setdefault(token_id, _SUPPRESS_LOGIT_BIAS)
++            logit_bias = merged
+         processors = make_logits_processors(
+-            args.logit_bias,
++            logit_bias,
+             args.repetition_penalty,
+             args.repetition_context_size,
+             args.presence_penalty,

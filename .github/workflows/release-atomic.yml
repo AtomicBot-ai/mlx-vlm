@@ -1,0 +1,327 @@
+name: Release (Atomic)
+run-name: "Release (Atomic) ${{ inputs.upstream_tag }} [cid:${{ inputs.candidate_id }}]"
+
+# Builds the mlx-server binary Atomic Chat ships (macOS arm64), from an unmodified upstream tag of
+# Neywa-Labs/mlx-vlm plus the patch series in atomic/patches, and publishes it as the release of
+# that tag here: one asset, mlxvlm-mlx-server-macos-arm64.tar.gz (a PyInstaller onefile, signed with
+# the Developer ID and notarized), and requirements.lock.txt (what pip resolved for the build).
+# atomic-chat-conf's mirror-mlx.yml copies it into a conf release mlxvlm-macos-arm64-<rev>, which is
+# what the core downloads. See atomic/README.md.
+#
+# The hatchet pipeline (AtomicBot-ai/atomic-hatchet-pipeline) dispatches this on
+# upstream-sync/<tag> with publish and replace, finds the run by [cid:...] in its title, and tells
+# a patch conflict from a broken build by which job failed: the one named `patches` or another.
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Neywa-Labs/mlx-vlm release tag to build (vX.Y.Z, e.g. v0.7.12)"
+        required: true
+        type: string
+      publish:
+        description: "Create the release of that tag in this repository"
+        required: false
+        default: false
+        type: boolean
+      replace:
+        description: "Replace that release's assets if it already exists; without it publishing fails"
+        required: false
+        default: false
+        type: boolean
+      candidate_id:
+        description: "Id the caller finds this run by in its title"
+        required: false
+        default: manual
+        type: string
+
+concurrency:
+  group: release-atomic-${{ inputs.upstream_tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_REPO: Neywa-Labs/mlx-vlm
+  TAG: ${{ inputs.upstream_tag }}
+  ASSET: mlxvlm-mlx-server-macos-arm64.tar.gz
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.tag.outputs.sha }}
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      # The pipeline matches [cid:<id>] in the run title literally: no spaces or brackets in it.
+      # An existing release without `replace` would fail only in the release job.
+      - name: Check inputs
+        env:
+          CANDIDATE_ID: ${{ inputs.candidate_id }}
+          PUBLISH: ${{ inputs.publish }}
+          REPLACE: ${{ inputs.replace }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$CANDIDATE_ID" =~ ^[A-Za-z0-9._:-]{1,80}$ ]]; then
+            echo "::error::candidate_id must match ^[A-Za-z0-9._:-]{1,80}\$"
+            exit 1
+          fi
+          if [ "$PUBLISH" = true ] && [ "$REPLACE" != true ] && gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::release $TAG already exists here; run with replace to overwrite its assets"
+            exit 1
+          fi
+
+      - name: Resolve the upstream tag
+        id: tag
+        run: |
+          set -euo pipefail
+          if ! [[ "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "::error::upstream_tag must look like v0.7.12"
+            exit 1
+          fi
+          version="${BASH_REMATCH[1]}"
+          refs="$(git ls-remote "https://github.com/$UPSTREAM_REPO.git" "refs/tags/$TAG" "refs/tags/$TAG^{}")"
+          sha="$(printf '%s\n' "$refs" | awk '/\^\{\}$/ {print $1}' | head -1)"
+          [ -n "$sha" ] || sha="$(printf '%s\n' "$refs" | awk '{print $1}' | head -1)"
+          if [ -z "$sha" ]; then echo "::error::$UPSTREAM_REPO has no tag $TAG"; exit 1; fi
+          {
+            echo "sha=$sha"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+          echo "$TAG -> $sha"
+
+  # The series must apply to the tag before a macOS runner spends time on it. The hatchet pipeline
+  # reads a failure of the job named `patches` as a patch conflict and any other failure as a broken
+  # build, so keep the id and the name, and keep the build behind it.
+  patches:
+    name: patches
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Clone upstream tag
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.prepare.outputs.sha }}
+      - name: Clone Atomic build files
+        uses: actions/checkout@v4
+        with:
+          path: _atomic
+          sparse-checkout: atomic
+      - name: Check the patch series
+        run: bash _atomic/atomic/ci/apply-patches.sh --check
+
+  # macos-15 as the previous builds (build-mlxvlm-macos.yml on macos-latest): pip picks the mlx
+  # wheel for the runner's macOS, and that decides the oldest macOS the binary runs on.
+  macos-arm64:
+    needs: [prepare, patches]
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: Clone upstream tag
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.prepare.outputs.sha }}
+      - name: Clone Atomic build files
+        uses: actions/checkout@v4
+        with:
+          path: _atomic
+          sparse-checkout: atomic
+      - name: Apply Atomic patches
+        run: bash _atomic/atomic/ci/apply-patches.sh
+
+      - name: Check the tag's version
+        run: |
+          set -euo pipefail
+          actual="$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' mlx_vlm/version.py)"
+          if [ "$actual" != "$VERSION" ]; then
+            echo "::error::mlx_vlm/version.py says $actual, the tag $TAG"
+            exit 1
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # Not editable: PyInstaller does not analyze an editable install's imports (atomic/ci/build.sh).
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller pytest .
+          python -m pip freeze --exclude-editable | grep -v -e '^pyinstaller' -e '^pytest' > requirements.lock.txt
+          cat requirements.lock.txt
+
+      # The shipped runtime has no torch, and transformers' own image_processing_gemma4 still imports
+      # it; mlx-vlm carries a numpy/PIL processor instead. Importing ours reproduces the runtime path.
+      - name: Check the Gemma4 processor is torch-free
+        run: |
+          python - <<'PY'
+          import transformers
+          from mlx_vlm.models.gemma4 import processing_gemma4  # noqa: F401
+
+          print(f"OK: transformers {transformers.__version__}, Gemma4 processor imports cleanly")
+          PY
+
+      - name: Patch tests
+        run: python -m pytest -q -p no:cacheprovider _atomic/atomic/tests
+
+      - name: Build
+        run: bash _atomic/atomic/ci/build.sh
+
+      - name: Import the signing certificate
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          certificate="$RUNNER_TEMP/build_certificate.p12"
+          keychain="$RUNNER_TEMP/app-signing.keychain-db"
+          # A throwaway keychain that lives only in this job: its password needs no secret.
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+          echo -n "$MACOS_CERTIFICATE_P12" | base64 --decode -o "$certificate"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security import "$certificate" -P "$MACOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$keychain"
+          security list-keychain -d user -s "$keychain"
+          rm -f "$certificate"
+          identity="$(security find-identity -v -p codesigning "$keychain" | head -1 | grep -o '".*"' | tr -d '"')"
+          [ -n "$identity" ] || { echo "::error::no code signing identity in the certificate"; exit 1; }
+          echo "KEYCHAIN_PATH=$keychain" >> "$GITHUB_ENV"
+          echo "CODESIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+
+      # Library Validation only applies once the binary carries a Developer ID signature, so the
+      # smoke runs on the signed binary: a broken seal on a native extension fails here.
+      - name: Sign
+        run: |
+          set -euo pipefail
+          codesign --force --options runtime --timestamp \
+            --entitlements _atomic/atomic/ci/mlx-server.entitlements \
+            --sign "$CODESIGN_IDENTITY" dist/mlx-server
+          codesign --verify --strict --verbose dist/mlx-server
+          codesign --display --entitlements - dist/mlx-server
+
+      - name: Smoke model cache
+        uses: actions/cache@v4
+        with:
+          path: ~/mlx-smoke-models
+          key: mlx-smoke-${{ hashFiles('_atomic/atomic/ci/smoke.py') }}
+
+      - name: Smoke
+        run: python -I _atomic/atomic/ci/smoke.py --binary dist/mlx-server --models-dir ~/mlx-smoke-models --log "$RUNNER_TEMP/mlx-server-smoke.log"
+
+      - name: Smoke server log
+        if: failure()
+        run: tail -n 200 "$RUNNER_TEMP/mlx-server-smoke.log" || true
+
+      - name: Archive
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          tar -czf "out/$ASSET" -C dist mlx-server
+          cp requirements.lock.txt out/
+          ls -lh out
+
+      - name: Notarize
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          zip -j "$RUNNER_TEMP/mlx-server-notarize.zip" dist/mlx-server
+          xcrun notarytool submit "$RUNNER_TEMP/mlx-server-notarize.zip" \
+            --apple-id "$APPLE_ID" --password "$APPLE_ID_PASSWORD" --team-id "$APPLE_TEAM_ID" \
+            --wait --timeout 15m
+          rm -f "$RUNNER_TEMP/mlx-server-notarize.zip"
+
+      - name: Clean up the keychain
+        if: always()
+        run: security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mlx-server-macos-arm64
+          path: out/
+          retention-days: 30
+
+  release:
+    needs: [prepare, macos-arm64]
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      SHA: ${{ needs.prepare.outputs.sha }}
+    steps:
+      - name: Clone Atomic build files
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: atomic
+      - uses: actions/download-artifact@v4
+        with:
+          name: mlx-server-macos-arm64
+          path: dist
+
+      - name: Check the assets and write the notes
+        run: |
+          set -euo pipefail
+          expected="$(printf '%s\n' "$ASSET" requirements.lock.txt | sort)"
+          actual="$(cd dist && ls | sort)"
+          if [ "$expected" != "$actual" ]; then
+            diff <(echo "$expected") <(echo "$actual") || true
+            echo "::error::the assets are not the expected two"
+            exit 1
+          fi
+          (cd dist && sha256sum "$ASSET")
+          shopt -s nullglob
+          patches=(atomic/patches/*.patch)
+          {
+            echo "Atomic build of [$UPSTREAM_REPO $TAG](https://github.com/$UPSTREAM_REPO/releases/tag/$TAG) (commit \`$SHA\`): the \`mlx-server\` Atomic Chat runs on macOS arm64."
+            echo
+            echo "\`$ASSET\` holds one PyInstaller onefile binary, signed with the Developer ID and notarized. \`requirements.lock.txt\` is what pip resolved for this build."
+            echo
+            if [ ${#patches[@]} -gt 0 ]; then
+              echo "Patches applied on top of the tag:"
+              for patch in "${patches[@]}"; do echo "- \`$(basename "$patch")\`"; done
+            else
+              echo "Source: the upstream tag as is (no patches)."
+            fi
+            echo
+            echo "Built by [release-atomic.yml]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) at \`$GITHUB_SHA\`."
+          } > notes.md
+          cat notes.md
+
+      # Prerelease, as every build of this fork: the core takes builds from conf, never from here.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPLACE: ${{ inputs.replace }}
+        run: |
+          set -euo pipefail
+          title="mlx-server $TAG (Atomic)"
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if [ "$REPLACE" != true ]; then
+              echo "::error::release $TAG already exists here; run with replace to overwrite its assets"
+              exit 1
+            fi
+            gh release upload "$TAG" dist/* --clobber -R "$GITHUB_REPOSITORY"
+            for name in $(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name'); do
+              if [ ! -e "dist/$name" ]; then
+                echo "removing $name, not in this build"
+                gh release delete-asset "$TAG" "$name" -y -R "$GITHUB_REPOSITORY"
+              fi
+            done
+            gh release edit "$TAG" --notes-file notes.md --title "$title" -R "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" dist/* --target "$SHA" --prerelease -R "$GITHUB_REPOSITORY" \
+              --title "$title" --notes-file notes.md
+          fi
