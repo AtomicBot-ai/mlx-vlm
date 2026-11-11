@@ -337,7 +337,7 @@ class ConvBN(nn.Module):
             padding=padding,
             bias=False,
         )
-        self.bn = nn.LayerNorm(out_channels)
+        self.bn = nn.LayerNorm(out_channels, eps=1e-6)
 
     def __call__(self, x: mx.array) -> mx.array:
         x = self.conv(x)
@@ -405,7 +405,7 @@ class MultiScaleProjector(nn.Module):
             num_bottlenecks=config.num_bottlenecks,
             bottleneck_channels=config.bottleneck_channels,
         )
-        final_norm = nn.LayerNorm(config.hidden_dim)
+        final_norm = nn.LayerNorm(config.hidden_dim, eps=1e-6)
         self.stages = [[c2f, final_norm]]
 
     def __call__(self, features: List[mx.array]) -> mx.array:
