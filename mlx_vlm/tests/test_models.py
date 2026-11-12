@@ -47,6 +47,7 @@ from mlx_vlm.utils import (
     load,
     load_config,
     load_model,
+    sharded_load,
 )
 
 
@@ -1747,8 +1748,9 @@ def test_mistral_large4_owned_experts_match_masked_reference(training, length):
     )
 
 
+@pytest.mark.parametrize("config_filename", ["config.json", "params.json"])
 def test_mistral_large4_shared_loader_native_weights_and_roundtrip(
-    tmp_path, mistral_large4_case
+    tmp_path, mistral_large4_case, config_filename
 ):
     from mlx_vlm.quantization.nvfp4 import ScaledQuantizedSwitchLinear
 
@@ -1834,9 +1836,12 @@ def test_mistral_large4_shared_loader_native_weights_and_roundtrip(
         "quant_method": "modelopt",
         "quant_algo": "MIXED_PRECISION",
     }
-    (tmp_path / "config.json").write_text(json.dumps(config))
+    (tmp_path / config_filename).write_text(json.dumps(config))
     mx.save_safetensors(str(tmp_path / "model.safetensors"), native)
     model = load_model(tmp_path)
+    if config_filename == "params.json":
+        assert not (tmp_path / "config.json").exists()
+        assert json.loads((tmp_path / "params.json").read_text()) == config
     assert isinstance(
         model.language_model.layers[1].feed_forward.experts.w1,
         ScaledQuantizedSwitchLinear,
@@ -2956,6 +2961,71 @@ def test_minimax_multimodal_model_exposes_sharding():
     shard.assert_called_once_with(group)
 
 
+@pytest.mark.parametrize("pipeline", [False, True])
+def test_deepseek_v4_sharded_load(tmp_path, pipeline):
+    from mlx_vlm.models import deepseek_v4
+
+    config = build_config(deepseek_v4, model_case("deepseek_v4")["config"])
+    reference = deepseek_v4.Model(config)
+    reference.eval()
+    weights = dict(tree_flatten(reference.parameters()))
+    (tmp_path / "config.json").write_text(json.dumps(asdict(config)))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+    group = mx.distributed.init()
+    assert group.size() == 1
+    with patch("mlx_vlm.utils.load_processor", return_value=object()):
+        model, _ = sharded_load(
+            tmp_path,
+            tensor_group=group,
+            pipeline_group=group if pipeline else None,
+        )
+    assert model.language_model.layers[0].attn.sharding_group is group
+    assert callable(model.language_model.model.pipeline)
+    for key, value in tree_flatten(model.parameters()):
+        assert mx.array_equal(value, weights[key]).item(), key
+    ids = mx.array([[1, 2, 3]])
+    np.testing.assert_array_equal(
+        np.array(model(ids).logits), np.array(reference(ids).logits)
+    )
+
+
+@pytest.mark.parametrize("world_size", [1, 2, 4, 8])
+def test_deepseek_v4_sharding_allows_replicated_kv(world_size):
+    from mlx_vlm.models import deepseek_v4
+
+    architecture, _ = get_model_and_args({"model_type": "deepseek_v4"})
+    assert callable(architecture.Model.shard)
+    assert architecture.validate_sharding is deepseek_v4.validate_sharding
+    architecture.validate_sharding({"num_key_value_heads": 1}, world_size)
+
+
+@pytest.mark.parametrize(
+    "overrides,world_size,message",
+    [
+        ({}, 0, "worker count"),
+        ({}, 3, "query heads"),
+        ({}, 16, "query heads"),
+        (
+            {"num_attention_heads": 4, "moe_intermediate_size": 7},
+            2,
+            "expert intermediate",
+        ),
+    ],
+)
+def test_deepseek_v4_sharding_rejects_invalid_partitions_before_mutation(
+    overrides, world_size, message
+):
+    from mlx_vlm.models import deepseek_v4
+
+    config = model_case("deepseek_v4")["config"]
+    config.update(overrides)
+    model = deepseek_v4.Model(build_config(deepseek_v4, config))
+    with patch.object(model.language_model, "shard") as shard:
+        with pytest.raises(ValueError, match=message):
+            model.shard(SimpleNamespace(size=lambda: world_size, rank=lambda: 0))
+    shard.assert_not_called()
+
+
 # Distributed language-model contracts
 
 
@@ -3716,7 +3786,36 @@ class TestPPDocLayoutV3(unittest.TestCase):
 # Loading and utility contracts
 
 
-def test_load_config_applies_generation_config_sampling_defaults(tmp_path):
+@pytest.mark.parametrize("params", [{"dim": 8}, {"dim": 8, "dsa": {"topk": 4}}])
+def test_load_config_preserves_params_schema(tmp_path, params):
+    (tmp_path / "params.json").write_text(json.dumps(params))
+    assert load_config(tmp_path) == params
+    assert not (tmp_path / "config.json").exists()
+    assert json.loads((tmp_path / "params.json").read_text()) == params
+
+
+def test_load_config_accepts_standard_schema_params(tmp_path):
+    config = {"model_type": "deepseek_v4", "hidden_size": 8}
+    (tmp_path / "params.json").write_text(json.dumps(config))
+    assert load_config(tmp_path) == config
+
+
+@pytest.mark.parametrize("valid", [False, True])
+def test_load_config_prefers_config_json(tmp_path, valid):
+    (tmp_path / "params.json").write_text(json.dumps({"model_type": "fallback"}))
+    config = {"model_type": "primary"}
+    (tmp_path / "config.json").write_text(json.dumps(config) if valid else "invalid")
+    if valid:
+        assert load_config(tmp_path) == config
+    else:
+        with pytest.raises(json.JSONDecodeError):
+            load_config(tmp_path)
+
+
+@pytest.mark.parametrize("config_filename", ["config.json", "params.json"])
+def test_load_config_applies_generation_config_sampling_defaults(
+    tmp_path, config_filename
+):
     generation_config = {
         "eos_token_id": [2, 3],
         "do_sample": True,
@@ -3725,7 +3824,7 @@ def test_load_config_applies_generation_config_sampling_defaults(tmp_path):
         "top_k": 64,
         "max_new_tokens": 4096,
     }
-    (tmp_path / "config.json").write_text(
+    (tmp_path / config_filename).write_text(
         json.dumps({"model_type": "demo", "eos_token_id": 1}), encoding="utf-8"
     )
     (tmp_path / "generation_config.json").write_text(

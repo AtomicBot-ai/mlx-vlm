@@ -947,7 +947,7 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
         dict: Model configuration
 
     Raises:
-        FileNotFoundError: If config.json is not found at the path
+        FileNotFoundError: If neither config.json nor params.json is found
     """
     if isinstance(model_path, str):
         model_path = get_model_path(
@@ -957,7 +957,10 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
         )
 
     try:
-        with open(model_path / "config.json", encoding="utf-8") as f:
+        config_file = (
+            "config.json" if (model_path / "config.json").exists() else "params.json"
+        )
+        with open(model_path / config_file, encoding="utf-8") as f:
             config = json.load(f)
 
         generation_config_file = model_path / "generation_config.json"

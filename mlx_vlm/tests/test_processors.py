@@ -852,6 +852,60 @@ def test_auto_processor_routes_to_custom_loader(
         loader.assert_called_once_with(tmp_path, trust_remote_code=True)
 
 
+def test_mistral_large4_processor_without_torch(tmp_path):
+    metadata = deepcopy(DATA["checkpoints"]["mistral3"])
+    metadata["config"]["model_type"] = "mistral_large4"
+    metadata["processor_config"]["processor_class"] = "PixtralProcessor"
+    _write_configs(tmp_path, **metadata)
+    image_tokens = ["[IMG]", "[IMG_BREAK]", "[IMG_END]"]
+    fast_tokenizer(
+        ("[UNK]", "[PAD]", "hello", *image_tokens),
+        eos_token="[PAD]",
+        additional_special_tokens=image_tokens,
+    ).save_pretrained(tmp_path)
+    script = textwrap.dedent("""
+        import importlib.util
+        import sys
+        from pathlib import Path
+
+        blocked = {"torch", "torchvision", "torchaudio", "torchcodec"}
+        original_find_spec = importlib.util.find_spec
+        def find_spec(name, *args, **kwargs):
+            return None if name.split(".")[0] in blocked else original_find_spec(name, *args, **kwargs)
+        importlib.util.find_spec = find_spec
+        class RejectTorch:
+            def find_spec(self, fullname, path=None, target=None):
+                assert fullname.split(".")[0] not in blocked, fullname
+        sys.meta_path.insert(0, RejectTorch())
+
+        import mlx.core as mx
+        from PIL import Image
+        from mlx_vlm.utils import get_model_and_args, load_config, load_processor
+
+        folder = Path(sys.argv[1])
+        module, model_type = get_model_and_args(load_config(folder))
+        assert model_type == "mistral_large4"
+        processor = load_processor(folder, local_files_only=True)
+        assert isinstance(processor, module.Mistral3Processor)
+        assert type(processor.image_processor).__module__ == "mlx_vlm.models.pixtral.image_processing_pixtral"
+        assert (processor.patch_size, processor.spatial_merge_size) == (14, 2)
+        assert processor(text="hello")["input_ids"].tolist() == [[2]]
+        output = processor(text="[IMG]hello", images=Image.new("RGB", (56, 28)))
+        assert all(isinstance(value, mx.array) for value in output.values())
+        assert output["pixel_values"].shape == (1, 3, 28, 56)
+        assert output["image_sizes"].tolist() == [[28, 56]]
+        assert int(mx.sum(output["input_ids"] == processor.image_token_id)) == 2
+        assert not any(name.split(".")[0] in blocked for name in sys.modules)
+    """)
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_flint_tokenizer_prompt_and_stop_tokens(tmp_path):
     importlib.import_module("mlx_vlm.models.flint")
     raw = Tokenizer(
