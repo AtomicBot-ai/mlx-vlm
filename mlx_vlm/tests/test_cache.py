@@ -2972,6 +2972,47 @@ def test_single_row_checkpoint(managers):
     assert batch._apc_manager.stats.exact_stores == 1
 
 
+@pytest.mark.skipif(
+    not mx.metal.is_available(), reason="Uses Metal allocation accounting"
+)
+def test_prefill_releases_unused_logits_before_checkpoint(managers, monkeypatch):
+    cache = C.ArraysCache(1)
+    cache[0] = mx.arange(2**21, dtype=mx.float32).reshape(1, 1, -1)
+    mx.eval(cache.state)
+    state_bytes = cache[0].nbytes
+    manager = managers(budget=4 * state_bytes)
+    manager.exact_cache_guard_tokens = 32
+
+    class RecurrentModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = NS(embed_tokens=lambda ids: mx.zeros((*ids.shape, 1)))
+
+        def make_cache(self):
+            return [cache]
+
+        def __call__(self, inputs, cache, **kwargs):
+            previous = cache[0][0]
+            cache[0][0] = -previous
+            mx.eval(cache[0].state)
+            return LanguageModelOutput(logits=mx.sin(previous))
+
+    model = RecurrentModel()
+    tokens = list(range(64))
+    batch = prompt_batch(model, manager, [tokens], [0], [cache], step=32)
+    mx.synchronize()
+    # Enough room for live state, the checkpoint and its reserve, but not
+    # another full state kept alive solely by an unused lazy logits graph.
+    budget = mx.get_active_memory() + 5 * state_bytes // 2
+    monkeypatch.setattr(
+        manager, "_memory_headroom", lambda: budget - mx.get_active_memory()
+    )
+    assert batch.prompt_step() == 32
+    restored, count = manager.lookup_exact_cache(tokens)
+    assert count == 32
+    assert mx.all(restored[0][0] == -mx.arange(2**21).reshape(1, 1, -1)).item()
+
+
 def test_generation_stream_spill(managers, monkeypatch):
     from mlx_vlm.generate.common import generation_stream
 
