@@ -6431,6 +6431,15 @@ def test_lfm3_omni_quantized_checkpoint_roundtrip(tmp_path, lfm3_omni):
     np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
 
 
+class TestSkipMultimodalModule:
+    def test_gemma4_projectors(self):
+        from mlx_vlm.utils import skip_multimodal_module
+
+        assert skip_multimodal_module("embed_vision.embedding_projection")
+        assert skip_multimodal_module("embed_audio.embedding_projection")
+        assert not skip_multimodal_module("language_model.model.layers.0.mlp.gate_proj")
+
+
 class TestEncoderActivations:
     """Checkpoint activation names select the matching values and gradients."""
 
@@ -6628,12 +6637,3 @@ def test_qwen3_5_attention_forwards_rope_parameters(omit_original_max):
         QWEN3_5_YARN_HF_ATTENTION_FACTOR, rel=1e-6
     )
     assert not rotary.fused_apply
-
-
-class TestSkipMultimodalModule:
-    def test_gemma4_projectors(self):
-        from mlx_vlm.utils import skip_multimodal_module
-
-        assert skip_multimodal_module("embed_vision.embedding_projection")
-        assert skip_multimodal_module("embed_audio.embedding_projection")
-        assert not skip_multimodal_module("language_model.model.layers.0.mlp.gate_proj")
