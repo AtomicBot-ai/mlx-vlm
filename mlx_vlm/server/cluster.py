@@ -471,6 +471,11 @@ class ClusterManager:
             ownership=(
                 "server" if coordinator and coordinator.launcher else "external"
             ),
+            fast_sync=(
+                getattr(coordinator.launcher.launch, "fast_sync", None)
+                if coordinator and coordinator.launcher and self.running
+                else None
+            ),
             memory=self.aggregate(),
             capabilities=Capabilities(
                 resumable=not self.running
@@ -872,7 +877,9 @@ class ClusterManager:
 
                 # Keep the failure marker until fresh process identities are checked
                 # below; startup still refuses occupied endpoints or another owner.
-                await launcher.start(recover=True, progress=launching)
+                await launcher.start(
+                    recover=True, progress=launching, fast_sync=body.fast_sync
+                )
             else:
                 for rank, node_id in enumerate(self.selected):
                     info = self.nodes[node_id].identity.worker

@@ -18,7 +18,7 @@ import tempfile
 import threading
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from ._worker_supervisor import worker_environment
@@ -38,6 +38,7 @@ class LaunchConfig:
     startup_timeout: float = 120
     shutdown_timeout: float = 10
     env: dict = field(default_factory=dict)
+    fast_sync: bool = False
 
     @classmethod
     def read(cls, data, base):
@@ -51,6 +52,8 @@ class LaunchConfig:
         if not isinstance(cwd, str) or not Path(cwd).is_absolute():
             raise ValueError("launch.cwd must be an absolute path on every Mac")
         config = cls(**{**data, "hostfile": hostfile})
+        if type(config.fast_sync) is not bool:
+            raise ValueError("launch.fast_sync must be a boolean")
         if config.backend not in ("jaccl", "ring"):
             raise ValueError("Automatic launch supports jaccl or ring")
         if not isinstance(config.host, str) or not config.host:
@@ -75,6 +78,10 @@ class LaunchConfig:
             for key, value in config.env.items()
         ):
             raise ValueError("launch.env must map environment names to strings")
+        if "MLX_METAL_FAST_SYNCH" in config.env:
+            raise ValueError(
+                "Use launch.fast_sync instead of launch.env.MLX_METAL_FAST_SYNCH"
+            )
         if any(
             key.startswith(
                 ("MLX_VLM_PRELOAD_", "MLX_VLM_DRAFT_", "MLX_JACCL_", "MLX_RING_")
@@ -133,6 +140,9 @@ class WorkerLauncher:
             raise ValueError(f"Set {self.config.api_key_env} before launching workers")
         env = {
             **self.launch.env,
+            # The supervisor applies this before spawning each worker Python.
+            # Explicit 0 also overrides inherited host/hostfile tuning.
+            "MLX_METAL_FAST_SYNCH": "1" if self.launch.fast_sync else "0",
             "MLX_VLM_SERVER_API_KEY": key,
             "MLX_VLM_WORKER_LAUNCH_ID": self.launch_id,
         }
@@ -239,9 +249,14 @@ class WorkerLauncher:
             except (OSError, ValueError):
                 return  # Supervisors expire their leases if transport is lost.
 
-    async def start(self, *, recover=False, progress=None):
+    async def start(
+        self, *, recover=False, progress=None, fast_sync: bool | None = None
+    ):
         import httpx
 
+        if fast_sync is not None:
+            # Keep the configured default intact for the next managed launch.
+            self.launch = replace(self.launch, fast_sync=fast_sync)
         started = time.monotonic()
         reported = None
 
@@ -313,6 +328,12 @@ class WorkerLauncher:
                 len(self.config.workers),
                 self.launch.backend,
             )
+            if self.launch.fast_sync:
+                logger.warning(
+                    "Experimental distributed fast synchronization is enabled; "
+                    "MLX may deadlock. Stop the group and relaunch with "
+                    "fast_sync=false if generation stalls."
+                )
             self.process = subprocess.Popen(
                 self._command(),
                 stdin=subprocess.PIPE,

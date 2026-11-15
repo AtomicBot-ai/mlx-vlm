@@ -128,6 +128,67 @@ def test_worker_payload_is_private_and_local_settings_do_not_leak(cluster, monke
     assert _worker_supervisor.worker_environment({"MLX_RANK": "1"}) == {"MLX_RANK": "1"}
 
 
+@pytest.mark.parametrize("fast_sync", [None, False, True])
+def test_fast_sync_configuration_controls_worker_payload(
+    cluster, monkeypatch, fast_sync
+):
+    monkeypatch.setenv("MLX_METAL_FAST_SYNCH", "0" if fast_sync else "1")
+    data = {"hostfile": "hosts.json", "cwd": cluster.launch.cwd}
+    if fast_sync is not None:
+        data["fast_sync"] = fast_sync
+    config = ClusterConfig.read(_config_file(cluster, launch=data))
+    assert config.launch.fast_sync is (fast_sync is True)
+    payload = json.loads(WorkerLauncher(Coordinator(config))._payload())
+    assert payload["env"]["MLX_METAL_FAST_SYNCH"] == ("1" if fast_sync else "0")
+    assert os.environ["MLX_METAL_FAST_SYNCH"] == ("0" if fast_sync else "1")
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "true", "false", "1", [], {}])
+def test_fast_sync_requires_an_explicit_boolean(cluster, value):
+    data = {"hostfile": "hosts.json", "cwd": cluster.launch.cwd, "fast_sync": value}
+    with pytest.raises(ValueError, match="launch.fast_sync must be a boolean"):
+        ClusterConfig.read(_config_file(cluster, launch=data))
+
+
+@pytest.mark.parametrize("value", ["0", "1"])
+def test_fast_sync_cannot_be_overridden_by_launch_env(cluster, value):
+    data = {
+        "hostfile": "hosts.json",
+        "cwd": cluster.launch.cwd,
+        "env": {"MLX_METAL_FAST_SYNCH": value},
+    }
+    with pytest.raises(ValueError, match="Use launch.fast_sync instead"):
+        ClusterConfig.read(_config_file(cluster, launch=data))
+
+
+@pytest.mark.parametrize("configured", [False, True])
+@pytest.mark.parametrize("override", [None, False, True])
+def test_start_fast_sync_override_preserves_configured_default(
+    fake_launch, monkeypatch, configured, override
+):
+    launcher, process, _ = fake_launch
+    launcher.config = replace(
+        launcher.config, launch=replace(launcher.launch, fast_sync=configured)
+    )
+    launcher.launch = launcher.config.launch
+
+    def handler(request):
+        if launcher.process is None:
+            raise httpx.ConnectError("refused", request=request)
+        return httpx.Response(
+            200, json=_health(int(request.url.host[-1]), launcher.launch_id)
+        )
+
+    _transport(monkeypatch, handler)
+    asyncio.run(launcher.start(fast_sync=override))
+    expected = configured if override is None else override
+    assert launcher.launch.fast_sync is expected
+    assert launcher.config.launch.fast_sync is configured
+    assert json.loads(process.read())["env"]["MLX_METAL_FAST_SYNCH"] == (
+        "1" if expected else "0"
+    )
+
+
 def _transport(monkeypatch, handler):
     original = httpx.AsyncClient
     monkeypatch.setattr(
@@ -571,3 +632,87 @@ def test_monitor_does_not_fail_group_after_explicit_stop():
     launcher.coordinator = SimpleNamespace(failed=Mock())
     asyncio.run(launcher.monitor())
     launcher.coordinator.failed.assert_not_called()
+
+
+@pytest.mark.parametrize("fast_sync", [None, False, True])
+def test_native_launcher_sets_fast_sync_before_mlx_import_on_every_rank(
+    cluster, tmp_path, fast_sync
+):
+    inherited = "0" if fast_sync else "1"
+    cluster.launch.hostfile.write_text(
+        json.dumps(
+            {
+                "envs": [f"MLX_METAL_FAST_SYNCH={inherited}"],
+                "hosts": [
+                    {"ssh": "127.0.0.1", "ips": ["127.0.0.1"]},
+                    {"ssh": "127.0.0.1", "ips": ["127.0.0.1"]},
+                ],
+            }
+        )
+    )
+    options = {} if fast_sync is None else {"fast_sync": fast_sync}
+    launcher = WorkerLauncher(
+        Coordinator(
+            replace(cluster, launch=replace(cluster.launch, backend="ring", **options))
+        )
+    )
+    prefix = str(tmp_path / "fast-sync-rank-")
+    code = f"""
+import json, os, pathlib, sys, time
+assert 'mlx.core' not in sys.modules
+before_import = os.environ.get('MLX_METAL_FAST_SYNCH')
+import mlx.core
+pathlib.Path({prefix!r} + os.environ['MLX_RANK']).write_text(json.dumps({{
+    'pid': os.getpid(),
+    'before_import': before_import,
+    'after_import': os.environ.get('MLX_METAL_FAST_SYNCH'),
+}}))
+time.sleep(60)
+"""
+    payload = json.loads(launcher._payload())
+    payload["args"] = ["-c", code]
+    proc = subprocess.Popen(
+        launcher._command(),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env={**os.environ, "MLX_METAL_FAST_SYNCH": inherited},
+        start_new_session=True,
+    )
+    children, output = [], b""
+    try:
+        deadline = time.monotonic() + 10
+        while not all(
+            f"MLX_VLM_SUPERVISOR_READY:{launcher.launch_id}:{rank}".encode() in output
+            for rank in range(2)
+        ):
+            assert time.monotonic() < deadline, output.decode(errors="replace")
+            assert proc.poll() is None, output.decode(errors="replace")
+            if select.select([proc.stdout], [], [], 0.1)[0]:
+                output += os.read(proc.stdout.fileno(), 8192)
+        proc.stdin.write(json.dumps(payload).encode() + b"\n")
+        proc.stdin.flush()
+        for rank in range(2):
+            children.append(_wait_file(Path(prefix + str(rank))))
+        expected = "1" if fast_sync else "0"
+        assert all(
+            child["before_import"] == child["after_import"] == expected
+            for child in children
+        )
+        proc.stdin.write(b"stop\n")
+        proc.stdin.flush()
+        proc.wait(timeout=8)
+        for child in children:
+            with pytest.raises(ProcessLookupError):
+                os.kill(child["pid"], 0)
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        proc.wait(timeout=5)
+        for child in children:
+            try:
+                os.kill(child["pid"], signal.SIGKILL)
+            except ProcessLookupError:
+                pass

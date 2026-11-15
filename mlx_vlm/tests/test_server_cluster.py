@@ -114,6 +114,103 @@ async def register_pair(control):
     await control.select(Members(node_ids=["a", "b"]))
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"mode": "launch", "fast_sync": 1},
+        {"mode": "launch", "fast_sync": 0},
+        {"mode": "launch", "fast_sync": "true"},
+        {"mode": "launch", "fast_sync": "false"},
+        {"mode": "attach", "fast_sync": True},
+        {"mode": "attach", "fast_sync": False},
+    ],
+)
+def test_start_api_rejects_invalid_or_external_fast_sync(control, body):
+    client = TestClient(server.app)
+    response = client.post(
+        "/v1/cluster/start",
+        headers={"Authorization": "Bearer public-secret"},
+        json=body,
+    )
+    assert response.status_code == 422
+    assert not control.operations and not control.tasks
+
+
+@pytest.mark.parametrize("configured", [False, True])
+async def test_start_api_toggles_fast_sync_without_changing_default(
+    control, monkeypatch, configured
+):
+    from dataclasses import replace
+
+    from mlx_vlm.server.distributed_launch import LaunchConfig
+
+    await register_pair(control)
+    initial = management.Coordinator(
+        replace(
+            control.config(),
+            launch=LaunchConfig(
+                control.root / "hosts.json", str(control.root), fast_sync=configured
+            ),
+        )
+    )
+    monkeypatch.setattr(runtime, "distributed_coordinator", initial)
+    control.bootstrapped = True
+    start = AsyncMock()
+    monkeypatch.setattr(WorkerLauncher, "start", start)
+    monkeypatch.setattr(WorkerLauncher, "_stop", Mock())
+    monkeypatch.setattr(management.Coordinator, "_health", AsyncMock())
+    for override in (True, False, None):
+        body = StartGroup(mode="launch", fast_sync=override)
+        operation = await control.begin("start", body, f"start-{override}")
+        await asyncio.gather(*control.tasks)
+        assert operation.status == "succeeded", operation.error
+        assert start.call_args.kwargs["fast_sync"] is override
+        assert runtime.distributed_coordinator.config.launch.fast_sync is configured
+        active = runtime.distributed_coordinator
+        calls = start.await_count
+        repeated = await control.begin("start", body, f"start-{override}")
+        assert repeated.id == operation.id and start.await_count == calls
+        rejected = await control.begin(
+            "start", StartGroup(mode="launch", fast_sync=not override), None
+        )
+        await asyncio.gather(*control.tasks)
+        assert rejected.error.code == "already_running"
+        assert runtime.distributed_coordinator is active
+        assert start.await_count == calls
+        stopped = await control.begin("stop", StopGroup(), None)
+        await asyncio.gather(*control.tasks)
+        assert stopped.status == "succeeded", stopped.error
+        assert control.snapshot().fast_sync is None
+    assert initial.config.launch.fast_sync is configured
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_cluster_state_reports_effective_fast_sync(control, monkeypatch, configured):
+    from dataclasses import replace
+
+    from mlx_vlm.server.distributed_launch import LaunchConfig
+
+    coordinator = management.Coordinator(
+        replace(
+            control.config(),
+            launch=LaunchConfig(
+                control.root / "hosts.json", str(control.root), fast_sync=configured
+            ),
+        )
+    )
+    monkeypatch.setattr(runtime, "distributed_coordinator", coordinator)
+    control.nodes["a"] = NS(identity=info("a"))
+    control.running = ["a"]
+    assert control.snapshot().fast_sync is None  # Externally managed group.
+    coordinator.launcher = WorkerLauncher(coordinator)
+    coordinator.launcher.launch = replace(
+        coordinator.config.launch, fast_sync=not configured
+    )
+    assert control.snapshot().fast_sync is not configured
+    control.running = []
+    assert control.snapshot().fast_sync is None
+
+
 async def test_authenticated_identity_preserving_updates_and_persistence(control):
     await register_pair(control)
     node = await control.update(

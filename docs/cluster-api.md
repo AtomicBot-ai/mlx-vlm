@@ -371,6 +371,23 @@ hostfile/topology requires reconfiguration while stopped. It does not synthesize
 RDMA wiring from IP addresses. Topology is ultimately validated by initializing
 the configured MLX backend and successfully running collectives, not discovery.
 
+Managed launches honor the experimental, default-off `launch.fast_sync` boolean
+in `cluster.json`. To override it without restarting the public server, first
+stop the group and wait for that operation to succeed, then start fresh workers:
+
+```json
+{"mode": "launch", "fast_sync": true, "model": "organization/shardable-model"}
+```
+
+`fast_sync` accepts only a boolean or `null`; omitting it (or using `null`) inherits
+the configured default. The override applies only to this launch and does not
+change the default for future starts. Use `false` to disable it. A start request
+while the group is running still fails with `already_running`; `mode: "attach"`
+rejects a non-null `fast_sync` because external workers are already initialized.
+`GET /v1/cluster` exposes the active managed group's effective `fast_sync`, or
+`null` when stopped or attached externally. See [distributed launch configuration](distributed-serving.md)
+for MLX's deadlock warning. All workers receive the setting before Python starts.
+
 `stop` first rejects new distributed admissions, then waits for active requests
 to drain, up to `drain_timeout_seconds` (default 60). A timeout is observable and
 never silently kills active inference. Retained continuations return

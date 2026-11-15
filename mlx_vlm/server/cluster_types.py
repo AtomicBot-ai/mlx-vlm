@@ -6,7 +6,14 @@ from ipaddress import IPv4Address
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    field_validator,
+    model_validator,
+)
 
 
 def worker_origin(value):
@@ -150,6 +157,18 @@ class StartGroup(Contract):
     mode: Literal["attach", "launch"] = "attach"
     model: str | None = None
     revision: str | None = None
+    fast_sync: bool | None = Field(
+        default=None,
+        strict=True,
+        description="Experimental fast synchronization for this managed launch; "
+        "omit to use launch.fast_sync from the server configuration.",
+    )
+
+    @model_validator(mode="after")
+    def fast_sync_requires_launch(self):
+        if self.fast_sync is not None and self.mode != "launch":
+            raise ValueError("fast_sync requires mode='launch' and fresh workers")
+        return self
 
 
 class StopGroup(Contract):
@@ -222,6 +241,7 @@ class ClusterState(Contract):
     active_model: str | None
     active_requests: int
     ownership: Literal["external", "server"]
+    fast_sync: bool | None = None
     memory: AggregateMemory
     capabilities: Capabilities = Field(default_factory=Capabilities)
     operation_id: str | None = None
