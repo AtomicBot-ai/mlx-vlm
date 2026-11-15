@@ -3055,6 +3055,37 @@ def _prepare_minimax_distributed(model, dtype):
             )
 
 
+def _prepare_inkling2_distributed(model, dtype):
+    for path, value in tree_flatten(model.parameters()):
+        if any(name in path for name in (".query", ".rel_proj", "gate_weight")):
+            target_dtype = mx.float32 if path.endswith(".query") else dtype
+            value = (mx.random.normal(value.shape) * 0.1).astype(target_dtype)
+            model.load_weights([(path, value)], strict=False)
+        elif path.endswith("e_score_correction_bias"):
+            value = mx.arange(value.size, dtype=mx.float32) / 129
+            model.load_weights([(path, value)], strict=False)
+
+
+def _prepare_inkling2_mixed_distributed(model, dtype):
+    from mlx_vlm.quantization.nvfp4 import ScaledQuantizedSwitchLinear
+
+    _prepare_inkling2_distributed(model, dtype)
+    for index, layer in enumerate(model.layers):
+        mode, bits, group_size = (
+            ("mxfp8", 8, 32) if index == len(model.layers) - 1 else ("nvfp4", 4, 16)
+        )
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            projection = getattr(layer.mlp.switch_mlp, name).to_quantized(
+                group_size=group_size, bits=bits, mode=mode
+            )
+            if mode == "nvfp4":
+                scale = mx.linspace(0.5, 1.5, projection.num_experts).astype(mx.float32)
+                projection = ScaledQuantizedSwitchLinear(
+                    projection, scale, "weight_scale_2"
+                )
+            setattr(layer.mlp.switch_mlp, name, projection)
+
+
 def _prepare_ernie_distributed(model, dtype):
     for layer in model.layers:
         for hc in (layer.attn_hc, layer.ffn_hc):
@@ -3074,7 +3105,127 @@ def _prepare_ernie_distributed(model, dtype):
 DISTRIBUTED_MODEL_SETUPS = {
     "minimax_m3_nvfp4": _prepare_minimax_distributed,
     "ernie5_5_moe": _prepare_ernie_distributed,
+    "inkling2": _prepare_inkling2_distributed,
+    "inkling2_mixed": _prepare_inkling2_mixed_distributed,
 }
+
+
+@pytest.mark.parametrize("family", ["inkling2", "inkling2_mixed"])
+@pytest.mark.parametrize("rank", [0, 1, 2])
+def test_inkling2_shard_preserves_experts_and_replicated_weights(family, rank):
+    model = _make_distributed_test_model(family, mx.bfloat16)
+    original = dict(tree_flatten(model.parameters()))
+    model.shard(SimpleNamespace(size=lambda: 1, rank=lambda: 0))
+    assert all(p is original[k] for k, p in tree_flatten(model.parameters()))
+    count = model.config.n_routed_experts
+    start, end = count * rank // 3, count * (rank + 1) // 3
+    model.shard(SimpleNamespace(size=lambda: 3, rank=lambda: rank))
+    for key, value in tree_flatten(model.parameters()):
+        old = original[key]
+        assert value.dtype == old.dtype, key
+        if ".switch_mlp." in key:
+            assert mx.array_equal(value, old[start:end]).item(), key
+        else:
+            assert value is old, key
+    for layer in model.layers:
+        assert (layer.mlp.expert_start, layer.mlp.expert_end) == (start, end)
+        assert layer.mlp.switch_mlp.num_experts == count
+
+
+@pytest.mark.parametrize("size,rank", [(0, 0), (33, 0), (2, -1), (2, 2)])
+def test_inkling2_shard_rejects_invalid_group_without_mutation(size, rank):
+    model = _make_distributed_test_model("inkling2", mx.bfloat16)
+    original = dict(tree_flatten(model.parameters()))
+    with pytest.raises(ValueError, match="Each distributed rank"):
+        model.shard(SimpleNamespace(size=lambda: size, rank=lambda: rank))
+    assert all(p is original[k] for k, p in tree_flatten(model.parameters()))
+
+
+def test_inkling2_shard_validates_scales_before_mutation():
+    model = _make_distributed_test_model("inkling2_mixed", mx.bfloat16)
+    model.layers[-1].mlp.switch_mlp.down_proj.scales = mx.ones((3, 64, 2))
+    original = dict(tree_flatten(model.parameters()))
+    with pytest.raises(ValueError, match="Invalid expert partition"):
+        model.shard(SimpleNamespace(size=lambda: 2, rank=lambda: 0))
+    assert all(p is original[k] for k, p in tree_flatten(model.parameters()))
+
+
+def test_inkling2_shard_preserves_scalar_outer_scales():
+    model = _make_distributed_test_model("inkling2_mixed", mx.bfloat16)
+    projection = model.layers[0].mlp.switch_mlp.gate_proj
+    scale = projection.weight_scale_2 = mx.array(0.1234567, mx.float32)
+    model.shard(SimpleNamespace(size=lambda: 2, rank=lambda: 1))
+    assert projection.weight_scale_2 is scale
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Requires Metal")
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("layer_index", [0, 5])
+def test_inkling2_attention_shards_complete_heads_and_keeps_sink(rank, layer_index):
+    from mlx_vlm.models.inkling2.config import TextConfig
+    from mlx_vlm.models.inkling2.language import Attention
+
+    cfg = TextConfig(
+        hidden_size=256,
+        num_attention_heads=16,
+        num_key_value_heads=8,
+        head_dim=32,
+        swa_num_attention_heads=16,
+        swa_num_key_value_heads=8,
+        swa_head_dim=32,
+        d_rel=16,
+    )
+    attention = Attention(cfg, layer_index)
+    original = dict(tree_flatten(attention.parameters()))
+    group = SimpleNamespace(size=lambda: 2, rank=lambda: rank)
+    attention.shard(group)
+    assert attention.n_heads == 8 and attention.n_kv == 4
+    assert attention.sharding_group is group
+    assert attention.head_start == rank * 8
+    for key, value in tree_flatten(attention.parameters()):
+        old = original[key]
+        if key in ("sink_proj.weight", "rel_proj"):
+            assert value is old
+        else:
+            axis = 1 if key.endswith("static_weight") else 0
+            width = old.shape[axis] // 2
+            slices = [slice(None)] * old.ndim
+            slices[axis] = slice(rank * width, (rank + 1) * width)
+            assert mx.array_equal(value, old[tuple(slices)]).item(), key
+    partition = dict(tree_flatten(attention.parameters()))
+    attention.shard(group)
+    assert all(v is partition[k] for k, v in tree_flatten(attention.parameters()))
+
+
+@pytest.mark.parametrize(
+    "reason", ["three_ranks", "quantized_dynamic", "small_projection"]
+)
+def test_inkling2_attention_shard_fallback_preserves_parameters(reason):
+    from mlx_vlm.models.inkling2.config import TextConfig
+    from mlx_vlm.models.inkling2.language import Attention
+
+    attention = Attention(
+        TextConfig(
+            hidden_size=256,
+            num_attention_heads=16,
+            num_key_value_heads=8,
+            head_dim=32,
+            d_rel=16,
+        ),
+        5,
+    )
+    if reason == "quantized_dynamic":
+        attention.k_sconv.weight_proj = attention.k_sconv.weight_proj.to_quantized()
+    if reason == "small_projection":
+        attention.r_proj = nn.Linear(256, 16, bias=False)
+    original = dict(tree_flatten(attention.parameters()))
+    attention.shard(
+        SimpleNamespace(
+            size=lambda: 3 if reason == "three_ranks" else 2, rank=lambda: 0
+        )
+    )
+    assert attention.sharding_group is None
+    assert all(v is original[k] for k, v in tree_flatten(attention.parameters()))
 
 
 @pytest.mark.parametrize(
@@ -7285,6 +7436,359 @@ class TestGemma4PerLayerConfig:
         assert full.v_proj.weight.shape == full.k_proj.weight.shape
         sliding = attention_cls(cfg, 0)
         assert (sliding.head_dim, sliding.n_kv_heads) == (8, 4)
+
+
+@pytest.fixture
+def inkling2_model():
+    from mlx_vlm.models.inkling2 import Model, ModelConfig
+
+    mx.random.seed(194)
+    model = Model(ModelConfig.from_dict(model_case("inkling2")["config"]))
+    for path, value in tree_flatten(model.parameters()):
+        if any(name in path for name in (".query", ".rel_proj", "gate_weight")):
+            model.load_weights(
+                [(path, mx.random.normal(value.shape) * 0.1)], strict=False
+            )
+    model.eval()
+    return model
+
+
+def _inkling2_native_weights(model):
+    """Original release names and interleaved expert rows, including full attention."""
+    weights = {}
+    for key, value in tree_flatten(model.parameters()):
+        if ".switch_mlp." in key:
+            continue
+        if key.startswith("language_model.model.layers."):
+            layer, sub = key[len("language_model.model.layers.") :].split(".", 1)
+            if sub == "attention_input.query":
+                key = f"model.llm.attn_res.attn_queries.{int(layer) - 1}"
+            elif sub == "mlp_input.query":
+                key = f"model.llm.attn_res.mlp_queries.{layer}"
+            else:
+                for src, dst in (
+                    ("self_attn.q_proj", "attn.wq_du"),
+                    ("self_attn.k_proj", "attn.wk_dv"),
+                    ("self_attn.v_proj", "attn.wv_dv"),
+                    ("self_attn.r_proj", "attn.wr_du"),
+                    ("self_attn.o_proj", "attn.wo_ud"),
+                    ("self_attn.gate_proj", "attn.gate_attn"),
+                    ("self_attn.sink_proj", "attn.attn_sink_proj"),
+                    ("self_attn.q_scale", "attn.q_l2_clip.scale"),
+                    ("self_attn.rel_scale", "attn.rel_l2_clip.scale"),
+                    ("self_attn.rel_proj", "attn.rel_logits_proj.proj"),
+                    ("self_attn.", "attn."),
+                    (".static_weight", ".static_w"),
+                    (".weight_proj.weight", ".weight_proj"),
+                    ("input_layernorm", "attn_norm"),
+                    ("post_attention_layernorm", "mlp_norm"),
+                    ("q_attn_norm", "q_input_norm"),
+                    ("k_attn_norm", "k_input_norm"),
+                    ("v_attn_norm", "v_input_norm"),
+                    ("mlp.gate_weight", "mlp.gate.weight"),
+                    ("mlp.e_score_correction_bias", "mlp.gate.bias"),
+                ):
+                    sub = sub.replace(src, dst)
+                if ".conv.weight" in sub:
+                    sub = sub.replace(".conv.weight", ".weight")
+                    value = value.transpose(0, 2, 1)
+                key = f"model.llm.layers.{layer}.{sub}"
+        elif key.startswith("language_model.model."):
+            sub = key[len("language_model.model.") :]
+            sub = sub.replace("embed_tokens.weight", "embed.weight")
+            sub = sub.replace("final_input.query", "attn_res.output_query")
+            key = "model.llm." + sub
+        elif key == "language_model.lm_head.weight":
+            key = "model.llm.unembed.weight"
+        elif key.startswith("vision_tower."):
+            sub = key[len("vision_tower.") :]
+            sub = sub.replace("pre_layernorm.", "ln_pre.")
+            sub = sub.replace(".layernorm_before.", ".ln_1.").replace(
+                ".layernorm_after.", ".ln_2."
+            )
+            sub = sub.replace(".lambda_1", ".ls_1.gamma").replace(
+                ".lambda_2", ".ls_2.gamma"
+            )
+            sub = sub.replace(".mlp.fc1.", ".mlp.c_fc.").replace(
+                ".mlp.fc2.", ".mlp.c_proj."
+            )
+            key = (
+                "model.visual." + ("" if sub.startswith("proj_") else "backbone.") + sub
+            )
+        weights[key] = value
+    for i, layer in enumerate(model.layers):
+        sm = layer.mlp.switch_mlp
+        weights[f"model.llm.layers.{i}.mlp.experts.w13_weight"] = mx.stack(
+            [sm.gate_proj.weight, sm.up_proj.weight], axis=-2
+        ).reshape(
+            sm.gate_proj.num_experts,
+            -1,
+            sm.gate_proj.input_dims,
+        )
+        weights[f"model.llm.layers.{i}.mlp.experts.w2_weight"] = sm.down_proj.weight
+    return weights
+
+
+def test_inkling2_native_checkpoint_and_mixed_quantization(inkling2_model, tmp_path):
+    from mlx_vlm.convert import convert
+
+    model = inkling2_model
+    raw = _inkling2_native_weights(model)
+    expected = dict(tree_flatten(model.parameters()))
+    sanitized = model.sanitize(raw)
+    assert sanitized.keys() == expected.keys()
+    for key in expected:
+        np.testing.assert_array_equal(np.array(sanitized[key]), np.array(expected[key]))
+    twice = model.sanitize(sanitized)
+    for key in sanitized:
+        np.testing.assert_array_equal(np.array(twice[key]), np.array(sanitized[key]))
+
+    # Match the release's cast groups: queries and router bias stay FP32,
+    # while dense weights (including router/conv weights) are stored in BF16.
+    for key, value in raw.items():
+        if not (".attn_res." in key or key.endswith(".mlp.gate.bias")):
+            raw[key] = value.astype(mx.bfloat16)
+        elif key.endswith(".mlp.gate.bias"):
+            raw[key] = mx.arange(value.size, dtype=mx.float32) / 129
+
+    # The real release combines NVFP4 with per-expert amax and rowwise MXFP8.
+    groups = [
+        {
+            "weight_transform": "cast",
+            "compute_dtype": name,
+            "output_dtype": name,
+            "tensors": [
+                key
+                for key, value in raw.items()
+                if value.dtype == dtype
+                and ".experts." not in key
+                and key != "model.llm.unembed.weight"
+            ],
+        }
+        for name, dtype in (("float32", mx.float32), ("bfloat16", mx.bfloat16))
+    ]
+    groups.append(
+        {
+            "weight_transform": "cast",
+            "compute_dtype": "bfloat16",
+            "output_dtype": "bfloat16",
+            "fwd_output_dtype": "float32",
+            "tensors": ["model.llm.unembed.weight"],
+        }
+    )
+    for layer, mode, bits, group_size in ((0, "nvfp4", 4, 16), (1, "mxfp8", 8, 32)):
+        names = [
+            f"model.llm.layers.{layer}.mlp.experts.{name}"
+            for name in ("w13_weight", "w2_weight")
+        ]
+        groups.append({"weight_transform": mode + "_nearest", "tensors": names})
+        for name in names:
+            weight = raw[name]
+            scale = mx.array([0.5, 0.75, 1.25, 1.5]) if bits == 4 else mx.ones((4,))
+            packed, scales = mx.quantize(
+                weight / scale[:, None, None],
+                group_size=group_size,
+                bits=bits,
+                mode=mode,
+            )
+            raw[name] = packed.view(mx.uint8)
+            raw[name + "_scale"] = scales
+            if bits == 4:
+                raw[name + "_amax"] = scale * 2688
+                raw[name + "_outer_scale_denominator"] = mx.array([2688.0])
+    metadata = {"quant_method": "inkling2", "model": {"parameter_groups": groups}}
+    (tmp_path / "config.json").write_text(json.dumps(asdict(model.config)))
+    (tmp_path / "hf_quant_config.json").write_text(json.dumps(metadata))
+    # Omit null declarations, as in the native checkpoint.
+    config = json.loads((tmp_path / "config.json").read_text())
+    config.pop("quantization")
+    config.pop("quantization_config")
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), raw)
+    loaded = load_model(tmp_path, strict=True)
+    sm = loaded.layers[0].mlp.switch_mlp
+    assert sm.gate_proj.mode == "nvfp4"
+    np.testing.assert_array_equal(
+        np.array(sm.gate_proj.weight_scale_2), [0.5, 0.75, 1.25, 1.5]
+    )
+    assert loaded.layers[1].mlp.switch_mlp.gate_proj.mode == "mxfp8"
+    assert not hasattr(loaded.layers[2].mlp.switch_mlp.gate_proj, "mode")
+    expected = dict(tree_flatten(loaded.parameters()))
+    for key, value in model.sanitize(raw).items():
+        assert expected[key].dtype == value.dtype
+        np.testing.assert_array_equal(
+            np.array(expected[key].astype(mx.float32)),
+            np.array(value.astype(mx.float32)),
+        )
+    fp32_weights = {
+        key: np.array(value)
+        for key, value in expected.items()
+        if value.dtype == mx.float32
+    }
+    assert any(
+        not np.array_equal(
+            value, np.array(mx.array(value).astype(mx.bfloat16).astype(mx.float32))
+        )
+        for value in fp32_weights.values()
+    )
+    ids = mx.array([[1, 2, 3, 4]])
+    logits = loaded(ids).logits
+    assert bool(mx.all(mx.isfinite(logits)))
+    # Use the same public entry point as distributed generation. A fake group
+    # isolates weight loading/partitioning; real collectives are tested below.
+    group = SimpleNamespace(size=lambda: 2, rank=lambda: 1)
+    processor = SimpleNamespace()
+    with (
+        patch("mlx_vlm.utils.load_processor", return_value=processor),
+        patch("mlx_vlm.utils.load_image_processor", return_value=None),
+        patch("mlx.core.distributed.all_sum", side_effect=lambda x, **kw: x),
+    ):
+        sharded, returned_processor = sharded_load(str(tmp_path), tensor_group=group)
+    assert returned_processor is processor
+    assert sharded.language_model.sharding_group is group
+    for key, value in tree_flatten(sharded.parameters()):
+        old = expected[key]
+        assert value.dtype == old.dtype
+        target = old[2:] if ".switch_mlp." in key else old
+        assert mx.array_equal(value, target).item(), key
+    converted = tmp_path / "converted"
+    config["quantization"] = model.quantization_from_metadata(metadata)
+    expected_dtypes = {key: value.dtype for key, value in expected.items()}
+    with patch("mlx_vlm.convert.fetch_from_hub", return_value=(loaded, config, None)):
+        convert(str(tmp_path), str(converted), dtype="bfloat16")
+    reloaded = load_model(converted, strict=True)
+    for key, value in tree_flatten(reloaded.parameters()):
+        assert value.dtype == expected_dtypes[key]
+        if key in fp32_weights:
+            np.testing.assert_array_equal(np.array(value), fp32_weights[key])
+    np.testing.assert_allclose(
+        np.array(reloaded(ids).logits), np.array(logits), atol=1e-6
+    )
+
+
+@pytest.mark.parametrize("softcap", [0.0, 30.0])
+def test_inkling2_bf16_head_keeps_fp32_projection_scores(inkling2_model, softcap):
+    lm = inkling2_model.language_model
+    lm.config.final_logit_softcapping = softcap
+    lm.model.embed_norm.weight = lm.model.embed_norm.weight.astype(mx.bfloat16)
+    lm.lm_head.weight = mx.ones(lm.lm_head.weight.shape, mx.bfloat16)
+    h = mx.zeros((1, 2, lm.config.hidden_size), mx.bfloat16)
+    h[..., 0] = 1
+    h[..., 1] = 1 / 256
+    expected = (
+        np.asarray(h.astype(mx.float32), dtype=np.float64)
+        @ np.asarray(lm.lm_head.weight.astype(mx.float32), dtype=np.float64).T
+    )
+    if softcap:
+        expected = np.tanh(expected / softcap) * softcap
+    actual = lm._logits_from_norm(h)
+    assert actual.dtype == mx.float32
+    assert lm.lm_head.weight.dtype == mx.bfloat16
+    np.testing.assert_allclose(
+        np.array(actual),
+        expected[..., : lm.config.unpadded_vocab_size],
+        atol=2e-7,
+        rtol=0,
+    )
+
+
+@pytest.mark.parametrize(
+    "dtype,tolerance", [(mx.float32, 2e-5), (mx.float16, 1e-2), (mx.bfloat16, 8e-2)]
+)
+def test_inkling2_cached_chunks_and_speculative_rollback(
+    inkling2_model, dtype, tolerance
+):
+    model = inkling2_model
+    # Keep routing away from top-k ties when testing low-precision cache numerics.
+    for layer in model.layers:
+        layer.mlp.e_score_correction_bias = mx.arange(4, dtype=mx.float32)
+    model.update(tree_map(lambda a: a.astype(dtype), model.parameters()))
+    ids = mx.array([[1, 2, 3, 5, 8, 13, 7, 4, 9, 2, 3]])
+    reference = model(ids).logits
+    for chunk in (1, 3, 5):
+        cache = model.make_cache()
+        outputs = [
+            model(ids[:, i : i + chunk], cache=cache).logits
+            for i in range(0, ids.shape[1], chunk)
+        ]
+        np.testing.assert_allclose(
+            np.array(mx.concatenate(outputs, axis=1)),
+            np.array(reference),
+            atol=tolerance,
+            rtol=tolerance,
+        )
+    language = model.language_model
+    cache = language.make_cache()
+    language(ids[:, :3], cache=cache)
+    _, _, state = language.speculative_verify_hidden(ids[:, 3:7], cache)
+    language.rollback_speculative_cache(cache, state, accepted=1, block_size=4)
+    actual = language(ids[:, 5:6], cache=cache).logits
+    np.testing.assert_allclose(
+        np.array(actual), np.array(reference[:, 5:6]), atol=tolerance, rtol=tolerance
+    )
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+def test_inkling2_multiple_images_and_embedding_slots(inkling2_model, dtype):
+    model = inkling2_model
+    model.update(tree_map(lambda a: a.astype(dtype), model.parameters()))
+    pixels = mx.random.normal((3, 4, 4, 3))
+    grid = mx.array([[1, 1, 2], [1, 1, 1]])
+    combined = model.vision_tower(pixels, grid)
+    assert combined.dtype == dtype
+    separate = mx.concatenate(
+        [
+            model.vision_tower(pixels[:2], grid[:1]),
+            model.vision_tower(pixels[2:], grid[1:]),
+        ]
+    )
+    np.testing.assert_allclose(
+        np.array(combined.astype(mx.float32)),
+        np.array(separate.astype(mx.float32)),
+        atol=1e-6,
+    )
+    ids = mx.array([[1, 60, 60, 2, 60]])
+    embeds = model.get_input_embeddings(ids, pixels, image_grid_thw=grid).inputs_embeds
+    np.testing.assert_allclose(
+        np.array(embeds[0, mx.array([1, 2, 4])].astype(mx.float32)),
+        np.array(combined.astype(mx.float32)),
+        atol=1e-6,
+    )
+    with pytest.raises(ValueError, match="Image tokens"):
+        model.get_input_embeddings(mx.array([[60]]), pixels, image_grid_thw=grid)
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+def test_inkling2_convolution_rounds_after_residual_and_scaling(dtype):
+    from mlx_vlm.models.inkling2.language import ShortConvolution
+
+    mx.random.seed(194)
+    conv = ShortConvolution(16, 4, 0)
+    conv.conv.weight = mx.random.normal((16, 4, 1)).astype(dtype)
+    inputs = mx.random.normal((1, 17, 16)).astype(dtype)
+    x = np.array(inputs.astype(mx.float32))
+    taps = np.array(conv.conv.weight.astype(mx.float32))[:, :, 0].T
+    padded = np.pad(x, ((0, 0), (3, 0), (0, 0)))
+    expected = x.copy()
+    convolution = np.zeros_like(x)
+    for tap in range(4):
+        convolution += padded[:, tap : tap + 17] * taps[tap]
+    expected = mx.array((expected + convolution) / np.float32(np.sqrt(5))).astype(dtype)
+    cache = [None]
+    cached = mx.concatenate(
+        [
+            conv(inputs[:, :11], cache),
+            *[conv(inputs[:, i : i + 1], cache) for i in range(11, 17)],
+        ],
+        axis=1,
+    )
+    for actual in (conv(inputs), cached):
+        np.testing.assert_allclose(
+            np.array(actual.astype(mx.float32)),
+            np.array(expected.astype(mx.float32)),
+            atol=2e-6,
+            rtol=2e-6,
+        )
 
 
 def make_ernie55_model(*, learned=False):

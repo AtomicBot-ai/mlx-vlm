@@ -940,6 +940,176 @@ def test_mistral_large4_masked_nvfp4_tensor_scale_and_noncontiguous_input(scale_
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="Requires Metal")
+@pytest.mark.parametrize(
+    "batch,length,routes",
+    [
+        (1, 2, 3),
+        (2, 3, 3),
+        (4, 8, 3),
+        (2, 2, 8),
+        (2, 3, 8),
+        (2, 4, 8),
+        (2, 8, 8),
+        (4, 2, 8),
+        (4, 8, 8),
+    ],
+)
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+def test_masked_switch_glu_matches_independent_decode(batch, length, routes, dtype):
+    from mlx_vlm.models.linear import tokenwise
+    from mlx_vlm.models.switch_layers import SwitchGLU
+
+    mx.random.seed(94)
+    experts = SwitchGLU(512, 256, 4)
+    for name, inputs, outputs in (
+        ("up_proj", 512, 256),
+        ("gate_proj", 512, 256),
+        ("down_proj", 256, 512),
+    ):
+        projection = QuantizedSwitchLinear(
+            inputs, outputs, 4, bias=False, group_size=16, bits=4, mode="nvfp4"
+        )
+        experts[name] = ScaledQuantizedSwitchLinear(
+            projection, mx.array([0.125, 0.77, 1.23, 2.5]), "weight_scale_2"
+        )
+    experts.eval()
+    x = mx.random.normal((batch, length, 512)).astype(dtype)
+    ids = mx.random.randint(-1, 4, (batch, length, routes))
+    actual = experts.masked(x, ids)
+    expected = mx.where(
+        ids[..., None] >= 0,
+        tokenwise(experts, x, mx.maximum(ids, 0)),
+        0,
+    )
+    np.testing.assert_array_equal(
+        np.array(actual.astype(mx.float32)), np.array(expected.astype(mx.float32))
+    )
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Requires Metal")
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("scale_name", [None, "weight_scale_2", "weight_global_scale"])
+def test_paired_masked_nvfp4_boundaries_and_rounding(dtype, scale_name):
+    from mlx_vlm.models.masked_quantized import paired_masked_qmv
+
+    mx.random.seed(95)
+    projection = QuantizedSwitchLinear(
+        512, 24, 4, bias=False, group_size=16, bits=4, mode="nvfp4"
+    )
+    if scale_name is not None:
+        projection = ScaledQuantizedSwitchLinear(
+            projection, mx.array([0.125, 0.77, 1.23, 2.5]), scale_name
+        )
+    ids = mx.array([-1, -1, -1, 2, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, -1, 3])
+    x = mx.random.normal((16, 1024)).astype(dtype)
+    x[:2] = float("nan")
+    x = x[:, ::2]
+    actual = paired_masked_qmv(x, projection, ids)
+    expected = projection(x[:, None, None], mx.maximum(ids, 0)[:, None]).reshape(16, 24)
+    expected = mx.where(ids[:, None] >= 0, expected, 0)
+    np.testing.assert_array_equal(
+        np.array(actual.astype(mx.float32)), np.array(expected.astype(mx.float32))
+    )
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Requires Metal")
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("width", [256, 512, 768])
+@pytest.mark.parametrize("mode", ["nvfp4", "mxfp8"])
+def test_grouped_masked_float_quantized_boundaries(dtype, width, mode):
+    from mlx_vlm.models.masked_quantized import (
+        grouped_masked_qmv,
+        paired_masked_mxfp8_qmv,
+    )
+
+    mx.random.seed(96)
+    projection = QuantizedSwitchLinear(
+        width,
+        24,
+        4,
+        bias=False,
+        group_size=16 if mode == "nvfp4" else 32,
+        bits=4 if mode == "nvfp4" else 8,
+        mode=mode,
+    )
+    if mode == "nvfp4":
+        projection = ScaledQuantizedSwitchLinear(
+            projection, mx.array([0.125, 0.77, 1.23, 2.5]), "weight_scale_2"
+        )
+    ids = mx.array([-1, -1, -1, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3])
+    x = mx.random.normal((16, width * 2)).astype(dtype)[:, ::2]
+    x[:3] = float("nan")
+    kernel = grouped_masked_qmv if mode == "nvfp4" else paired_masked_mxfp8_qmv
+    actual = kernel(x, projection, ids)
+    expected = projection(x[:, None, None], mx.maximum(ids, 0)[:, None]).reshape(16, 24)
+    expected = mx.where(ids[:, None] >= 0, expected, 0)
+    np.testing.assert_array_equal(
+        np.array(actual.astype(mx.float32)), np.array(expected.astype(mx.float32))
+    )
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Requires Metal")
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@pytest.mark.parametrize(
+    "batch,length,routes", [(1, 1, 8), (2, 3, 8), (4, 8, 8), (3, 3, 3), (8, 3, 8)]
+)
+def test_masked_mxfp8_switch_glu_matches_independent_decode(
+    batch, length, routes, dtype
+):
+    from mlx_vlm.models.linear import tokenwise
+    from mlx_vlm.models.switch_layers import SwitchGLU
+
+    mx.random.seed(97)
+    experts = SwitchGLU(512, 256, 4)
+    for name, inputs, outputs in (
+        ("up_proj", 512, 256),
+        ("gate_proj", 512, 256),
+        ("down_proj", 256, 512),
+    ):
+        experts[name] = QuantizedSwitchLinear(
+            inputs, outputs, 4, bias=False, group_size=32, bits=8, mode="mxfp8"
+        )
+    experts.eval()
+    x = mx.random.normal((batch, length, 512)).astype(dtype)
+    ids = mx.random.randint(-1, 4, (batch, length, routes))
+    actual = experts.masked(x, ids)
+    expected = mx.where(
+        ids[..., None] >= 0, tokenwise(experts, x, mx.maximum(ids, 0)), 0
+    )
+    np.testing.assert_array_equal(
+        np.array(actual.astype(mx.float32)), np.array(expected.astype(mx.float32))
+    )
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Requires Metal")
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize(
+    "inputs,outputs", [(4608, 6144), (4608, 1024), (4608, 768), (6144, 4608)]
+)
+def test_inkling2_partitioned_projection_preserves_native_matrix_reduction(
+    rank, inputs, outputs
+):
+    from types import SimpleNamespace
+
+    from mlx_vlm.models.inkling2.language import Attention
+
+    mx.random.seed(98)
+    full = nn.Linear(inputs, outputs, bias=False)
+    full.weight = full.weight.astype(mx.bfloat16)
+    local = nn.Linear(inputs, outputs // 2, bias=False)
+    start = rank * (outputs // 2)
+    local.weight = mx.contiguous(full.weight[start : start + outputs // 2])
+    attention = SimpleNamespace(sharding_group=SimpleNamespace(rank=lambda: rank))
+    for length in (1, 3, 4, 8, 32, 128):
+        x = mx.random.normal((4, length, inputs)).astype(mx.bfloat16)
+        actual = Attention._project(attention, local, x)
+        expected = full(x)[..., start : start + outputs // 2]
+        np.testing.assert_array_equal(
+            np.array(actual.astype(mx.float32)), np.array(expected.astype(mx.float32))
+        )
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Requires Metal")
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("batch,length", [(1, 1), (2, 1), (2, 4), (8, 4)])
 @pytest.mark.parametrize("start", [0, 4])

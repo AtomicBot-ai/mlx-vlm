@@ -2,8 +2,10 @@ import argparse
 import glob
 import json
 import shutil
+import sys
 from functools import wraps
 from pathlib import Path
+from types import ModuleType
 from typing import Callable, Optional, Union
 
 import mlx.core as mx
@@ -617,6 +619,20 @@ def main():
     parser = configure_parser()
     args = parser.parse_args()
     convert(**vars(args))
+
+
+class _CallableConversionModule(ModuleType):
+    """Keep the package-level conversion call without hiding this module."""
+
+    @property
+    def __wrapped__(self):
+        return self.convert
+
+    def __call__(self, *args, **kwargs):
+        return self.convert(*args, **kwargs)
+
+
+sys.modules[__name__].__class__ = _CallableConversionModule
 
 
 if __name__ == "__main__":

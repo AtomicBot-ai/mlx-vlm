@@ -245,6 +245,101 @@ class SwitchGLU(nn.Module):
         self.up_proj = SwitchLinear(input_dims, hidden_dims, num_experts, bias=bias)
         self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
         self.activation = activation
+        self.num_experts = num_experts
+
+    def masked(self, x, indices):
+        """Skip unowned quantized routes when verifying a short decode block.
+
+        Negative indices denote routes owned by another rank. Preserve each
+        projection's native reduction, including the down projection's width.
+        """
+        from .masked_quantized import (
+            grouped_masked_qmv,
+            masked_qmv,
+            paired_masked_mxfp8_qmv,
+            paired_masked_qmv,
+            supports_masked_qmv,
+            supports_paired_mxfp8_qmv,
+        )
+
+        if (
+            not self.training
+            and x.ndim == 3
+            and 1 <= x.shape[0] <= 4
+            and 1 <= x.shape[1] <= DECODE_BLOCK_SIZE
+            and x.shape[0] * indices.shape[-1] < 64
+            and indices.size % 2 == 0
+            and x.dtype in (mx.bfloat16, mx.float16, mx.float32)
+            and mx.metal.is_available()
+            and mx.default_device() == mx.gpu
+            and all(
+                supports_paired_mxfp8_qmv(layer)
+                for layer in (self.up_proj, self.gate_proj, self.down_proj)
+            )
+        ):
+            batch, length, hidden = x.shape
+            order = mx.argsort(indices.reshape(-1))
+            inverse = mx.argsort(order)
+            selected = indices.reshape(-1)[order]
+            values = x.reshape(-1, hidden)[order // indices.shape[-1]]
+            up = paired_masked_mxfp8_qmv(values, self.up_proj, selected)
+            gate = paired_masked_mxfp8_qmv(values, self.gate_proj, selected)
+            output = paired_masked_mxfp8_qmv(
+                self.activation(up, gate), self.down_proj, selected
+            )
+            return output[inverse].reshape(batch, length, indices.shape[-1], hidden)
+
+        if (
+            not self.training
+            and x.ndim == 3
+            and 1 <= x.shape[0] <= 4
+            and 1 < x.shape[1] <= DECODE_BLOCK_SIZE
+            and x.shape[0] * indices.shape[-1] < 64
+            and getattr(self.down_proj, "mode", None) == "nvfp4"
+            and x.dtype in (mx.bfloat16, mx.float16, mx.float32)
+            and mx.metal.is_available()
+            and mx.default_device() == mx.gpu
+            and all(
+                supports_masked_qmv(layer) for layer in (self.up_proj, self.gate_proj)
+            )
+        ):
+            batch, length, hidden = x.shape
+            routes = indices.shape[-1]
+            if batch in (2, 4) and routes == 8:
+                # Speculative positions often select the same experts. Pair
+                # sorted routes to reuse packed weights without changing dots.
+                order = mx.argsort(indices.reshape(-1))
+                inverse = mx.argsort(order)
+                selected = indices.reshape(-1)[order]
+                values = x.reshape(-1, hidden)[order // routes]
+                up = paired_masked_qmv(values, self.up_proj, selected)
+                gate = paired_masked_qmv(values, self.gate_proj, selected)
+                activated = self.activation(up, gate)
+                if batch == 4 and supports_masked_qmv(
+                    self.down_proj, input_alignment=256
+                ):
+                    output = grouped_masked_qmv(activated, self.down_proj, selected)
+                else:
+                    output = self.down_proj(
+                        activated[:, None, None],
+                        mx.maximum(selected, 0)[:, None],
+                        sorted_indices=False,
+                    ).reshape(selected.size, hidden)
+                output = output[inverse].reshape(batch, length, routes, hidden)
+                return mx.where((indices >= 0)[..., None], output, 0)
+            selected = indices.reshape(-1, 1, routes)
+            values = x.reshape(-1, 1, hidden)
+            up = masked_qmv(values, self.up_proj, selected)
+            gate = masked_qmv(values, self.gate_proj, selected)
+            activated = self.activation(up, gate).reshape(batch, length, routes, -1)
+            output = self.down_proj(
+                mx.expand_dims(mx.contiguous(activated), -2),
+                mx.maximum(indices, 0),
+                sorted_indices=False,
+            ).squeeze(-2)
+        else:
+            output = self(x, mx.maximum(indices, 0))
+        return mx.where((indices >= 0)[..., None], output, 0)
 
     def __call__(
         self, x, indices, weights=None, shared=None, residual=None
@@ -302,12 +397,20 @@ class SwitchGLU(nn.Module):
             x, idx, inv_order = _gather_sort(x, indices)
         if self.training:
             idx = mx.stop_gradient(idx)
-        x_up = self.up_proj(x, idx, sorted_indices=do_sort)
-        x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
+        sorted_indices = do_sort
+        if (
+            hasattr(self.gate_proj, "mode")
+            and self.gate_proj.num_experts != self.num_experts
+        ):
+            # Expert partitioning must not lower GatherQMM's B/E >= 4
+            # threshold: NVFP4 vector and matrix kernels round differently.
+            sorted_indices = do_sort and indices.size >= 4 * self.num_experts
+        x_up = self.up_proj(x, idx, sorted_indices=sorted_indices)
+        x_gate = self.gate_proj(x, idx, sorted_indices=sorted_indices)
         x = self.down_proj(
             self.activation(x_up, x_gate),
             idx,
-            sorted_indices=do_sort,
+            sorted_indices=sorted_indices,
         )
 
         if do_sort:

@@ -43,6 +43,13 @@ class _RotatingCacheTransaction:
             else:
                 del cache.update_and_fetch
         else:
+            from .cache_kernels import commit_rotating_prefix
+
+            if commit_rotating_prefix(
+                cache, self.original, self.updates, lengths, length
+            ):
+                self.updates.clear()
+                return
             updates = self.updates[:]
             self.abort()
             keep = max(lengths)

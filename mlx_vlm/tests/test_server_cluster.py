@@ -800,6 +800,23 @@ def test_model_member_count_errors_are_actionable(monkeypatch):
     assert error.value.detail["action"]
 
 
+@pytest.mark.parametrize("world_size", [2, 3, 5, 32])
+def test_inkling2_member_count_uses_expert_ownership(world_size):
+    config = {
+        "model_type": "inkling2",
+        "text_config": {
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "intermediate_size": 64,
+            "n_routed_experts": 32,
+        },
+    }
+    management.validate_model(config, world_size)
+    with pytest.raises(HTTPException) as error:
+        management.validate_model(config, 33)
+    assert error.value.detail["code"] == "unsupported_member_count"
+
+
 async def test_weight_delivery_operation_is_independent_of_membership(
     control, monkeypatch
 ):

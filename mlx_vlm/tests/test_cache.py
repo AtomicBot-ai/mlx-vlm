@@ -3247,6 +3247,8 @@ def finish_batch(batch, sample=None):
 
 
 def embeddings(lm, tokens):
+    if callable(embed := getattr(lm.model, "embed", None)):
+        return embed(tokens)
     return lm.model.embed_tokens(tokens) * getattr(lm.model, "embed_scale", 1)
 
 
@@ -3403,7 +3405,7 @@ def test_diffusion_suffix(prefix_manager, tier):
     assert recorder.input_lengths[-1] == 1
 
 
-@parametrize("model_name", ["gemma4", "qwen3_5"])
+@parametrize("model_name", ["gemma4", "qwen3_5", "inkling2"])
 @parametrize("tier", ["memory", "disk"])
 @parametrize("path", ["stream", "batch"])
 def test_hybrid_prefix_generation(prefix_manager, model_name, tier, path):
@@ -4555,6 +4557,54 @@ def test_deepseek_v41_batch_cache_restores_all_state(abort):
         assert batch.rows[i].offset == expected[i].offset
     assert not batch.is_speculating and not any(
         row.is_speculating for row in batch.rows
+    )
+
+
+def test_inkling2_padded_batch_decode_and_extract():
+    from mlx_vlm.generate.ar import _make_cache
+    from mlx_vlm.models.inkling2 import Model, ModelConfig
+
+    mx.random.seed(23)
+    model = Model(ModelConfig.from_dict(model_case("inkling2")["config"]))
+    model.eval()
+    # Nonzero relative profiles expose ordering errors when a ring wraps.
+    for layer in model.layers:
+        layer.self_attn.rel_proj = mx.random.normal(layer.self_attn.rel_proj.shape)
+    ids = mx.array([[0, 0, 1, 2, 3, 4, 5], [6, 7, 8, 9, 10, 11, 12]])
+    cache = _make_cache(model.language_model, [2, 0])
+    chunks = [
+        model(ids[:, :3], cache=cache).logits,
+        model(ids[:, 3:], cache=cache).logits,
+    ]
+    logits = mx.concatenate(chunks, axis=1)
+    for row, padding in enumerate((2, 0)):
+        expected = model(ids[row : row + 1, padding:]).logits
+        np.testing.assert_allclose(
+            np.array(logits[row : row + 1, padding:]),
+            np.array(expected),
+            atol=2e-5,
+            rtol=2e-5,
+        )
+    token = mx.array([[13], [14]])
+    actual = model(token, cache=cache).logits
+    for row, padding in enumerate((2, 0)):
+        full = mx.concatenate(
+            [ids[row : row + 1, padding:], token[row : row + 1]], axis=1
+        )
+        expected = model(full).logits[:, -1:]
+        np.testing.assert_allclose(
+            np.array(actual[row : row + 1]), np.array(expected), atol=2e-5, rtol=2e-5
+        )
+    extracted = [layer.extract(0) for layer in cache]
+    next_token = mx.array([[15]])
+    expected = model(
+        mx.concatenate([ids[:1, 2:], token[:1], next_token], axis=1)
+    ).logits[:, -1:]
+    np.testing.assert_allclose(
+        np.array(model(next_token, cache=extracted).logits),
+        np.array(expected),
+        atol=2e-5,
+        rtol=2e-5,
     )
 
 

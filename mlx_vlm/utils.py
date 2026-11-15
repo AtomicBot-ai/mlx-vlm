@@ -545,7 +545,8 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             hf_quant_path = model_path / "hf_quant_config.json"
             if hf_quant_path.exists():
                 with open(hf_quant_path) as f:
-                    hf_quant = json.load(f).get("quantization", {})
+                    hf_metadata = json.load(f)
+                hf_quant = hf_metadata.get("quantization", {})
                 if hf_quant.get("quant_algo") == "NVFP4":
                     # nvfp4 implies group_size=16
                     config["quantization"] = config["quantization_config"] = {
@@ -553,6 +554,12 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                         "bits": 4,
                         "mode": "nvfp4",
                     }
+                elif hasattr(model, "quantization_from_metadata"):
+                    native_quantization = model.quantization_from_metadata(hf_metadata)
+                    if native_quantization is not None:
+                        config["quantization"] = config["quantization_config"] = (
+                            native_quantization
+                        )
 
         if quantization_config is not None:
             quant_method = quantization_config.get("quant_method")

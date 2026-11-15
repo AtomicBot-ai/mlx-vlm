@@ -5096,3 +5096,35 @@ def test_load_processor_keeps_processor_stop_ids():
     assert criteria.eos_token_ids == [2, 9]
     criteria.reset([5])
     assert criteria.eos_token_ids == [5, 9]
+
+
+def test_inkling2_image_padding_transparency_and_placeholder_counts():
+    from transformers.processing_utils import ProcessorMixin
+
+    from mlx_vlm.models.inkling2 import Inkling2ImageProcessor, Inkling2Processor
+
+    image_processor = Inkling2ImageProcessor(size={"height": 4, "width": 4})
+    transparent = Image.new("RGBA", (9, 5), (255, 0, 0, 0))
+    features = image_processor(transparent)
+    assert features["image_grid_thw"].tolist() == [[1, 2, 3]]
+    pixels = np.array(features["pixel_values"])
+    assert pixels.shape == (6, 4, 4, 3)
+    np.testing.assert_allclose(pixels[0, 0, 0], 204 / 127.5 - 1, atol=1e-6)
+    np.testing.assert_allclose(pixels[2, 0, 0], 153 / 127.5 - 1, atol=1e-6)
+    np.testing.assert_allclose(pixels[-1, -1, -1], -1 / 127.5 - 1, atol=1e-6)
+    tokenizer = MagicMock()
+    tokenizer.convert_tokens_to_ids.return_value = 60
+    tokenizer.pad_token_id = 0
+    tokenizer.encode.side_effect = lambda s, **kw: [60] * s.count("<image>") + [1]
+    with patch.object(ProcessorMixin, "__init__", return_value=None):
+        processor = Inkling2Processor(image_processor, tokenizer, image_token="<image>")
+    processor.image_processor, processor.tokenizer = image_processor, tokenizer
+    texts = ["<image> first", "<image> second"]
+    inputs = processor(text=texts, images=[transparent, Image.new("RGB", (4, 4))])
+    assert texts == ["<image> first", "<image> second"]
+    assert (inputs["input_ids"] == 60).sum(axis=1).tolist() == [6, 1]
+    assert inputs["attention_mask"].sum(axis=1).tolist() == [7, 2]
+    with pytest.raises(ValueError, match="More image placeholders"):
+        processor(text="<image><image>", images=transparent)
+    with pytest.raises(ValueError, match="More images"):
+        processor(text="hello", images=transparent)

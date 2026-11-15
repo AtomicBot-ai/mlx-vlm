@@ -32,6 +32,7 @@ DRAFTER_KIND_BY_MODEL_TYPE = {
     "glm_moe_dsa_mtp": "mtp",
     "hy_v4_mtp": "mtp",
     "inkling_mtp": "mtp",
+    "inkling2_dspark": "dflash",
     "qwen3_5_mtp": "mtp",
     "qwen4_exp_mtp": "mtp",
     "laguna": "dflash",

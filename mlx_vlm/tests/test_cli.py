@@ -104,6 +104,15 @@ def test_cli_boolean_and_thinking_flags(entrypoint, default):
     assert error.value.code == 2
 
 
+def test_server_prefill_budget_respects_worker_environment(monkeypatch):
+    from mlx_vlm.server.cli import main
+
+    monkeypatch.setenv("PREFILL_STEP_SIZE", "128")
+    parser = _capture_parser(main)
+    assert parser.parse_args([]).prefill_step_size == 128
+    assert parser.parse_args(["--prefill-step-size", "256"]).prefill_step_size == 256
+
+
 def test_cli_reasoning_effort_parsing():
     parser = _capture_parser(dispatch.parse_arguments)
     assert parser.parse_args([]).reasoning_effort is None

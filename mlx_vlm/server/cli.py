@@ -153,7 +153,7 @@ def main():
     parser.add_argument(
         "--prefill-step-size",
         type=int,
-        default=DEFAULT_PREFILL_STEP_SIZE,
+        default=os.environ.get("PREFILL_STEP_SIZE", DEFAULT_PREFILL_STEP_SIZE),
         help="Prompt-token budget per batch step, including padding "
         "(default: %(default)s). Lower values reduce pauses in active streams.",
     )

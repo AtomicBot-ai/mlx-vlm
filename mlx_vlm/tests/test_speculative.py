@@ -60,6 +60,431 @@ DATA = json.loads(Path(__file__).with_name("model_cases.json").read_text())[
 ]
 
 
+def inkling2_dspark_case(dtype=mx.float32):
+    from mlx_vlm.models.inkling2 import Model, ModelConfig
+    from mlx_vlm.speculative.drafters.inkling2_dspark import Model as Draft
+    from mlx_vlm.speculative.drafters.inkling2_dspark import ModelConfig as DraftConfig
+
+    config = deepcopy(model_case("inkling2")["config"])
+    config["mtp_config"] = deepcopy(DATA["inkling2_dspark"])
+    target = Model(ModelConfig.from_dict(config))
+    draft = Draft(
+        DraftConfig(
+            text_config={**config["text_config"], "mtp_config": config["mtp_config"]}
+        )
+    )
+    target.set_dtype(dtype)
+    draft.set_dtype(dtype)
+    # Keep target routing away from ties when comparing chunk shapes.
+    for layer in target.layers:
+        layer.mlp.e_score_correction_bias = mx.arange(4, dtype=mx.float32)
+    target.eval()
+    draft.eval()
+    return target, draft
+
+
+@parametrize("location", ["root", "text"])
+def test_inkling2_dspark_native_and_standalone_loading(tmp_path, location):
+    target, draft = inkling2_dspark_case(mx.bfloat16)
+    config = deepcopy(model_case("inkling2")["config"])
+    config.update(model_type="inkling2", mtp_config=deepcopy(DATA["inkling2_dspark"]))
+    if location == "text":
+        config["text_config"]["mtp_config"] = config.pop("mtp_config")
+    # Target quantization must not quantize the BF16 sidecar.
+    config["quantization"] = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    weights = dict(tree_flatten(draft.parameters()))
+    mx.save_safetensors(str(tmp_path / "mtp.safetensors"), weights)
+    mx.save_safetensors(
+        str(tmp_path / "model.safetensors"), {"norm.weight": mx.zeros((32,))}
+    )
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"norm.weight": "model.safetensors"}})
+    )
+    loaded, kind = load_drafter(str(tmp_path))
+    assert kind == resolve_drafter_kind(tmp_path) == "dflash"
+    equal(dict(tree_flatten(loaded.parameters())), weights)
+    validate_drafter_compatibility(target, loaded, kind)
+    output = get_mtp_splitter(source_config=config).split(
+        str(tmp_path), str(tmp_path / "draft")
+    )
+    standalone, kind = load_drafter(str(output))
+    equal(dict(tree_flatten(standalone.parameters())), weights)
+    assert kind == "dflash"
+    del weights["markov_head.rnn_proj.bias"]
+    mx.save_safetensors(str(tmp_path / "mtp.safetensors"), weights)
+    with pytest.raises(ValueError, match="Missing|missing"):
+        load_drafter(str(tmp_path))
+
+
+def test_inkling2_dspark_capture_inputs_and_final_norm():
+    target, _ = inkling2_dspark_case()
+    lm = target.language_model
+    ids = mx.array([[1, 2, 3, 4, 5]])
+    x, blocks, expected = lm.model.embed(ids), [], []
+    for layer in lm.layers:
+        expected.append(x)
+        x = layer(x, blocks)
+    expected.append(
+        lm.model.norm(lm.model.final_input(blocks, x)[..., 0, :]).astype(x.dtype)
+    )
+    equal(
+        lm(ids, capture_layer_ids=[3, 0, 2]).hidden_states,
+        [expected[i] for i in [3, 0, 2]],
+    )
+    for invalid in ([0, 0], [-1], [4], [True]):
+        with pytest.raises(ValueError, match="capture_layer_ids"):
+            lm(ids, capture_layer_ids=invalid)
+
+
+@parametrize("dtype,tol", [(mx.float32, 3e-5), (mx.bfloat16, 0.04)])
+@parametrize("retained", [[1, 3], [4, 2], [0, 0]])
+def test_inkling2_dspark_ragged_rollback_and_abort(dtype, tol, retained):
+    target, draft = inkling2_dspark_case(dtype)
+    lm = target.language_model
+    cache = _make_cache(lm, [0, 0])
+    prefix = mx.array([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]])
+    mx.eval(lm(prefix, cache=cache).logits)
+    controls = [[c.extract(row) for c in cache] for row in range(2)]
+    block = mx.array([[11, 12, 13, 14], [15, 16, 17, 18]])
+    out = lm(
+        block,
+        cache=cache,
+        capture_layer_ids=draft.config.target_layer_ids,
+        speculative_verify=True,
+    )
+    mx.eval(out.logits)
+    if retained == [0, 0]:
+        out.gdn_states.abort()
+    else:
+        out.gdn_states.commit(retained)
+    for row, length in enumerate(retained):
+        for i in range(length):
+            mx.eval(lm(block[row : row + 1, i : i + 1], cache=controls[row]).logits)
+        actual = [c.extract(row) for c in cache]
+        equal(
+            lm(mx.array([[19]]), cache=actual).logits,
+            lm(mx.array([[19]]), cache=controls[row]).logits,
+            atol=tol,
+            rtol=tol,
+        )
+        for a, b in zip(actual, controls[row]):
+            equal(a[1].state, b[1].state, atol=tol, rtol=tol)
+
+
+@parametrize("width", [0, 3, 7])
+@parametrize("length", [1, 8])
+def test_inkling2_dspark_masked_convolution_history(width, length):
+    from mlx_vlm.models.cache import ArraysCache
+    from mlx_vlm.models.inkling2.language import _update_conv_cache
+    from mlx_vlm.models.inkling.language import _next_conv_state
+
+    mx.random.seed(99)
+    initial = mx.random.normal((4, width, 16))
+    inputs = mx.random.normal((4, length, 16))
+    positions = mx.arange(length)[None]
+    mask = (positions >= mx.array([2, 0, 0, 0])[:, None]) & (
+        positions < mx.array([length, 4, 0, length])[:, None]
+    )
+    for retained in ([0, 1, 4, 8], [8, 5, 3, 0]):
+        retained = [min(n, length) for n in retained]
+        cache = ArraysCache(1)
+        cache[0] = initial
+        cache.start_speculation(length)
+        _update_conv_cache(cache, 0, initial, inputs, mask)
+        cache.commit_speculation(retained)
+        expected = mx.concatenate(
+            [
+                (
+                    _next_conv_state(
+                        initial[row : row + 1],
+                        inputs[row : row + 1, :keep],
+                        mask[row : row + 1, :keep],
+                    )
+                    if keep
+                    else initial[row : row + 1]
+                )
+                for row, keep in enumerate(retained)
+            ]
+        )
+        equal(cache[0], expected, atol=0, rtol=0)
+
+
+@parametrize("batch", [1, 4])
+@parametrize("length", [1, 2, 3, 8])
+@parametrize("masked", [False, True])
+def test_inkling2_short_convolution_native_fp32_rounding(
+    batch, length, masked, monkeypatch
+):
+    from mlx_vlm.models.inkling2 import kernels
+    from mlx_vlm.models.inkling2.language import ShortConvolution
+
+    conv = ShortConvolution(128, 4, 0)
+    conv.set_dtype(mx.bfloat16)
+    conv.eval()
+    actual, reference = ArraysCache(4), ArraysCache(4)
+    state = mx.random.normal((batch, 3, 128))
+    actual[0] = reference[0] = state
+    x = mx.random.normal((batch, length, 128)).astype(mx.bfloat16)
+    mask = None
+    if masked:
+        positions = mx.arange(length)[None]
+        mask = (positions >= mx.array([0, 1, 0, length][:batch])[:, None]) & (
+            positions < mx.array([length, length, length - 1, length][:batch])[:, None]
+        )
+    actual.start_speculation(length)
+    reference.start_speculation(length)
+    calls = []
+    kernel = kernels.short_convolution
+
+    def record(*args):
+        calls.append(True)
+        return kernel(*args)
+
+    monkeypatch.setattr(kernels, "short_convolution", record)
+    output = conv(x, actual, mask)
+    if mx.metal.is_available() and mx.default_device() == mx.gpu:
+        assert calls
+    with monkeypatch.context() as patch:
+        patch.setattr(mx.metal, "is_available", lambda: False)
+        expected = conv(x, reference, mask)
+    retained = [length] if batch == 1 else [0, 1, length - 1, length]
+    actual.commit_speculation(retained)
+    reference.commit_speculation(retained)
+    equal(output, expected, atol=0, rtol=0)
+    equal(actual.state, reference.state, atol=0, rtol=0)
+    assert actual[0].dtype == mx.float32
+
+
+@parametrize("rank", [None, 0, 1])
+def test_inkling2_fp32_head_cache_preserves_logits_and_reload(rank, monkeypatch):
+    target, _ = inkling2_dspark_case(mx.bfloat16)
+    lm = target.language_model
+    lm.lm_head = nn.Linear(32, 16384, bias=False)
+    lm.lm_head.set_dtype(mx.bfloat16)
+    lm.config.unpadded_vocab_size = 16370
+    if rank is not None:
+        lm.sharding_group = NS(size=lambda: 2, rank=lambda: rank)
+    h = mx.random.normal((4, 3, 32)).astype(mx.bfloat16)
+    for _ in range(2):
+        # Replacing checkpoint weights must invalidate the retained conversion.
+        lm.lm_head.weight = mx.random.normal((16384, 32)).astype(mx.bfloat16)
+        expected = h.astype(mx.float32) @ lm.lm_head.weight.astype(mx.float32).T
+
+        def gather(local, group):
+            parts = [
+                part.reshape(1, -1, 8192) for part in mx.split(expected, 2, axis=-1)
+            ]
+            equal(local, parts[rank], atol=0, rtol=0)
+            return mx.concatenate(parts)
+
+        if rank is not None:
+            monkeypatch.setattr(mx.distributed, "all_gather", gather)
+        actual = lm._logits_from_norm(h)
+        cap = lm.config.final_logit_softcapping
+        if cap:
+            expected = mx.tanh(expected / cap) * cap
+        equal(actual, expected[..., : lm.config.unpadded_vocab_size], atol=0, rtol=0)
+        assert actual.dtype == mx.float32
+        assert lm.lm_head.weight.dtype == mx.bfloat16
+        if mx.metal.is_available() and mx.default_device() == mx.gpu:
+            assert lm._head_projection_cache[0] is lm.lm_head.weight
+        assert not any(
+            "_head_projection_cache" in name
+            for name, _ in tree_flatten(lm.parameters())
+        )
+
+
+def test_inkling2_dspark_draft_context_window_and_budget():
+    target, draft = inkling2_dspark_case()
+    draft.bind(target)
+    hidden = mx.random.normal((1, 7, 3 * 32))
+    full, short = draft.make_cache(), draft.make_cache()
+    all_tokens = draft.draft_block(1, hidden, full, 4, greedy)
+    token = draft.draft_block(1, hidden, short, 2, greedy)
+    equal(token, all_tokens[:, :1])
+    assert all(c.offset == 7 for c in full)
+    assert full[0].keys.shape[2] <= 4
+    for a, b in zip(full, short):
+        equal(a.state, b.state)
+    # A second round keeps only committed target context, never mask positions.
+    draft.draft_block(2, hidden[:, :2], full, 4, greedy)
+    assert all(c.offset == 9 for c in full)
+    assert draft.draft_block(1, hidden, [], 1, greedy).shape == (1, 0)
+
+
+def test_inkling2_dspark_distributed_draft_cache_ownership(monkeypatch):
+    mx.random.seed(96)
+    target, draft = inkling2_dspark_case(mx.bfloat16)
+    draft.bind(target)
+    group = NS(size=lambda: 2, rank=lambda: current_rank)
+    target.language_model.sharding_group = group
+    contributions = []
+
+    def all_sum(value, group):
+        contributions.append(value)
+        return value
+
+    monkeypatch.setattr(mx.distributed, "all_sum", all_sum)
+    references = [draft.make_cache() for _ in range(4)]
+    caches = [[draft.make_cache() for _ in range(4)] for _ in range(2)]
+    for lengths, keep, add in (
+        ([9, 3, 8, 1], None, False),
+        ([1, 3], [1, 3], False),  # Both survivors belong to rank one.
+        ([2, 1, 4], None, True),  # Merge a fresh row without moving owners.
+        ([3], [1], False),  # A resumed singleton must keep its previous owner.
+    ):
+        if keep is not None:
+            references = [references[i] for i in keep]
+            caches = [[row[i] for i in keep] for row in caches]
+        if add:
+            references.append(draft.make_cache())
+            for row in caches:
+                row.append(draft.make_cache())
+        hidden = [mx.random.normal((1, n, 96)).astype(mx.bfloat16) for n in lengths]
+        anchors = [3] * len(lengths)
+        expected = mx.concatenate(
+            [
+                draft.draft_block(a, h, c, 4, greedy)
+                for a, h, c in zip(anchors, hidden, references)
+            ]
+        )
+        contributions.clear()
+        for current_rank in range(2):
+            draft.draft_batch_greedy(
+                anchors, hidden, caches[current_rank], 4, greedy, mx.int32
+            )
+            for row, reference in zip(caches[current_rank], references):
+                if row[0]._draft_rank == current_rank:
+                    for actual, ref in zip(row, reference):
+                        assert actual.offset == ref.offset
+                        equal(actual.state, ref.state)
+        assert len(contributions) == 2
+        equal(contributions[0] + contributions[1], expected)
+        caches = deepcopy(caches)
+
+    # A fresh singleton keeps replicated execution and adds no collective.
+    contributions.clear()
+    singleton = draft.make_cache()
+    actual = draft.draft_batch_greedy([3], hidden, [singleton], 4, greedy, mx.int32)
+    expected = draft.draft_block(3, hidden[0], draft.make_cache(), 4, greedy)
+    equal(actual, expected)
+    assert not contributions and not hasattr(singleton[0], "_draft_rank")
+
+
+@parametrize("batch", [2, 4])
+def test_inkling2_dspark_local_batch_preserves_logits_and_ragged_cache(batch):
+    target, draft = inkling2_dspark_case(mx.bfloat16)
+    draft.bind(target)
+    references = [draft.make_cache() for _ in range(batch)]
+    caches = [draft.make_cache() for _ in range(batch)]
+    for depth, lengths in ((3, [9, 3, 8, 1]), (2, [2, 1, 3, 2]), (4, [1, 4, 2, 1])):
+        hidden = [
+            mx.random.normal((1, n, 96)).astype(mx.bfloat16) for n in lengths[:batch]
+        ]
+        anchors = list(range(3, 3 + batch))
+        ref_logits, actual_logits = [], []
+
+        def reference_sampler(x):
+            ref_logits.append(x)
+            return mx.argmax(x, axis=-1)
+
+        def actual_sampler(x):
+            actual_logits.append(x)
+            return mx.argmax(x, axis=-1)
+
+        expected = mx.concatenate(
+            [
+                draft.draft_block(a, h, c, depth, reference_sampler)
+                for a, h, c in zip(anchors, hidden, references)
+            ]
+        )
+        actual = draft._draft_local_batch(
+            anchors, hidden, caches, depth, actual_sampler, mx.int32
+        )
+        count = depth - 1
+        expected_logits = mx.stack(
+            [
+                mx.concatenate(ref_logits[row * count : (row + 1) * count])
+                for row in range(batch)
+            ]
+        )
+        equal(mx.stack(actual_logits, axis=1), expected_logits, atol=0, rtol=0)
+        equal(actual, expected)
+        for row, reference in zip(caches, references):
+            for a, b in zip(row, reference):
+                assert a.offset == b.offset
+                equal(a.state, b.state, atol=0, rtol=0)
+
+
+@parametrize("dtype", [mx.float32, mx.bfloat16])
+def test_inkling2_dspark_markov_head_reference(dtype):
+    target, draft = inkling2_dspark_case(dtype)
+    draft.bind(target)
+    head = draft.markov_head
+
+    # Independent FP64 fold, followed by the checkpoint's explicit rounding.
+    def array(x):
+        return np.array(x.astype(mx.float32)).astype(np.float64)
+
+    folded = array(target.language_model.lm_head.weight) @ array(head.hidden_out.weight)
+    equal(head._fold_weight, mx.array(folded.astype(np.float32)).astype(dtype))
+    state = mx.zeros((1, draft.config.markov_rank), dtype)
+    hidden, context = mx.random.normal((1, 1, 32)).astype(dtype), mx.random.normal(
+        (1, 1, 32)
+    ).astype(dtype)
+    term = head.context(hidden, context)[:, 0]
+    previous = mx.array([3])
+
+    def rounded(x):
+        return array(mx.array(np.asarray(x, dtype=np.float32)).astype(dtype))
+
+    raw = rounded(
+        np.concatenate([array(state), array(head.markov_w1(previous))], -1)
+        @ array(head.rnn_proj.weight[:, :16]).T
+        + array(term)
+    )
+    gate, candidate, output = np.split(raw, 3, axis=-1)
+    gate, candidate = rounded(1 / (1 + np.exp(-gate))), rounded(np.tanh(candidate))
+    expected = rounded(
+        rounded(gate * array(state)) + rounded(rounded(1 - gate) * candidate)
+    )
+    actual, _ = head.step(state, previous, term)
+    equal(
+        actual,
+        mx.array(expected.astype(np.float32)).astype(dtype),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+@parametrize("temperature", [0, 0.7])
+@parametrize("prefill_step_size", [None, 2])
+@parametrize("dtype", [mx.float32, mx.bfloat16])
+def test_inkling2_dspark_standard_generation_and_reset(
+    temperature, prefill_step_size, dtype, monkeypatch
+):
+    mx.random.seed(73)
+    target, draft = inkling2_dspark_case(dtype)
+    calls = []
+    forward = type(target.language_model).__call__
+
+    def record(self, inputs=None, *args, **kwargs):
+        embeddings = kwargs.get("inputs_embeds")
+        calls.append(inputs.shape[1] if inputs is not None else embeddings.shape[1])
+        return forward(self, inputs, *args, **kwargs)
+
+    monkeypatch.setattr(type(target.language_model), "__call__", record)
+    options = dict(temperature=temperature, prefill_step_size=prefill_step_size)
+    expected = generated(target, **options)
+    for _ in range(2):
+        calls.clear()
+        assert generated(target, draft, **options) == expected
+        prefix = [2, 1, 1] if prefill_step_size else [4]
+        assert calls[: len(prefix)] == prefix
+        assert draft.draft_lens and sum(draft.draft_lens) > 0
+
+
 def mistral_dspark_case():
     from mlx_vlm.models.mistral_large4.config import TextConfig
     from mlx_vlm.models.mistral_large4.language import LanguageModel
@@ -279,7 +704,8 @@ def test_mistral_dspark_ragged_rollback_includes_shared_and_index_only_caches():
 @parametrize("cancel", [False, True])
 @parametrize("sampling", ["greedy", "random", "positioned"])
 @parametrize("phased", [False, True])
-def test_mistral_dspark_admits_requests_while_batch_is_active(cancel, sampling, phased):
+@parametrize("family", ["mistral", "inkling2"])
+def test_dspark_admits_requests_while_batch_is_active(cancel, sampling, phased, family):
     from types import SimpleNamespace
 
     from mlx_vlm.generate.ar import BatchGenerator
@@ -291,7 +717,12 @@ def test_mistral_dspark_admits_requests_while_batch_is_active(cancel, sampling, 
     sampler = make_sampler(temp=0.7) if sampling == "random" else None
     if sampling == "positioned":
         sampler = _PositionedTargetSampler(temperature=0.7, top_p=1.0, seed=23)
-    target, draft = mistral_dspark_case()
+    if family == "inkling2":
+        model, draft = inkling2_dspark_case()
+        target = model.language_model
+    else:
+        target, draft = mistral_dspark_case()
+    embed = getattr(target.model, "embed", target.model.embed_tokens)
     generator = BatchGenerator(
         target,
         SimpleNamespace(stopping_criteria=StoppingCriteria([])),
@@ -312,10 +743,7 @@ def test_mistral_dspark_admits_requests_while_batch_is_active(cancel, sampling, 
         generator.insert(
             rows,
             max_tokens=limits,
-            prompt_kwargs=[
-                {"inputs_embeds": target.model.embed_tokens(mx.array([p]))}
-                for p in rows
-            ],
+            prompt_kwargs=[{"inputs_embeds": embed(mx.array([p]))} for p in rows],
         )
 
     insert(prompts[:2], [40, 3])
@@ -350,7 +778,8 @@ def test_mistral_dspark_admits_requests_while_batch_is_active(cancel, sampling, 
 
 
 @parametrize(
-    "family", ["dflash2", "ricursive-dflash2", "dspark-lfm2", "mistral", "gemma"]
+    "family",
+    ["dflash2", "ricursive-dflash2", "dspark-lfm2", "mistral", "gemma", "inkling2"],
 )
 @parametrize("pause_after", [1, 8])
 @parametrize("sampling", [False, True])
@@ -363,6 +792,9 @@ def test_speculative_row_resume_preserves_state_and_other_requests(
     mx.random.seed(23)
     if family == "mistral":
         target, draft = mistral_dspark_case()
+    elif family == "inkling2":
+        model, draft = inkling2_dspark_case()
+        target = model.language_model
     elif family == "gemma":
         target, draft = gemma_dflash_case(shared=True)
     else:
@@ -382,13 +814,14 @@ def test_speculative_row_resume_preserves_state_and_other_requests(
     )
     prompts = [[1, 3, 5, 7], [2, 4]]
     outputs = [[], []]
+    embed = getattr(target.model, "embed", target.model.embed_tokens)
     generator.insert(
         prompts,
         max_tokens=32,
         resumable=True,
         prompt_kwargs=[
             {
-                "inputs_embeds": target.model.embed_tokens(mx.array([p]))
+                "inputs_embeds": embed(mx.array([p]))
                 * getattr(target.model, "embed_scale", 1)
             }
             for p in prompts
@@ -3973,6 +4406,149 @@ def test_rotating_ragged_commit_masks_rejected_tokens():
         visible = mx.where(mask[row, 0, 0], keys[row, 0, :, 0], -1)
         expected = list(range(12)) + list(range(100, 100 + retained)) + [200]
         assert sorted(x for x in visible.tolist() if x >= 0) == sorted(expected[-8:])
+
+
+@parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@parametrize("initial_length,decode", [(3, 0), (8, 0), (8, 3), (17, 1)])
+@parametrize("block", [2, 3, 8])
+def test_rotating_prefix_kernel_matches_independent_replay(
+    dtype, initial_length, decode, block, monkeypatch
+):
+    from mlx_vlm.models.cache import BatchRotatingKVCache
+    from mlx_vlm.speculative import cache_kernels
+
+    base = BatchRotatingKVCache(8, [0, 2, 1, 0])
+    keys = mx.random.normal((4, 2, initial_length, 16)).astype(dtype)
+    values = mx.random.normal((4, 2, initial_length, 24)).astype(dtype)
+    base.update_and_fetch(keys, values)
+    for _ in range(decode):
+        base.update_and_fetch(keys[:, :, :1], values[:, :, :1])
+    actual, reference = deepcopy(base), deepcopy(base)
+    for lengths in (
+        [block, 1, block - 1, 0],
+        [1] * 4,
+        [block] * 4,
+        [0] * 4,
+        [block - 1] * 4,
+    ):
+        k = mx.random.normal((4, 2, block, 16)).astype(dtype)
+        v = mx.random.normal((4, 2, block, 24)).astype(dtype)
+        a = start_speculative_cache([actual], block)
+        b = start_speculative_cache([reference], block)
+        actual.update_and_fetch(k, v)
+        reference.update_and_fetch(k, v)
+        a.commit(lengths)
+        with monkeypatch.context() as patch:
+            patch.setattr(cache_kernels, "commit_rotating_prefix", lambda *args: False)
+            b.commit(lengths)
+        equal(actual.state, reference.state, atol=0, rtol=0)
+        assert actual.meta_state == reference.meta_state
+        assert "update_and_fetch" not in actual.__dict__
+    # Retained cache rows remain usable after filtering and snapshot/restore.
+    actual.filter([3, 1])
+    reference.filter([3, 1])
+    actual = deepcopy(actual)
+    a, b = start_speculative_cache([actual], block), start_speculative_cache(
+        [reference], block
+    )
+    actual.update_and_fetch(k[[3, 1]], v[[3, 1]])
+    reference.update_and_fetch(k[[3, 1]], v[[3, 1]])
+    a.commit([block, 0])
+    with monkeypatch.context() as patch:
+        patch.setattr(cache_kernels, "commit_rotating_prefix", lambda *args: False)
+        b.commit([block, 0])
+    equal(actual.state, reference.state, atol=0, rtol=0)
+    assert actual.meta_state == reference.meta_state
+
+
+@parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@parametrize("total", [2, 3, 8])
+@parametrize("has_initial", [False, True])
+def test_temporal_prefix_selection_strides_and_zero_acceptance(
+    dtype, total, has_initial, monkeypatch
+):
+    from mlx_vlm.speculative import cache_kernels
+
+    # Views retain nontrivial batch, time and feature strides.
+    states = mx.random.normal((4, total + 1, 3, 38)).astype(dtype)[..., ::2]
+    middle, final = states[:, 1:total], states[:, total]
+    initial = states[:, 0] if has_initial else None
+    lengths = [0, 1, total - 1, total]
+    record = ("states", middle, final)
+    actual = ArraysCache._select_speculative_states(record, initial, lengths, total)
+    with monkeypatch.context() as patch:
+        patch.setattr(cache_kernels, "select_temporal_states", lambda *args: None)
+        expected = ArraysCache._select_speculative_states(
+            record, initial, lengths, total
+        )
+    equal(actual, expected, atol=0, rtol=0)
+
+
+def test_temporal_prefix_selection_retains_promoted_initial_dtype():
+    initial = mx.full((4, 3), 1.001, mx.float32)
+    middle = mx.full((4, 1, 3), 2, mx.bfloat16)
+    final = mx.full((4, 3), 3, mx.bfloat16)
+    output = ArraysCache._select_speculative_states(
+        ("states", middle, final), initial, [0, 1, 2, 0], 2
+    )
+    assert output.dtype == mx.float32
+    equal(
+        output,
+        mx.concatenate(
+            [
+                initial[:1],
+                middle[1, :1].astype(mx.float32),
+                final[2:3].astype(mx.float32),
+                initial[3:],
+            ]
+        ),
+        atol=0,
+        rtol=0,
+    )
+
+
+def test_rotating_prefix_commit_retains_incoming_dtype_promotion(monkeypatch):
+    from mlx_vlm.models.cache import BatchRotatingKVCache
+    from mlx_vlm.speculative import cache_kernels
+
+    actual = BatchRotatingKVCache(8, [0, 0])
+    old = mx.ones((2, 1, 12, 16), mx.bfloat16)
+    actual.update_and_fetch(old, old)
+    reference = deepcopy(actual)
+    incoming = mx.full((2, 1, 3, 16), 1.001, mx.float32)
+    a, b = start_speculative_cache([actual], 3), start_speculative_cache([reference], 3)
+    actual.update_and_fetch(incoming, incoming)
+    reference.update_and_fetch(incoming, incoming)
+    a.commit([3, 1])
+    with monkeypatch.context() as patch:
+        patch.setattr(cache_kernels, "commit_rotating_prefix", lambda *args: False)
+        b.commit([3, 1])
+    equal(actual.state, reference.state, atol=0, rtol=0)
+    assert actual.keys.dtype == actual.values.dtype == mx.float32
+
+
+def test_rotating_prefix_commit_preserves_subclass_update_semantics(monkeypatch):
+    from mlx_vlm.models.cache import BatchRotatingKVCache
+    from mlx_vlm.speculative import cache_kernels
+
+    class ScaledRotatingCache(BatchRotatingKVCache):
+        def update_and_fetch(self, keys, values):
+            return super().update_and_fetch(keys * 2, values * 2)
+
+    actual = ScaledRotatingCache(8, [0, 0])
+    prefix = mx.ones((2, 1, 12, 16))
+    actual.update_and_fetch(prefix, prefix)
+    reference = deepcopy(actual)
+    incoming = mx.full((2, 1, 3, 16), 7.0)
+    a, b = start_speculative_cache([actual], 3), start_speculative_cache([reference], 3)
+    actual.update_and_fetch(incoming, incoming)
+    reference.update_and_fetch(incoming, incoming)
+    a.commit([3, 1])
+    with monkeypatch.context() as patch:
+        patch.setattr(cache_kernels, "commit_rotating_prefix", lambda *args: False)
+        b.commit([3, 1])
+    equal(actual.state, reference.state, atol=0, rtol=0)
+    assert bool(mx.any(actual.keys == 14).item())
 
 
 def test_temporal_cache_boundaries_and_failed_transactions():

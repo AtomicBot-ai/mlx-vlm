@@ -120,6 +120,7 @@ MODEL_CONFIG = {
     "youtu_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "inkling": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "inkling_mm_model": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "inkling2": MessageFormat.LIST_WITH_IMAGE_FIRST,
     # Prompt-only models
     "florence2": MessageFormat.PROMPT_ONLY,
     "plamo2vl": MessageFormat.PROMPT_ONLY,

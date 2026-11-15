@@ -61,6 +61,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 
 | Model | Documentation |
 |-------|---------------|
+| Inkling 2 Small | [Docs](mlx_vlm/models/inkling2/README.md) |
 | LFM3 / LFM3-VL | [Docs](mlx_vlm/models/lfm3/README.md) |
 | LFM3-Audio | [Docs](mlx_vlm/models/lfm3_audio/README.md) |
 | LFM3-Omni | [Docs](mlx_vlm/models/lfm3_omni/README.md) |
