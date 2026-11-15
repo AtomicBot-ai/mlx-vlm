@@ -109,13 +109,16 @@ def transform_fp8_weights(
         return weights, None
     quantization = dict(target_quantization or source_quantization)
 
-    scale_keys = [key for key in weights if key.endswith(".weight_scale_inv")]
+    source = config["quantization_config"]
+    scale_suffix = "." + source.get("scale_key", "weight_scale_inv")
+    scale_keys = [key for key in weights if key.endswith(scale_suffix)]
     if not scale_keys:
         return weights, quantization
 
     converted = dict(weights)
     for scale_key in scale_keys:
-        weight_key = scale_key[: -len("_scale_inv")]
+        prefix = scale_key[: -len(scale_suffix)]
+        weight_key = prefix + ".weight"
         if weight_key not in converted:
             raise ValueError(f"Missing FP8 weight for scale tensor {scale_key!r}.")
 
@@ -124,7 +127,6 @@ def transform_fp8_weights(
         quantized = _quantize_fp8_weight(weight, scale_inv, quantization)
         packed, scales = quantized[:2]
         converted[weight_key] = packed
-        prefix = weight_key[: -len(".weight")]
         converted[prefix + ".scales"] = scales
         if len(quantized) == 3:
             converted[prefix + ".biases"] = quantized[2]

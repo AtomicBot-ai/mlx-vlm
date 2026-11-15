@@ -143,9 +143,11 @@ class Model(Mistral3Model):
                 source = f"{prefix}.{args.expert_start}.{projection}"
                 if f"{source}.weight" not in sanitized:
                     continue  # Already stacked MLX weights are left unchanged.
-                suffixes = ["weight"]
-                if args.nvfp4:
-                    suffixes.extend(("scales", "weight_scale_2"))
+                suffixes = ["weight"] + [
+                    suffix
+                    for suffix in ("scales", "biases", "weight_scale_2")
+                    if f"{source}.{suffix}" in sanitized
+                ]
                 for suffix in suffixes:
                     sanitized[f"{prefix}.{projection}.{suffix}"] = mx.stack(
                         [
