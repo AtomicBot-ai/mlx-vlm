@@ -42,6 +42,7 @@ from mlx_vlm.tests.test_models import (
     TINY_DEFAULTS,
     TINY_MODELS,
     build_config,
+    make_ernie55_model,
     model_case,
     tiny_config,
     tiny_language_model,
@@ -4506,3 +4507,352 @@ def test_deepseek_v41_native_packed_weights(bits):
         mx.dequantize(packed, scales, group_size=32, bits=bits, mode=mode),
     )
     assert split.quantization_from_source(converted, {})[name]["mode"] == mode
+
+
+def ernie_echo_case():
+    from mlx_vlm.speculative.drafters.ernie5_5_mtp import Model, ModelConfig
+
+    target = make_ernie55_model()
+    draft = Model(ModelConfig(text_config=target.config))
+    draft.eval()
+    mx.eval(target.parameters(), draft.parameters())
+    return target, draft
+
+
+@pytest.mark.parametrize("length", [3, 16])
+@pytest.mark.parametrize("batch", [1, 4])
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+def test_ernie_echo_projects_only_the_next_proposal(length, batch, dtype):
+    target, draft = ernie_echo_case()
+    target.set_dtype(dtype)
+    draft.set_dtype(dtype)
+    lm = target.language_model
+    prompt = mx.broadcast_to(mx.arange(length)[None], (batch, length))
+    prefill = lm(prompt, cache=lm.make_cache(), return_hidden=True)
+    draft.reset(lm)
+    logits, hidden = draft._forward_tokens(prompt, prefill.hidden_states[-1])
+    h = hidden.reshape(batch, length, lm.config.hc_mult, lm.config.hidden_size)
+    expected = lm.multimax(lm.lm_head(draft.norm(draft.hc_head(h)).astype(mx.float32)))
+    assert logits.shape == (batch, 1, lm.config.vocab_size)
+    assert mx.allclose(logits, expected[:, -1:], atol=2e-5, rtol=2e-5).item()
+    assert all(cache.offset == length for cache in draft._cache)
+
+
+def distributed_echo_outputs(target, stage, barrier=None):
+    """Real ECHO draft/verify/rollback collectives for the shared TP harness."""
+    from mlx_vlm.generate.ar import _make_cache, generate_step
+    from mlx_vlm.models.ernie5_5_moe import Model as TargetModel
+    from mlx_vlm.speculative.drafters.ernie5_5_mtp import Model, ModelConfig
+
+    mx.random.seed(55)
+    draft = Model(ModelConfig(text_config=target.config))
+    draft.set_dtype(target.model.embed_tokens.weight.dtype)
+    draft.eval()
+    mx.eval(draft.parameters())
+    outputs = {}
+
+    def record(key, value):
+        stage(key)
+        mx.eval(value, draft.draft_eval_state())
+        outputs[key] = value
+        if barrier is not None:
+            barrier(key)
+
+    def check_rank_tokens(key, tokens):
+        # BF16 near-ties can change free-running tokens relative to the
+        # unsharded model. All TP ranks must nevertheless agree exactly.
+        group = target.sharding_group
+        if group is not None:
+            gathered = mx.distributed.all_gather(tokens.reshape(1, -1), group=group)
+            mx.eval(gathered)
+            assert mx.all(gathered == gathered[:1]).item(), key
+        if barrier is not None:
+            barrier(key)
+
+    sampler = lambda logits: mx.argmax(logits, axis=-1)
+    for batch in (1, 2):
+        prompt = mx.broadcast_to(mx.arange(8)[None], (batch, 8))
+        for accepted in (0, 1, 2):
+            prefix = f"echo-batch={batch}-accepted={accepted}"
+            caches = _make_cache(target, [2, 0]) if batch == 2 else target.make_cache()
+            prefill = target(prompt, cache=caches, return_hidden=True)
+            draft.reset(target)
+            draft.set_shared_kv(
+                {}, 8, kv_valid_len=mx.array([6, 8]) if batch == 2 else 8
+            )
+            bonus = mx.full((batch,), 13)
+            draft.prefill_from_target_hidden(
+                prompt, prefill.hidden_states[-1], bonus, sampler, greedy=True
+            )
+            record(prefix + "-prefill", draft._seed_hidden)
+            tokens = draft.draft_block(
+                bonus, prefill.hidden_states[-1][:, -1:], None, 3, sampler, greedy=True
+            )
+            check_rank_tokens(prefix + "-draft", tokens)
+            # Teacher-force identical proposals for aligned verification and
+            # replay comparisons, independently of BF16 draft-token ties.
+            tokens = mx.broadcast_to(mx.array([[17, 19]]), (batch, 2))
+            verify = mx.concatenate([bonus[:, None], tokens], axis=1)
+            hidden, _, transaction = target.speculative_verify_hidden(verify, caches)
+            record(prefix + "-verify", target.speculative_logits_from_hidden(hidden))
+            # Force all acceptance lengths to exercise replay and rollback.
+            new_tokens = [
+                [int(t) for t in row[:accepted]] + [23] for row in tokens.tolist()
+            ]
+            draft.accept_verified_tokens_batch(
+                hidden, tokens, [accepted] * batch, new_tokens, sampler, greedy=True
+            )
+            target.rollback_speculative_cache(
+                caches, transaction, [accepted] * batch, 3
+            )
+            record(prefix + "-replay", draft._seed_hidden)
+            record(
+                prefix + "-next", target(mx.full((batch, 1), 23), cache=caches).logits
+            )
+
+    # The public generator must also keep draft and verifier collectives ordered.
+    wrapper = TargetModel(target.config)
+    wrapper.language_model = target
+    wrapper.eval()
+    previous = {}
+    for repeat, temperature in enumerate((0.0, 0.7, 0.0, 0.7)):
+        mx.random.seed(17)
+        tokens = []
+        for step, (token, _) in enumerate(
+            generate_step(
+                mx.arange(8)[None],
+                wrapper,
+                None,
+                None,
+                max_tokens=9,
+                temperature=temperature,
+                draft_model=draft,
+                draft_kind="mtp",
+                draft_block_size=3,
+            )
+        ):
+            tokens.append(int(token))
+            if barrier is not None:
+                barrier(f"echo-generation-{repeat}-{step}")
+        check_rank_tokens(f"echo-generation-{repeat}", mx.array(tokens))
+        if temperature in previous:
+            assert tokens == previous[temperature]
+        previous[temperature] = tokens
+
+    caches = _make_cache(target, [2, 0])
+    prompt = mx.broadcast_to(mx.arange(8)[None], (2, 8))
+    prefill = target(prompt, cache=caches, return_hidden=True)
+    rows = [[], []]
+    for step, (tokens, _) in enumerate(
+        mtp._mtp_rounds_batch(
+            wrapper,
+            draft,
+            caches,
+            prefill.hidden_states[-1],
+            {},
+            prompt_tokens=prompt,
+            first_bonus=sampler(prefill.logits[:, -1]),
+            max_tokens=8,
+            sampler=sampler,
+            draft_block_size=3,
+            greedy_sampling=True,
+        )
+    ):
+        for row, token in zip(rows, tokens):
+            if token is not None:
+                row.append(token)
+        if barrier is not None:
+            barrier(f"echo-batched-generation-{step}")
+    check_rank_tokens("echo-batched-generation", mx.array(rows))
+    return outputs
+
+
+@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("prompt_length", [7, 8, 10])
+@pytest.mark.parametrize("accepted", [0, 2, 4])
+def test_ernie_echo_rollback_matches_committed_prefix(
+    batch_size, prompt_length, accepted
+):
+    import numpy as np
+
+    from mlx_vlm.generate.ar import _make_cache
+
+    target = make_ernie55_model()
+    lm = target.language_model
+    padding = [3, 0] if batch_size == 2 else [0]
+    cache = _make_cache(lm, padding) if batch_size > 1 else lm.make_cache()
+    reference = _make_cache(lm, padding) if batch_size > 1 else lm.make_cache()
+    prompt = mx.broadcast_to(
+        mx.arange(prompt_length)[None], (batch_size, prompt_length)
+    )
+    lm(prompt, cache=cache)
+    lm(prompt, cache=reference)
+    block = mx.broadcast_to(mx.arange(5)[None] + 15, (batch_size, 5))
+    hidden, _, state = lm.speculative_verify_hidden(block, cache)
+    mx.eval(hidden)
+    lm.rollback_speculative_cache(cache, state, [accepted] * batch_size, 5)
+    lm(block[:, : accepted + 1], cache=reference)
+    probe = mx.full((batch_size, 3), 21)
+    actual = lm(probe, cache=cache).logits
+    expected = lm(probe, cache=reference).logits
+    np.testing.assert_allclose(actual, expected, atol=2e-5, rtol=2e-5)
+    assert mx.array_equal(
+        mtp._mtp_cache_offset(cache), mtp._mtp_cache_offset(reference)
+    )
+    from mlx_vlm.models.cache import BatchPoolingCache
+
+    for actual_layer, expected_layer in zip(cache, reference):
+        for a, b in zip(actual_layer.caches, expected_layer.caches):
+            if isinstance(a, BatchPoolingCache):
+                # Transactions may compact unused physical pool columns. Compare
+                # every row's valid history, not allocator padding.
+                assert a._pool_lengths == b._pool_lengths
+                assert a.remainder == b.remainder
+                pairs = [
+                    (a.extract(i).state, b.extract(i).state) for i in range(batch_size)
+                ]
+            else:
+                pairs = [(a.state, b.state)]
+            for actual_state, expected_state in pairs:
+                for x, y in zip(
+                    tree_flatten(actual_state), tree_flatten(expected_state)
+                ):
+                    if isinstance(x[1], mx.array) and isinstance(y[1], mx.array):
+                        np.testing.assert_allclose(x[1], y[1], atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.parametrize("prompt_length", [7, 8])
+@pytest.mark.parametrize("draft_behavior", ["learned", "accept_all", "reject_all"])
+def test_ernie_echo_generation_matches_ar(prompt_length, draft_behavior):
+    from mlx_vlm.generate.ar import generate_step
+
+    target, draft = ernie_echo_case()
+    prompt = mx.arange(prompt_length)[None]
+    expected = [
+        int(t)
+        for t, _ in generate_step(
+            prompt, target, None, None, max_tokens=25, temperature=0
+        )
+    ]
+    if draft_behavior != "learned":
+        original = draft.draft_block
+
+        def force_tokens(
+            last_bonus,
+            hidden,
+            cache,
+            block_size,
+            sampler,
+            token_dtype=mx.int32,
+            greedy=False,
+        ):
+            original(
+                last_bonus, hidden, cache, block_size, sampler, token_dtype, greedy
+            )
+            position = (
+                draft._cache[0].offset - draft._round_appended - prompt_length + 1
+            )
+            tokens = expected[position : position + block_size - 1]
+            if draft_behavior == "reject_all":
+                tokens = [(t + 1) % target.config.vocab_size for t in tokens]
+            return mx.array([tokens])
+
+        draft.draft_block = force_tokens
+    for _ in range(2):
+        actual = [
+            int(t)
+            for t, _ in generate_step(
+                prompt,
+                target,
+                None,
+                None,
+                max_tokens=25,
+                temperature=0,
+                draft_model=draft,
+                draft_kind="mtp",
+                draft_block_size=3,
+            )
+        ]
+        assert actual == expected
+        assert draft.accept_lens
+        if draft_behavior == "accept_all":
+            assert draft.accept_lens == draft.draft_lens
+        elif draft_behavior == "reject_all":
+            assert set(draft.accept_lens) == {0}
+
+
+@pytest.mark.parametrize("mode", [None, "affine", "mxfp8", "nvfp4"])
+def test_ernie_echo_native_load_and_conversion_preserve_auxiliary(tmp_path, mode):
+    import numpy as np
+
+    from mlx_vlm.models.ernie5_5_moe.echo import ECHO_WEIGHT_NAMES
+    from mlx_vlm.speculative.drafters import load_drafter
+    from mlx_vlm.utils import load_model
+
+    target, draft = ernie_echo_case()
+    original = dict(tree_flatten(draft.parameters()))
+    weights = dict(tree_flatten(target.parameters()))
+    prefix = f"model.layers.{target.config.num_hidden_layers}."
+    for source, dest in ECHO_WEIGHT_NAMES.items():
+        value = original[dest]
+        weights[prefix + source] = value.T if source == "hc_head_fn" else value
+    (tmp_path / "config.json").write_text(json.dumps(target.config.to_dict()))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+    loaded, kind = load_drafter(str(tmp_path))
+    assert kind == "mtp"
+    assert resolve_drafter_kind(tmp_path, "dflash") == "mtp"
+    for key, value in tree_flatten(loaded.parameters()):
+        np.testing.assert_array_equal(value, original[key])
+    # Ordinary conversion saves the loaded target's parameters, including echo.*.
+    converted = load_model(tmp_path)
+    assert converted.echo is not None
+    if mode is not None:
+        from mlx_vlm.quant_utils import quantize_model
+
+        converted, config = quantize_model(
+            converted,
+            target.config.to_dict(),
+            group_size=None,
+            bits=8 if mode == "mxfp8" else 4,
+            mode=mode,
+        )
+        original = dict(tree_flatten(converted.echo.parameters()))
+        (tmp_path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(
+        str(tmp_path / "model.safetensors"), dict(tree_flatten(converted.parameters()))
+    )
+    reloaded, _ = load_drafter(str(tmp_path))
+    for key, value in tree_flatten(reloaded.parameters()):
+        np.testing.assert_array_equal(value, original[key])
+    if mode is not None:
+        assert reloaded.e_proj.mode == reloaded.h_proj.mode == "mxfp8"
+    converted_again = load_model(tmp_path)
+    inputs = mx.arange(9)[None]
+    np.testing.assert_allclose(
+        converted_again(inputs).logits, converted(inputs).logits, atol=2e-5, rtol=2e-5
+    )
+    mx.save_safetensors(
+        str(tmp_path / "model.safetensors"), dict(tree_flatten(target.parameters()))
+    )
+    with pytest.raises(ValueError, match="No MTP tensors"):
+        load_drafter(str(tmp_path))
+
+
+def test_ernie_echo_shared_decoder_preserves_target_router():
+    target, draft = ernie_echo_case()
+    original = target.layers[-1].ffn.e_score_correction_bias
+    draft.e_score_correction_bias = mx.arange(
+        target.config.n_routed_experts, dtype=mx.float32
+    )
+    draft.reset(target)
+    cache = target.make_cache()
+    inputs = mx.arange(9)[None]
+    out = target.language_model(inputs, cache=cache, return_hidden=True)
+    bonus = mx.argmax(out.logits[:, -1], axis=-1)
+    draft.set_shared_kv({}, 9, kv_valid_len=9)
+    draft.prefill_from_target_hidden(
+        inputs, out.hidden_states[-1], bonus, lambda x: mx.argmax(x, -1), greedy=True
+    )
+    mx.eval(draft.draft_eval_state())
+    assert target.layers[-1].ffn.e_score_correction_bias is original
+    assert draft._target.layers[-1] is target.layers[-1]

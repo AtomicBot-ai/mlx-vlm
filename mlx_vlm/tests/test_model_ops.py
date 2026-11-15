@@ -2707,6 +2707,63 @@ def test_quantize_module(
         assert config["quantization"] == defaults
 
 
+@pytest.mark.parametrize("kind", ["linear", "embedding", "switch", "multi"])
+@pytest.mark.parametrize("selection", ["legacy", "skip", "same", "default", "override"])
+def test_quantize_existing_module(kind, selection):
+    from mlx_vlm.models.mla import MultiLinear
+    from mlx_vlm.models.switch_layers import SwitchLinear
+    from mlx_vlm.quant_utils import quantize_model
+
+    mxfp8 = dict(group_size=32, bits=8, mode="mxfp8")
+    affine4 = dict(group_size=64, bits=4, mode="affine")
+    projection = {
+        "linear": lambda: nn.Linear(64, 32),
+        "embedding": lambda: nn.Embedding(32, 64),
+        "switch": lambda: SwitchLinear(64, 32, 2),
+        "multi": lambda: MultiLinear(64, 32, 2),
+    }[kind]().to_quantized(**mxfp8)
+    before = mx.dequantize(projection.weight, projection.scales, **mxfp8)
+    requested = mxfp8 if selection == "override" else affine4
+
+    def predicate(path, module, *, quantization):
+        assert path == "projection"
+        assert quantization == requested
+        return {
+            "skip": False,
+            "same": mxfp8,
+            "default": True,
+            # Dict overrides use affine mode when no mode is specified.
+            "override": {"group_size": 64, "bits": 4},
+        }[selection]
+
+    if selection == "legacy":
+        predicate = lambda path, module: True
+    model = nn.Module()
+    model.projection = projection
+    _, config = quantize_model(
+        model,
+        {"quantization": mxfp8},
+        **requested,
+        quant_predicate=predicate,
+    )
+    changed = selection in ("default", "override")
+    expected_params = affine4 if changed else mxfp8
+    actual_params = config["quantization"].get("projection", config["quantization"])
+    assert {key: actual_params[key] for key in expected_params} == expected_params
+    assert {
+        key: getattr(model.projection, key) for key in expected_params
+    } == expected_params
+    if changed:
+        for name, reference in zip(
+            ("weight", "scales", "biases"), mx.quantize(before, **affine4)
+        ):
+            assert mx.array_equal(getattr(model.projection, name), reference).item()
+        if "bias" in projection:
+            assert mx.array_equal(model.projection.bias, projection.bias).item()
+    else:
+        assert model.projection is projection
+
+
 def test_mixed_recipe_finds_lfm2_down_projection():
     from mlx_vlm.convert import mixed_quant_predicate_builder
 
@@ -2735,6 +2792,166 @@ def test_mixed_recipe_finds_lfm2_down_projection():
         assert bits[f"layers.{i}.feed_forward.w2"] == high
         assert bits[f"layers.{i}.self_attn.v_proj"] == high
         assert bits[f"layers.{i}.feed_forward.w1"] == 4
+
+
+def _fp8_conversion_case(family):
+    from mlx_vlm.tests.test_models import model_case
+
+    config = model_case(family)["config"]
+    if family == "qwen3_5":
+        config["text_config"].update(hidden_size=128, intermediate_size=128)
+        model = qwen35.Model(qwen35.ModelConfig.from_dict(config))
+        weights = dict(tree_flatten(model.parameters()))
+        key = "language_model.model.layers.0.mlp.gate_proj.weight"
+        return config, weights, {key: key}, {}
+
+    from mlx_vlm.models.ernie5_5_moe import Model, ModelConfig
+    from mlx_vlm.models.ernie5_5_moe.echo import EchoWeights
+
+    config.update(first_k_dense_replace=0, hybrid_mla_kv_lora_rank=64)
+    model = Model(ModelConfig.from_dict(config))
+    model.echo = EchoWeights(model.config)
+    weights = {
+        k: v.astype(mx.bfloat16) if model.cast_predicate(k) or "lm_head" in k else v
+        for k, v in tree_flatten(model.parameters())
+    }
+    # Block 0 has BF16 experts; block 1 loads individual FP8 tensors into stacked
+    # MXFP8 modules.
+    source_keys = {}
+    prefix = "language_model.model.layers.1.ffn."
+    for source, native in (("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")):
+        native_key = prefix + f"switch_mlp.{native}.weight"
+        for expert, weight in enumerate(weights.pop(native_key)):
+            source_key = (
+                f"model.layers.1.block_sparse_moe.experts.{expert}.{source}.weight"
+            )
+            weights[source_key] = weight
+            source_keys[source_key] = (native_key, expert)
+    for source, native in (
+        (
+            "model.layers.0.self_attn.linear_q_down_proj.weight",
+            "language_model.model.layers.0.attn.wq_a.weight",
+        ),
+        (
+            "model.layers.1.block_sparse_moe.shared_experts.w1.weight",
+            prefix + "shared_experts.gate_proj.weight",
+        ),
+        ("model.layers.2.e_proj.weight", "echo.e_proj.weight"),
+        ("model.layers.2.h_proj.weight", "echo.h_proj.weight"),
+    ):
+        weights[source] = weights.pop(native)
+        source_keys[source] = native
+    # The fused MLA projection is restored before splitting its K/V layout.
+    prefix = "language_model.model.layers.1.attn."
+    k = weights.pop(prefix + "embed_q.weight").swapaxes(-1, -2)
+    v = weights.pop(prefix + "unembed_out.weight")
+    fused = mx.concatenate((k, v), axis=1).reshape(-1, 64)
+    key = "model.layers.1.self_attn.kv_b_proj.weight"
+    weights[key] = fused
+    source_keys[key] = None
+    preserved = {
+        "language_model.lm_head.weight": weights["language_model.lm_head.weight"],
+        "language_model.model.layers.0.ffn.gate.weight": weights[
+            "language_model.model.layers.0.ffn.gate.weight"
+        ],
+        "language_model.model.layers.0.attn.compressor.wkv.weight": weights[
+            "language_model.model.layers.0.attn.compressor.wkv.weight"
+        ],
+    }
+    return config, weights, source_keys, preserved
+
+
+@pytest.mark.parametrize(
+    "family,q_bits,q_mode",
+    [
+        ("qwen3_5", None, "affine"),
+        ("ernie5_5_moe", None, "affine"),
+        ("ernie5_5_moe", 4, "affine"),
+        ("ernie5_5_moe", 8, "affine"),
+        ("ernie5_5_moe", 8, "mxfp8"),
+        ("ernie5_5_moe", 4, "mxfp4"),
+        ("ernie5_5_moe", 4, "nvfp4"),
+    ],
+)
+def test_convert_fp8_preserves_loaded_layout(tmp_path, family, q_bits, q_mode):
+    from mlx_vlm.convert import convert
+
+    mx.random.seed(55)
+    config, weights, source_keys, preserved = _fp8_conversion_case(family)
+    mxfp8 = dict(group_size=32, bits=8, mode="mxfp8")
+    group_size = {"affine": 64, "mxfp4": 32, "nvfp4": 16, "mxfp8": 32}[q_mode]
+    experts = dict(group_size=group_size, bits=4, mode=q_mode) if q_bits == 4 else mxfp8
+    expected = {}
+    if q_bits is not None and family == "ernie5_5_moe":
+        for key, weight in weights.items():
+            if ".switch_mlp." in key:
+                expected[key] = (experts, mx.quantize(weight, **experts))
+    for source_key, native_key in source_keys.items():
+        weights[source_key] = mx.to_fp8(weights[source_key])
+        rows, cols = weights[source_key].shape
+        scales = mx.full(((rows + 127) // 128, (cols + 127) // 128), 1.3)
+        weights[source_key + "_scale_inv"] = scales
+        restored = (
+            mx.from_fp8(weights[source_key], dtype=mx.bfloat16)
+            * mx.repeat(mx.repeat(scales, 128, axis=0), 128, axis=1)[:rows, :cols]
+        )
+        quantized = mx.quantize(restored, **mxfp8)
+        if native_key is None:
+            fused = mx.dequantize(*quantized, **mxfp8).reshape(4, 24, 64)
+            prefix = "language_model.model.layers.1.attn."
+            preserved[prefix + "embed_q.weight"] = fused[:, :8].swapaxes(-1, -2)
+            preserved[prefix + "unembed_out.weight"] = fused[:, 8:]
+        else:
+            params = mxfp8
+            if q_bits == 4 and isinstance(native_key, tuple):
+                params = experts
+                quantized = mx.quantize(mx.dequantize(*quantized, **mxfp8), **params)
+            expected[native_key] = (params, quantized)
+    config["quantization_config"] = {
+        "quant_method": "fp8",
+        "fmt": "e4m3",
+        "weight_block_size": [128, 128],
+    }
+    source, destination = tmp_path / "source", tmp_path / "converted"
+    source.mkdir()
+    mx.save_safetensors(str(source / "model.safetensors"), weights)
+    (source / "config.json").write_text(json.dumps(config))
+    with patch("mlx_vlm.utils.load_processor", return_value=SimpleNamespace()):
+        convert(
+            str(source),
+            str(destination),
+            quantize=q_bits is not None,
+            q_bits=q_bits,
+            q_mode=q_mode,
+            q_group_size=None,
+        )
+    restored = load_model(destination)
+    modules = dict(restored.named_modules())
+    if q_bits is not None:
+        exported = json.loads((destination / "config.json").read_text())["quantization"]
+        for path, module in modules.items():
+            if hasattr(module, "scales"):
+                params = exported.get(path, exported)
+                assert {k: params[k] for k in mxfp8} == {
+                    k: getattr(module, k) for k in mxfp8
+                }
+    for key, (params, quantized) in expected.items():
+        native_key, expert = key if isinstance(key, tuple) else (key, None)
+        projection = modules[native_key.removesuffix(".weight")]
+        assert {k: getattr(projection, k) for k in params} == params
+        for name, reference in zip(("weight", "scales", "biases"), quantized):
+            actual = getattr(projection, name)
+            if expert is not None:
+                actual = actual[expert]
+            assert actual.dtype == reference.dtype
+            assert mx.array_equal(actual, reference).item()
+    parameters = dict(tree_flatten(restored.parameters()))
+    for key, reference in preserved.items():
+        assert parameters[key].dtype == reference.dtype
+        assert mx.array_equal(parameters[key], reference).item()
+    if family == "ernie5_5_moe":
+        assert restored.language_model.lm_head.weight.dtype == mx.bfloat16
+        assert mx.isfinite(restored(mx.array([[1, 2, 3]])).logits).all().item()
 
 
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
@@ -3334,3 +3551,93 @@ def test_lfm3_partial_rope_preserves_pairs_in_both_halves():
     np.testing.assert_allclose(
         y[..., 4:6], b * np.cos(angles) + a * np.sin(angles), atol=2e-6
     )
+
+
+def test_ernie55_situ_and_multimax_reference():
+    from mlx_vlm.models.ernie5_5_moe.language import MultiMax, SiTU
+    from mlx_vlm.tests.test_models import make_ernie55_model
+
+    config = make_ernie55_model().config
+    up = np.linspace(-100, 100, 97).astype(np.float32)
+    gate = np.linspace(-30, 30, 97).astype(np.float32)
+    expected = 4 * np.tanh(gate / 4) / (1 + np.exp(-gate)) * 25 * np.tanh(up / 25)
+    np.testing.assert_allclose(
+        SiTU(config)(mx.array(up), mx.array(gate)), expected, atol=2e-5, rtol=2e-5
+    )
+    head = MultiMax()
+    head.multimax_ranges = mx.array([-2.0, 2.0, -3.0, 3.0])
+    head.multimax_ts = mx.array([0.2, 0.3, 0.1, -0.1])
+    expected = (
+        gate
+        + 0.2 * np.maximum(-2 - gate, 0)
+        + 0.3 * np.maximum(gate - 2, 0)
+        + 0.1 * np.maximum(-3 - gate, 0) ** 2
+        - 0.1 * np.maximum(gate - 3, 0) ** 2
+    )
+    np.testing.assert_allclose(head(mx.array(gate)), expected, atol=2e-5, rtol=2e-5)
+
+
+def test_ernie55_multi_router_selection_uses_bias_but_weights_do_not():
+    from mlx_vlm.models.ernie5_5_moe.language import MultiRouter
+    from mlx_vlm.tests.test_models import make_ernie55_model
+
+    config = make_ernie55_model().config
+    gate = MultiRouter(config)
+    gate.weight = mx.random.normal(gate.weight.shape) * 0.2
+    gate.weight_1 = mx.random.normal(gate.weight_1.shape) * 0.2
+    gate.routed_scaling_factor_param = mx.array([0.5, 1.5, 2.0, 3.0])
+    x = mx.random.normal((2, 3, config.hidden_size))
+    bias = mx.array([0.1, 10.0, -10.0, 0.0])
+    ids, actual = gate(x, bias)
+    sigmoid = lambda y: 1 / (1 + np.exp(-y))
+    scores = sigmoid(np.array(x) @ np.array(gate.weight).T) + sigmoid(
+        np.array(x) @ np.array(gate.weight_1).T
+    )
+    expected_ids = np.argsort(-(scores + np.array(bias)), axis=-1)[..., :2]
+    assert np.array_equal(np.sort(ids, axis=-1), np.sort(expected_ids, axis=-1))
+    expected = np.take_along_axis(scores, np.array(ids), axis=-1)
+    expected = (
+        expected
+        / expected.sum(-1, keepdims=True)
+        * np.array(gate.routed_scaling_factor_param)[np.array(ids)]
+    )
+    np.testing.assert_allclose(actual, expected, atol=2e-6, rtol=2e-6)
+
+
+def test_ernie55_hyper_connection_epsilon_and_sinkhorn_reference():
+    from mlx_vlm.tests.test_models import make_ernie55_model
+
+    hc = make_ernie55_model(learned=True).layers[0].attn_hc
+    hc.norm_eps = 0.5  # Distinguishes sqrt(mean)+eps from sqrt(mean+eps).
+    x = mx.random.normal((2, 3, 4, 64))
+    actual, post, comb = hc(x)
+    residual = np.array(x)
+    flat = residual.reshape(2, 3, -1)
+    mixes = (
+        flat @ np.array(hc.fn).T / (np.sqrt((flat**2).mean(-1, keepdims=True)) + 0.5)
+    )
+    pre = (
+        1
+        / (
+            1
+            + np.exp(-(mixes[..., :4] * np.array(hc.scale)[0] + np.array(hc.base)[:4]))
+        )
+        + hc.eps
+    )
+    expected_post = 2 / (
+        1 + np.exp(-(mixes[..., 4:8] * np.array(hc.scale)[1] + np.array(hc.base)[4:8]))
+    )
+    expected_comb = (
+        mixes[..., 8:] * np.array(hc.scale)[2] + np.array(hc.base)[8:]
+    ).reshape(2, 3, 4, 4)
+    expected_comb = np.exp(expected_comb - expected_comb.max(-1, keepdims=True))
+    expected_comb = expected_comb / expected_comb.sum(-1, keepdims=True) + hc.eps
+    expected_comb /= expected_comb.sum(-2, keepdims=True) + hc.eps
+    for _ in range(hc.iters - 1):
+        expected_comb /= expected_comb.sum(-1, keepdims=True) + hc.eps
+        expected_comb /= expected_comb.sum(-2, keepdims=True) + hc.eps
+    np.testing.assert_allclose(
+        actual, (pre[..., None] * residual).sum(-2), atol=2e-6, rtol=2e-6
+    )
+    np.testing.assert_allclose(post, expected_post, atol=2e-6, rtol=2e-6)
+    np.testing.assert_allclose(comb, expected_comb, atol=2e-6, rtol=2e-6)

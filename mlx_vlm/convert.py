@@ -2,6 +2,7 @@ import argparse
 import glob
 import json
 import shutil
+from functools import wraps
 from pathlib import Path
 from typing import Callable, Optional, Union
 
@@ -318,13 +319,15 @@ def convert(
 
     model_quant_predicate = getattr(model, "quant_predicate", None)
 
-    def base_quant_predicate(path, module):
+    def base_quant_predicate(path, module, **kwargs):
         if skip_multimodal_module(path):
             return False
         if model_quant_predicate is not None:
-            return model_quant_predicate(path, module)
+            return model_quant_predicate(path, module, **kwargs)
         return True
 
+    if model_quant_predicate is not None:
+        base_quant_predicate = wraps(model_quant_predicate)(base_quant_predicate)
     target = model
 
     if isinstance(quant_predicate, str):

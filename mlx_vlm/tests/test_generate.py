@@ -3222,3 +3222,127 @@ def test_prefill_failure_releases_reservation_after_delivering_last_decode(
         assert error.value.uid == refused
         assert gen.apc.finish_prefill.called
         assert gen.unprocessed_prompts[0][0] == refused
+
+
+def test_ernie55_continuous_batch_matches_single_with_late_arrival():
+    from mlx_vlm.tests.test_models import make_ernie55_model
+
+    model = make_ernie55_model()
+    prompts = [list(range(3)), list(range(11)), list(range(7))]
+    limits = [8, 8, 5]
+    expected = [
+        [
+            int(token)
+            for token, _ in ar_module.generate_step(
+                mx.array([prompt]),
+                model,
+                None,
+                None,
+                max_tokens=limit,
+                temperature=0,
+                prefill_step_size=3,
+            )
+        ]
+        for prompt, limit in zip(prompts, limits)
+    ]
+    processor = MockProcessor()
+    processor.tokenizer.stopping_criteria.eos_token_ids = []
+    generator = BatchGenerator(model, processor, stop_tokens=set(), prefill_step_size=3)
+
+    def insert(indices):
+        return generator.insert(
+            [prompts[i] for i in indices],
+            max_tokens=[limits[i] for i in indices],
+            prompt_kwargs=[
+                {
+                    "inputs_embeds": model.get_input_embeddings(
+                        mx.array([prompts[i]])
+                    ).inputs_embeds
+                }
+                for i in indices
+            ],
+        )
+
+    uids = insert([0, 1])
+    actual = {uid: [] for uid in uids}
+    try:
+        for _ in range(100):
+            _, responses = generator.next()
+            for response in responses:
+                actual[response.uid].append(response.token)
+            if len(uids) == 2 and responses:
+                late_uid = insert([2])[0]
+                uids.append(late_uid)
+                actual[late_uid] = []
+                cancelled = insert([2])[0]
+                assert generator.remove(cancelled)
+            if len(uids) == 3 and all(
+                len(actual[uid]) == limit for uid, limit in zip(uids, limits)
+            ):
+                break
+        assert [actual[uid] for uid in uids] == expected
+    finally:
+        generator.close()
+
+
+@pytest.mark.parametrize("batch_size", [1, 2, 4])
+def test_ernie_echo_batch_padding_completion_and_late_arrival(batch_size):
+    from mlx_vlm.tests.test_speculative import ernie_echo_case
+
+    target, draft = ernie_echo_case()
+    prompts = [list(range(5 + i * 3)) for i in range(batch_size + 1)]
+    limits = [8 + i * 3 for i in range(batch_size + 1)]
+    expected = [
+        [
+            int(t)
+            for t, _ in ar_module.generate_step(
+                mx.array([prompt]), target, None, None, max_tokens=limit, temperature=0
+            )
+        ]
+        for prompt, limit in zip(prompts, limits)
+    ]
+    processor = MockProcessor()
+    processor.tokenizer.stopping_criteria.eos_token_ids = []
+    gen = BatchGenerator(
+        target.language_model,
+        processor,
+        draft_model=draft,
+        draft_kind="mtp",
+        draft_block_size=3,
+        prefill_step_size=3,
+        prefill_batch_size=batch_size,
+        completion_batch_size=batch_size,
+        compute_logprobs=False,
+    )
+
+    def insert(indices):
+        return gen.insert(
+            [prompts[i] for i in indices],
+            [limits[i] for i in indices],
+            prompt_kwargs=[
+                {
+                    "inputs_embeds": target.get_input_embeddings(
+                        mx.array([prompts[i]])
+                    ).inputs_embeds
+                }
+                for i in indices
+            ],
+        )
+
+    uids = insert(range(batch_size))
+    actual = {uid: [] for uid in uids}
+    try:
+        for step in range(200):
+            _, responses = gen.next()
+            for r in responses:
+                actual[r.uid].append(r.token)
+            if responses and len(uids) == batch_size:
+                uids += insert([batch_size])
+                actual[uids[-1]] = []
+                cancelled = insert([batch_size])[0]
+                assert gen.remove(cancelled)
+            if not gen.has_work:
+                break
+        assert [actual[uid] for uid in uids] == expected
+    finally:
+        gen.close()

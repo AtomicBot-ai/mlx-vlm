@@ -970,22 +970,6 @@ def _mtp_rounds(
     # on the first round picks position 0, which is BOS — they get away with
     # it because subsequent rounds slice into the per-call verify hidden, but
     # the round-1 acceptance is wasted. We don't replicate that quirk.)
-    prefill_draft = getattr(draft_model, "prefill_from_target_hidden", None)
-    if callable(prefill_draft) and prompt_tokens is not None:
-        sampler_rng.draft_call(
-            prefill_draft,
-            prompt_tokens,
-            hidden,
-            first_bonus,
-            sampler,
-            token_dtype,
-            **_mtp_draft_kwargs(draft_model, greedy_sampling, sampler),
-        )
-
-    if hidden.shape[1] > 1:
-        hidden = hidden[:, -1:, :]
-    hidden = _mtp_draft_hidden(lm, hidden)
-
     kv_offset = _mtp_cache_offset_max(prompt_cache)
     shared_kv = getattr(lm, "shared_kv_from_cache", None)
     if callable(shared_kv):
@@ -997,6 +981,23 @@ def _mtp_rounds(
         kv_valid_len=kv_offset,
     )
     shared_kv_states = None
+
+    prefill_draft = getattr(draft_model, "prefill_from_target_hidden", None)
+    if callable(prefill_draft) and prompt_tokens is not None:
+        with mx.stream(generation_stream):
+            sampler_rng.draft_call(
+                prefill_draft,
+                prompt_tokens,
+                hidden,
+                first_bonus,
+                sampler,
+                token_dtype,
+                **_mtp_draft_kwargs(draft_model, greedy_sampling, sampler),
+            )
+
+    if hidden.shape[1] > 1:
+        hidden = hidden[:, -1:, :]
+    hidden = _mtp_draft_hidden(lm, hidden)
 
     if thinking_budget_criteria is not None:
         thinking_budget_criteria(first_bonus)
@@ -1015,16 +1016,17 @@ def _mtp_rounds(
 
         verify = None
         try:
-            draft_tokens = sampler_rng.draft_tokens(
-                draft_model.draft_block,
-                b,
-                hidden,
-                None,
-                bs,
-                sampler,
-                token_dtype,
-                **_mtp_draft_kwargs(draft_model, greedy_sampling, sampler),
-            )
+            with mx.stream(generation_stream):
+                draft_tokens = sampler_rng.draft_tokens(
+                    draft_model.draft_block,
+                    b,
+                    hidden,
+                    None,
+                    bs,
+                    sampler,
+                    token_dtype,
+                    **_mtp_draft_kwargs(draft_model, greedy_sampling, sampler),
+                )
             _release_shared_kv(draft_model)
 
             with mx.stream(generation_stream):
@@ -1057,16 +1059,17 @@ def _mtp_rounds(
 
             accept_verified = getattr(draft_model, "accept_verified_tokens", None)
             if callable(accept_verified):
-                sampler_rng.draft_call(
-                    accept_verified,
-                    verify.hidden,
-                    draft_tokens,
-                    accepted,
-                    new_tokens,
-                    sampler,
-                    token_dtype,
-                    **_mtp_draft_kwargs(draft_model, greedy_sampling, sampler),
-                )
+                with mx.stream(generation_stream):
+                    sampler_rng.draft_call(
+                        accept_verified,
+                        verify.hidden,
+                        draft_tokens,
+                        accepted,
+                        new_tokens,
+                        sampler,
+                        token_dtype,
+                        **_mtp_draft_kwargs(draft_model, greedy_sampling, sampler),
+                    )
 
             with mx.stream(generation_stream):
                 verify.commit(lm, prompt_cache, accepted, bs)
@@ -1289,32 +1292,6 @@ def _mtp_rounds_batch(
         and not _sampler_supports_positioned_target(sampler),
     )
 
-    prefill_draft = getattr(draft_model, "prefill_from_target_hidden", None)
-    if callable(prefill_draft) and prompt_tokens is not None:
-        prefill_kwargs = _mtp_draft_kwargs(
-            draft_model,
-            greedy_sampling,
-            sampler,
-        )
-        if getattr(draft_model, "supports_left_padded_prefill", False):
-            prefill_kwargs["left_padding"] = left_padding
-        sampler_rng.draft_call(
-            prefill_draft,
-            prompt_tokens,
-            hidden,
-            first_bonus,
-            sampler,
-            token_dtype,
-            **prefill_kwargs,
-        )
-
-    # First-round hidden: prefill output may have shape [B, L, H]; reduce
-    # to a single slot per row (last prompt token's hidden — see comment in
-    # ``_mtp_rounds`` for rationale).
-    if hidden.shape[1] > 1:
-        hidden = hidden[:, -1:, :]
-    hidden = _mtp_draft_hidden(lm, hidden)
-
     # Per-row state. ``positions`` stores each row's valid target-KV length.
     # All rows start at ``L_prefill`` and advance by ``accepted_i + 1`` per
     # round.
@@ -1331,6 +1308,33 @@ def _mtp_rounds_batch(
         left_padding=shared_padding,
     )
     shared_kv_states = None
+
+    prefill_draft = getattr(draft_model, "prefill_from_target_hidden", None)
+    if callable(prefill_draft) and prompt_tokens is not None:
+        prefill_kwargs = _mtp_draft_kwargs(
+            draft_model,
+            greedy_sampling,
+            sampler,
+        )
+        if getattr(draft_model, "supports_left_padded_prefill", False):
+            prefill_kwargs["left_padding"] = left_padding
+        with mx.stream(generation_stream):
+            sampler_rng.draft_call(
+                prefill_draft,
+                prompt_tokens,
+                hidden,
+                first_bonus,
+                sampler,
+                token_dtype,
+                **prefill_kwargs,
+            )
+
+    # First-round hidden: prefill output may have shape [B, L, H]; reduce
+    # to a single slot per row (last prompt token's hidden — see comment in
+    # ``_mtp_rounds`` for rationale).
+    if hidden.shape[1] > 1:
+        hidden = hidden[:, -1:, :]
+    hidden = _mtp_draft_hidden(lm, hidden)
 
     b = first_bonus.tolist()
     for state, token in zip(thinking_budget_criteria or [], b):
@@ -1363,17 +1367,18 @@ def _mtp_rounds_batch(
         # via set_shared_kv above; the drafter pulls it from there.
         verify = None
         try:
-            draft_tokens = sampler_rng.draft_tokens(
-                _mtp_draft_block_active,
-                draft_model,
-                b_active,
-                hidden,
-                bs,
-                sampler,
-                token_dtype,
-                positions_active,
-                greedy_sampling=greedy_sampling,
-            )
+            with mx.stream(generation_stream):
+                draft_tokens = sampler_rng.draft_tokens(
+                    _mtp_draft_block_active,
+                    draft_model,
+                    b_active,
+                    hidden,
+                    bs,
+                    sampler,
+                    token_dtype,
+                    positions_active,
+                    greedy_sampling=greedy_sampling,
+                )
             _release_shared_kv(draft_model)
 
             # Verify
@@ -1454,16 +1459,17 @@ def _mtp_rounds_batch(
 
             accept_verified = getattr(draft_model, "accept_verified_tokens_batch", None)
             if callable(accept_verified):
-                sampler_rng.draft_call(
-                    accept_verified,
-                    hidden_full,
-                    draft_tokens,
-                    accepted_list,
-                    new_tokens_list,
-                    sampler,
-                    token_dtype,
-                    **_mtp_draft_kwargs(draft_model, greedy_sampling, sampler),
-                )
+                with mx.stream(generation_stream):
+                    sampler_rng.draft_call(
+                        accept_verified,
+                        hidden_full,
+                        draft_tokens,
+                        accepted_list,
+                        new_tokens_list,
+                        sampler,
+                        token_dtype,
+                        **_mtp_draft_kwargs(draft_model, greedy_sampling, sampler),
+                    )
 
             with mx.stream(generation_stream):
                 verify.commit(lm, prompt_cache, accepted_list, bs)

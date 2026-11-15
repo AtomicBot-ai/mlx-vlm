@@ -1146,19 +1146,26 @@ class ModelChecks:
         assert actual.shape == (3, 1, 2)
         assert actual.tolist() == positions[:, :, 2:4].tolist()
 
-    def language(self, model, config, *, num_layers=None):
+    def language(self, model, config, *, num_layers=None, logits_dtype=None):
         if num_layers is None:
             num_layers = config.num_hidden_layers
         assert model.model_type == config.model_type
         assert len(model.layers) == num_layers
         for dtype in (mx.float32, mx.float16):
             model.update(tree_map(lambda p: p.astype(dtype), model.parameters()))
+            expected_dtype = getattr(mx, logits_dtype) if logits_dtype else dtype
             logits = model(mx.array([[0, 1]])).logits
-            assert logits.shape == (1, 2, config.vocab_size) and logits.dtype == dtype
+            assert (
+                logits.shape == (1, 2, config.vocab_size)
+                and logits.dtype == expected_dtype
+            )
             logits = model(
                 mx.argmax(logits[0, -1:, :], keepdims=True), cache=None
             ).logits
-            assert logits.shape == (1, 1, config.vocab_size) and logits.dtype == dtype
+            assert (
+                logits.shape == (1, 1, config.vocab_size)
+                and logits.dtype == expected_dtype
+            )
 
     def language_hidden_states(self, model):
         ids = mx.array([[1, 2, 3]])
@@ -1456,7 +1463,7 @@ def check_arguments(kind, case, model, config):
                 if hasattr(text, "num_hidden_layers")
                 else {"num_layers": text.n_layers}
             )
-            return (model.language_model, text), options
+            return (model.language_model, text), {**options, **case.get("language", {})}
         return (model.language_model, text.hidden_size), {}
     if kind == "projector":
         projector = attrgetter(case.get("projector_path", "multi_modal_projector"))(
@@ -3048,7 +3055,26 @@ def _prepare_minimax_distributed(model, dtype):
             )
 
 
-DISTRIBUTED_MODEL_SETUPS = {"minimax_m3_nvfp4": _prepare_minimax_distributed}
+def _prepare_ernie_distributed(model, dtype):
+    for layer in model.layers:
+        for hc in (layer.attn_hc, layer.ffn_hc):
+            hc.fn = mx.random.normal(hc.fn.shape) * 0.02
+            hc.base = mx.random.normal(hc.base.shape) * 0.1
+        for name in ("U", "V"):
+            layer.attn.vha[name] = (
+                mx.random.normal(layer.attn.vha[name].shape) * 0.1
+            ).astype(dtype)
+        if hasattr(layer.ffn, "gate"):
+            for name in ("weight", "weight_1"):
+                layer.ffn.gate[name] = (
+                    mx.random.normal(layer.ffn.gate[name].shape) * 0.1
+                ).astype(dtype)
+
+
+DISTRIBUTED_MODEL_SETUPS = {
+    "minimax_m3_nvfp4": _prepare_minimax_distributed,
+    "ernie5_5_moe": _prepare_ernie_distributed,
+}
 
 
 @pytest.mark.parametrize(
@@ -3227,7 +3253,7 @@ def test_deepseek_v4_sharding_rejects_invalid_partitions_before_mutation(
 # Distributed language-model contracts
 
 
-def _make_distributed_test_model(family, dtype):
+def _make_distributed_test_model(family, dtype, quant_mode="none"):
     case = TINY_MODELS[family]
     config = tiny_config(family, "distributed")
     module = importlib.import_module("mlx_vlm.models." + case["module"] + ".language")
@@ -3253,12 +3279,47 @@ def _make_distributed_test_model(family, dtype):
 
             quantization["class_predicate"] = predicate
         nn.quantize(model, **quantization)
+    if quant_mode != "none":
+        from mlx_vlm.quant_utils import quantize_model
+
+        # Match the release's already-loaded MXFP8 attention and dense FFN.
+        nn.quantize(
+            model,
+            group_size=32,
+            bits=8,
+            mode="mxfp8",
+            class_predicate=lambda path, module: isinstance(module, nn.Linear)
+            and (
+                path.startswith("model.layers.0.ffn.")
+                or path.rsplit(".", 1)[-1]
+                in (
+                    "wq_a",
+                    "wq_b",
+                    "wkv",
+                    "wo_b",
+                    "o_gate",
+                    "q_a_proj",
+                    "q_b_proj",
+                    "kv_a_proj_with_mqa",
+                )
+                and ".compressor." not in path
+            ),
+        )
+        model, _ = quantize_model(
+            model,
+            {},
+            group_size=None,
+            bits=8 if quant_mode == "mxfp8" else 4,
+            mode=quant_mode,
+            quant_predicate=model.quant_predicate,
+        )
     model.eval()
     return model
 
 
 def _distributed_model_outputs(model, stage, barrier=None):
     outputs = {}
+    config = getattr(model, "args", None) or model.config
     for batch in (1, 4):
         cache = make_prompt_cache(model)
         for step, tokens in enumerate(
@@ -3267,7 +3328,7 @@ def _distributed_model_outputs(model, stage, barrier=None):
             stage(f"batch={batch} step={step}")
             ids = mx.array(
                 [
-                    [(t + row) % model.args.vocab_size for t in tokens]
+                    [(t + row) % config.vocab_size for t in tokens]
                     for row in range(batch)
                 ]
             )
@@ -3279,6 +3340,10 @@ def _distributed_model_outputs(model, stage, barrier=None):
                 # Finish this step on every rank before another rank can queue
                 # the next collective on the GPU they share.
                 barrier(key)
+    if getattr(config, "model_type", None) == "ernie5_5_moe":
+        from mlx_vlm.tests.test_speculative import distributed_echo_outputs
+
+        outputs.update(distributed_echo_outputs(model, stage, barrier))
     # Copy only after every rank has finished all GPU work. Interleaving CPU
     # transfers with another rank's next GPU collective can deadlock Metal.
     # FP32 preserves the BF16 values that NumPy cannot represent directly.
@@ -3288,7 +3353,7 @@ def _distributed_model_outputs(model, stage, barrier=None):
         }
 
 
-def _distributed_model_worker(family, dtype_name):
+def _distributed_model_worker(family, dtype_name, quant_mode="none"):
     # Dump each rank's stack before the parent kills a stalled process group.
     faulthandler.register(signal.SIGTERM, chain=True)
 
@@ -3320,11 +3385,11 @@ def _distributed_model_worker(family, dtype_name):
         if group.rank() == rank:
             stage("building models")
             mx.random.seed(19)
-            reference = _make_distributed_test_model(family, dtype)
+            reference = _make_distributed_test_model(family, dtype, quant_mode)
             stage("evaluating reference weights")
             mx.eval(reference.parameters())
             weights = dict(tree_flatten(reference.parameters()))
-            sharded = _make_distributed_test_model(family, dtype)
+            sharded = _make_distributed_test_model(family, dtype, quant_mode)
             sharded.load_weights(list(weights.items()), strict=True)
             sharded.shard(group)
             if error := options.get("reshard_error"):
@@ -3407,7 +3472,7 @@ def _run_distributed_command(command, *, cwd, env, timeout=120):
         return output
 
 
-def _run_distributed_model_test(family, dtype, world_size):
+def _run_distributed_model_test(family, dtype, world_size, quant_mode="none"):
     repo = Path(__file__).resolve().parents[2]
     # Select a whole block outside the ephemeral range. Binding only the first
     # port to zero leaves the allocator free to hand the remaining ports to a
@@ -3443,6 +3508,7 @@ def _run_distributed_model_test(family, dtype, world_size):
         "_distributed_model_worker(*sys.argv[1:])",
         family,
         dtype,
+        quant_mode,
     ]
     with tempfile.TemporaryDirectory(prefix="mlx-vlm-distributed-") as barrier_dir:
         output = _run_distributed_command(
@@ -3558,6 +3624,47 @@ def test_distributed_worker_timeout_cleans_up_ranks(tmp_path):
 )
 def test_distributed_model(family, dtype, world_size):
     _run_distributed_model_test(family, dtype, world_size)
+
+
+@pytest.mark.skipif(not mx.distributed.is_available("ring"), reason="ring required")
+@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+@pytest.mark.parametrize("mode", ["affine", "mxfp8", "nvfp4"])
+def test_distributed_model_ernie55_quantized(mode, dtype, world_size):
+    _run_distributed_model_test("ernie5_5_moe", dtype, world_size, mode)
+
+
+@pytest.mark.parametrize("invalid", ["heads", "quantization-groups"])
+def test_ernie55_shard_validates_before_mutating(invalid):
+    model = _make_distributed_test_model("ernie5_5_moe", mx.bfloat16)
+    size = 3 if invalid == "heads" else 4
+    if invalid == "quantization-groups":
+        mlp = model.layers[-1].ffn.switch_mlp
+        mlp.down_proj = mlp.down_proj.to_quantized(group_size=128, bits=4)
+    before = dict(tree_flatten(model.parameters()))
+    with pytest.raises(ValueError, match="heads|Cannot shard"):
+        model.shard(NS(size=lambda: size, rank=lambda: 0))
+    assert model.sharding_group is None
+    assert all(
+        value is before[name] for name, value in tree_flatten(model.parameters())
+    )
+
+
+def test_ernie55_wrapper_shards_shared_echo_decoder_once():
+    from mlx_vlm.models.ernie5_5_moe import Model
+    from mlx_vlm.speculative.drafters.ernie5_5_mtp import Model as Draft
+    from mlx_vlm.speculative.drafters.ernie5_5_mtp import ModelConfig
+
+    target = Model(tiny_config("ernie5_5_moe"))
+    draft = Draft(ModelConfig(text_config=target.config)).bind(target)
+    target.shard(NS(size=lambda: 1, rank=lambda: 0))
+    assert target.language_model.sharding_group is None
+    group = NS(size=lambda: 2, rank=lambda: 0)
+    target.shard(group)
+    assert draft._target.layers[-1] is target.layers[-1]
+    assert draft._target.layers[-1].ffn.sharding_group is group
+    with pytest.raises(ValueError, match="already sharded"):
+        target.shard(group)
 
 
 def test_gemma4_modelopt_awq_strict_load_and_forward(tmp_path):
@@ -7178,3 +7285,40 @@ class TestGemma4PerLayerConfig:
         assert full.v_proj.weight.shape == full.k_proj.weight.shape
         sliding = attention_cls(cfg, 0)
         assert (sliding.head_dim, sliding.n_kv_heads) == (8, 4)
+
+
+def make_ernie55_model(*, learned=False):
+    from mlx_vlm.models.ernie5_5_moe import Model, ModelConfig
+
+    mx.random.seed(55)
+    model = Model(ModelConfig.from_dict(model_case("ernie5_5_moe")["config"]))
+    model.eval()
+    if learned:
+        # Exercise learned mixers/routers instead of their zero initialization.
+        for layer in model.layers:
+            for hc in (layer.attn_hc, layer.ffn_hc):
+                hc.fn = mx.random.normal(hc.fn.shape) * 0.02
+                hc.base = mx.random.normal(hc.base.shape) * 0.1
+            layer.attn.vha.U = mx.random.normal(layer.attn.vha.U.shape) * 0.1
+            layer.attn.vha.V = mx.random.normal(layer.attn.vha.V.shape) * 0.1
+            if hasattr(layer.ffn, "gate"):
+                for name in ("weight", "weight_1"):
+                    layer.ffn.gate[name] = (
+                        mx.random.normal(layer.ffn.gate[name].shape) * 0.1
+                    )
+    return model
+
+
+def test_ernie55_fp8_tail_blocks_use_shared_decoder():
+    model = make_ernie55_model()
+    key = "model.layers.0.self_attn.linear_q_down_proj.weight"
+    codes = mx.full((129, 131), 0x38, dtype=mx.uint8)  # E4M3 1.0
+    scales = mx.array([[1.0, 2.0], [4.0, 8.0]])
+    out = model.sanitize({key: codes, key + "_scale_inv": scales})
+    expected = np.repeat(np.repeat([[1, 2], [4, 8]], 128, axis=0), 128, axis=1)[
+        :129, :131
+    ]
+    np.testing.assert_array_equal(
+        out["language_model.model.layers.0.attn.wq_a.weight"].astype(mx.float32),
+        expected,
+    )

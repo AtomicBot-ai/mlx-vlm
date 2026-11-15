@@ -132,6 +132,7 @@ MODEL_CONFIG = {
     "nemotron_labs_diffusion": MessageFormat.TEXT_ONLY,
     "deepseek_v4": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "deepseek_v41": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "ernie5_5_moe": MessageFormat.TEXT_ONLY,
     "hrm_text": MessageFormat.TEXT_ONLY,
     "minimax_m3": MessageFormat.TEXT_ONLY,
     "qwen3_5_text": MessageFormat.TEXT_ONLY,
