@@ -24,6 +24,7 @@ from PIL import Image, ImageOps
 from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
 
+from .load_progress import LoadingProgress, ProgressCallback, evaluate_model
 from .models.base import BaseImageProcessor
 from .quantization.checkpoint import (
     merge_quantization_configs,
@@ -392,6 +393,7 @@ def load_model(
     model_path: Path,
     lazy: bool = False,
     sharding_group: Optional[mx.distributed.Group] = None,
+    progress_callback: Optional[ProgressCallback] = None,
     **kwargs,
 ) -> nn.Module:
     """
@@ -405,6 +407,8 @@ def load_model(
         sharding_group: Optional group passed to ``model.shard(group, weights=...)``
             before conversion when the architecture supports checkpoint weights.
             Call ``model.shard(group)`` afterwards to complete distributed loading.
+        progress_callback: Optional observer receiving measured stage snapshots.
+            Called synchronously on the loading thread; not passed to processors.
         revision (str, optional): A revision id which can be a branch name,
             a tag, or a commit hash. Default: ``None``.
         quantize_activations (bool, optional): If True, convert QuantizedLinear layers
@@ -418,6 +422,8 @@ def load_model(
         FileNotFoundError: If the weight files (.safetensors) are not found.
         ValueError: If the model class or args class are not found or cannot be instantiated.
     """
+    report = LoadingProgress(model_path, progress_callback)
+    report("loading_checkpoint")
     config = load_config(model_path, **kwargs)
 
     index_file = model_path / "model.safetensors.index.json"
@@ -466,8 +472,14 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         raise FileNotFoundError(message)
 
     weights = {}
-    for wf in weight_files:
+    report("loading_checkpoint", completed_files=0, total_files=len(weight_files))
+    for index, wf in enumerate(weight_files):
         weights.update(_load_safetensors(wf))
+        report(
+            "loading_checkpoint",
+            completed_files=index + 1,
+            total_files=len(weight_files),
+        )
 
     model_class, _ = get_model_and_args(config=config, model_path=model_path)
 
@@ -511,6 +523,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         if quantization_config is not None:
             config["quantization_config"] = quantization_config
 
+    report("converting_weights")
     weights, transformed_quantization = transform_quantized_weights(
         weights, quantization_config
     )
@@ -599,6 +612,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             if quantization_value is not None:
                 config[quantization_key] = quantization_value
 
+    report("sanitizing_weights")
     weights = sanitize_weights(model, weights)
 
     if hasattr(model_class, "VisionModel"):
@@ -633,6 +647,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         weights,
         model_path,
         lazy=lazy,
+        progress_callback=report.update if progress_callback is not None else None,
         declared_keys=declared_keys,
         is_offload_dir=(model_path / "offload_index.json").exists(),
         **kwargs,
@@ -646,6 +661,7 @@ def load_model_weights(
     model_path: Path,
     *,
     lazy: bool = False,
+    progress_callback: Optional[ProgressCallback] = None,
     strict: bool = True,
     declared_keys: Optional[set] = None,
     is_offload_dir: bool = False,
@@ -656,6 +672,8 @@ def load_model_weights(
     Pass declared_keys for full checkpoints that may omit multimodal modules.
     Prepared drafters retain every module so strict loading detects missing weights.
     """
+    report = LoadingProgress(model_path, progress_callback)
+    report("installing_weights")
     if is_offload_dir:
         strict = False
     if (quantization := config.get("quantization", None)) is not None:
@@ -760,7 +778,7 @@ def load_model_weights(
         )
 
     if not lazy:
-        mx.eval(model.parameters())
+        evaluate_model(model, report.update if progress_callback is not None else None)
 
     model.model_path = model_path
     model.eval()
@@ -849,6 +867,7 @@ def load(
     revision: Optional[str] = None,
     strict: bool = True,
     sharding_group: Optional[mx.distributed.Group] = None,
+    progress_callback: Optional[ProgressCallback] = None,
     **kwargs,
 ) -> Tuple[nn.Module, ProcessorMixin]:
     """
@@ -870,6 +889,10 @@ def load(
         sharding_group: Optional group for architecture-specific checkpoint
             preparation before conversion. Passed only to the model loader;
             callers still complete sharding with ``model.shard(group)``.
+        progress_callback: Optional callable receiving stage, elapsed time and
+            measured file/layer counts. Callbacks run on the loading thread.
+            ``loaded`` means model/processor loading finished; with lazy=True,
+            parameter evaluation is still deferred. Exceptions report ``failed``.
         quantize_activations (bool, optional): If True, convert QuantizedLinear layers
             to QQLinear layers for activation quantization. Only supported for models
             quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
@@ -881,30 +904,42 @@ def load(
         FileNotFoundError: If config file or safetensors are not found.
         ValueError: If model class or args class are not found.
     """
-    force_download = kwargs.get("force_download", False)
-    model_path = get_model_path(
-        path_or_hf_repo, force_download=force_download, revision=revision
-    )
-    model = load_model(
-        model_path, lazy, strict=strict, sharding_group=sharding_group, **kwargs
-    )
-    if adapter_path is not None:
-        model = apply_lora_layers(model, adapter_path)
-        model.eval()
+    report = LoadingProgress(path_or_hf_repo, progress_callback)
+    try:
+        report("resolving_model")
+        force_download = kwargs.get("force_download", False)
+        model_path = get_model_path(
+            path_or_hf_repo, force_download=force_download, revision=revision
+        )
+        model = load_model(
+            model_path,
+            lazy,
+            strict=strict,
+            sharding_group=sharding_group,
+            progress_callback=report.update if progress_callback is not None else None,
+            **kwargs,
+        )
+        if adapter_path is not None:
+            report("loading_adapter")
+            model = apply_lora_layers(model, adapter_path)
+            model.eval()
 
-    image_processor = load_image_processor(model_path, **kwargs)
+        report("loading_processor")
+        image_processor = load_image_processor(model_path, **kwargs)
 
-    # Get the eos_token_id from the model config
-    eos_token_id = getattr(model.config, "eos_token_id", None)
-
-    processor = load_processor(model_path, True, eos_token_ids=eos_token_id, **kwargs)
-
-    if image_processor is not None:
-        processor.image_processor = image_processor
-
-    if hasattr(model, "attach_processor"):
-        model.attach_processor(processor)
-
+        # Get the eos_token_id from the model config
+        eos_token_id = getattr(model.config, "eos_token_id", None)
+        processor = load_processor(
+            model_path, True, eos_token_ids=eos_token_id, **kwargs
+        )
+        if image_processor is not None:
+            processor.image_processor = image_processor
+        if hasattr(model, "attach_processor"):
+            model.attach_processor(processor)
+    except BaseException:
+        report("failed")
+        raise
+    report("loaded", lazy=lazy)
     return model, processor
 
 

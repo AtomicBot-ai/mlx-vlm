@@ -4394,7 +4394,8 @@ def test_sharded_load_resolves_checkpoint_model_file(
             assert not hasattr(model, "prepared_rank")
 
 
-def test_load_keeps_sharding_group_out_of_processor_kwargs(tmp_path):
+@pytest.mark.parametrize("lazy", [False, True])
+def test_load_keeps_loader_options_out_of_processor_kwargs(tmp_path, lazy):
     from mlx_vlm import utils
 
     _write_checkpoint(tmp_path)
@@ -4406,11 +4407,61 @@ def test_load_keeps_sharding_group_out_of_processor_kwargs(tmp_path):
             utils, "load_image_processor", return_value=None
         ) as image_processor,
     ):
-        utils.load(str(tmp_path), sharding_group=group, trust_remote_code=False)
+        events = []
+        model, _ = utils.load(
+            str(tmp_path),
+            sharding_group=group,
+            trust_remote_code=False,
+            lazy=lazy,
+            progress_callback=events.append,
+        )
     assert loader.call_args.kwargs["sharding_group"] is group
     for call in (processor.call_args, image_processor.call_args):
         assert "sharding_group" not in call.kwargs
+        assert "progress_callback" not in call.kwargs
         assert call.kwargs["trust_remote_code"] is False
+
+    assert events[0]["stage"] == "resolving_model"
+    assert events[-1]["stage"] == "loaded" and events[-1]["lazy"] is lazy
+    assert any(e.get("completed_files") == e.get("total_files") == 1 for e in events)
+    file_progress = [e for e in events if "completed_files" in e]
+    assert [e["stage_percent"] for e in file_progress] == [0.0, 100.0]
+    assert events[-1]["stage_percent"] is None
+    assert all(e["stage_percent"] is None for e in events if e.get("total_layers") == 0)
+    assert any(e["stage"] == "evaluating_remaining_parameters" for e in events) != lazy
+    assert all(e["model"] == str(tmp_path) for e in events)
+    elapsed = [e["elapsed_seconds"] for e in events]
+    assert elapsed == sorted(elapsed)
+    assert mx.array_equal(model.proj.weight, mx.zeros((4, 4)))
+    with patch.object(utils, "load_model", side_effect=ValueError("bad weights")):
+        with pytest.raises(ValueError, match="bad weights"):
+            utils.load(str(tmp_path), progress_callback=events.append)
+    assert events[-1]["stage"] == "failed"
+
+
+def test_layer_loading_progress_follows_evaluation(monkeypatch):
+    from mlx_vlm.load_progress import LoadingProgress, evaluate_model
+
+    model = nn.Module()
+    model.layers = [nn.Linear(4, 4), nn.Linear(4, 4)]
+    model.vision = nn.Linear(4, 4)
+    expected = {k: mx.array(v) for k, v in tree_flatten(model.parameters())}
+    events, before_eval = [], []
+    original_eval = mx.eval
+
+    def evaluate(*args):
+        before_eval.append(events[-1].copy())
+        original_eval(*args)
+
+    monkeypatch.setattr(mx, "eval", evaluate)
+    evaluate_model(model, LoadingProgress("demo", events.append).update)
+    assert [e.get("completed_layers") for e in before_eval] == [0, 1, None]
+    assert [e["stage_percent"] for e in events] == [0.0, 50.0, 100.0, None]
+    assert events[-2]["completed_layers"] == events[-2]["total_layers"] == 2
+    assert events[-1]["stage"] == "evaluating_remaining_parameters"
+    for key, value in tree_flatten(model.parameters()):
+        assert value.dtype == expected[key].dtype
+        assert mx.array_equal(value, expected[key])
 
 
 def test_qwen3_omni_audio_batch_matches_repeated_input():

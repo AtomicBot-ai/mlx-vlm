@@ -1619,6 +1619,7 @@ def _reset_runtime(monkeypatch, **overrides):
     state = dict(
         model_cache=server.ModelCacheRegistry(),
         response_generator=None,
+        model_load_progress=None,
         apc_manager=None,
     )
     for name, value in (state | overrides).items():
@@ -2042,21 +2043,38 @@ def _generator(**overrides):
     return gen
 
 
+@pytest.mark.parametrize("distributed", [False, True])
+def test_model_resources_forward_loading_observer(monkeypatch, distributed):
+    events = []
+    model, processor = NS(config=NS()), NS()
+
+    def load(*args, progress_callback, **kwargs):
+        progress_callback({"stage": "loading_checkpoint"})
+        return model, processor
+
+    monkeypatch.setattr(generation, "load", load)
+    monkeypatch.setattr(
+        server.runtime, "distributed_worker", NS(load=load) if distributed else None
+    )
+    assert generation.load_model_resources(
+        "demo", None, progress_callback=events.append
+    ) == (model, processor, model.config)
+    assert events == [{"stage": "loading_checkpoint"}]
+
+
 def test_server_caches_apc_mode_when_model_initializes(monkeypatch):
     config = NS(eos_token_id=[])
     language_model = NS()
     model = NS(language_model=language_model)
     processor = NS(tokenizer=NS())
-    gen = _generator()
+    events = []
+    gen = _generator(load_progress_callback=events.append)
     gen.apc_manager = object()
 
     monkeypatch.delenv("MLX_VLM_DRAFT_MODEL", raising=False)
     monkeypatch.delenv("MLX_VLM_DRAFT_KIND", raising=False)
-    monkeypatch.setattr(
-        generation,
-        "load_model_resources",
-        lambda *_args, **_kwargs: (model, processor, config),
-    )
+    loader = Mock(return_value=(model, processor, config))
+    monkeypatch.setattr(generation, "load_model_resources", loader)
     apc_mode = MagicMock(return_value="exact")
     monkeypatch.setattr(apc, "model_apc_mode", apc_mode)
 
@@ -2064,6 +2082,9 @@ def test_server_caches_apc_mode_when_model_initializes(monkeypatch):
 
     assert gen.apc_mode == "exact"
     apc_mode.assert_called_once_with(language_model)
+
+    assert loader.call_args.kwargs["progress_callback"] == events.append
+    assert events == [{"stage": "initializing_generator"}]
 
 
 def test_server_serves_ar_requests_after_drafter_mismatch(monkeypatch):
@@ -7742,6 +7763,7 @@ def settings_client(monkeypatch, tmp_path):
             self.processor = NS()
             self.config = NS(model_type="test")
             self.apc_manager = kwargs["apc_manager"]
+            self.load_progress_callback = kwargs["load_progress_callback"]
             self.stopped = False
             generators.append(self)
 
@@ -7760,6 +7782,88 @@ def settings_client(monkeypatch, tmp_path):
         if not generator.stopped:
             generator.stop_and_join()
     client.close()
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_local_loading_progress_is_observable_during_warmup(
+    settings_client, monkeypatch, fail
+):
+    _, generators = settings_client
+    entered, release = Event(), Event()
+    generator_class = server._app_module.ResponseGenerator
+    ready = generator_class.wait_until_ready
+
+    def loading(self):
+        self.load_progress_callback(
+            {
+                "stage": "evaluating_layers",
+                "completed_layers": 1,
+                "total_layers": 2,
+            }
+        )
+        entered.set()
+        assert release.wait(5)
+        if fail:
+            raise ValueError("broken checkpoint")
+        return ready(self)
+
+    monkeypatch.setattr(generator_class, "wait_until_ready", loading)
+    monkeypatch.setattr(
+        generator_class,
+        "_cpu_preprocess",
+        lambda *a, **k: {"input_ids": np.array([[1, 2, 3]])},
+        raising=False,
+    )
+    monkeypatch.setattr(openai, "apply_chat_template", lambda *a, **k: "prompt")
+    monkeypatch.setattr(
+        openai,
+        "_build_gen_args",
+        lambda *a, **k: NS(
+            to_template_kwargs=lambda: {}, preprocessing_kwargs=lambda: {}
+        ),
+    )
+
+    async def check():
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=server.app), base_url="http://test"
+        ) as client:
+            payload = {"model": "demo", "input": "Hello"}
+            pending = [
+                asyncio.create_task(
+                    client.post("/v1/responses/input_tokens", json=payload)
+                )
+                for _ in range(1 if fail else 2)
+            ]
+            try:
+                assert await asyncio.to_thread(entered.wait, 2)
+                health = await asyncio.wait_for(client.get("/health"), 1)
+                progress = health.json()["model_load_progress"]
+                assert progress["stage"] == "evaluating_layers"
+                assert progress["stage_percent"] == 50.0
+                assert (
+                    progress["completed_layers"] == 1 and progress["total_layers"] == 2
+                )
+                assert progress["model"] == "demo" and progress["elapsed_seconds"] >= 0
+                busy = await client.post("/unload")
+                assert busy.status_code == 409
+                assert busy.json()["detail"]["code"] == "model_loading"
+            finally:
+                release.set()
+                responses = await asyncio.gather(*pending)
+            assert all(r.status_code == (400 if fail else 200) for r in responses)
+            assert len(generators) == 1
+            progress = (await client.get("/health")).json()["model_load_progress"]
+            assert progress["stage"] == ("failed" if fail else "ready")
+            assert progress["stage_percent"] is None
+            if fail:
+                assert generators[0].stopped
+            else:
+                assert (await client.post("/unload")).status_code == 200
+                assert (await client.get("/health")).json()[
+                    "model_load_progress"
+                ] is None
+
+    asyncio.run(check())
 
 
 def test_apc_patch_reaches_next_model_request(settings_client, tmp_path):

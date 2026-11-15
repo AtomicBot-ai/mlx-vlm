@@ -1158,19 +1158,17 @@ class DistributedWorker:
             "load_progress": getattr(self, "load_progress", None),
         }
 
-    def load(self, model_path, adapter_path, trust_remote_code=False):
-        started = time.monotonic()
+    def load(
+        self, model_path, adapter_path, trust_remote_code=False, progress_callback=None
+    ):
+        from ..load_progress import LoadingProgress
 
-        def report(stage, **counts):
-            # Replace the snapshot atomically: the HTTP thread only reads it.
-            self.load_progress = {
-                "model": str(Path(model_path).resolve()),
-                "stage": stage,
-                "elapsed_seconds": time.monotonic() - started,
-                "updated_at": time.time(),
-                **counts,
-            }
+        def publish(event):
+            self.load_progress = event
+            if progress_callback is not None:
+                progress_callback(event.copy())
 
+        report = LoadingProgress(Path(model_path).resolve(), publish)
         report("loading_checkpoint")
         try:
             result = self._load(model_path, adapter_path, trust_remote_code, report)
@@ -1184,6 +1182,7 @@ class DistributedWorker:
         import mlx.core as mx
 
         from ..generate.diffusion import is_diffusion_model
+        from ..load_progress import evaluate_model
         from ..utils import load
 
         path = Path(model_path).resolve()
@@ -1202,6 +1201,7 @@ class DistributedWorker:
             sharding_group=self.group,
             trust_remote_code=trust_remote_code,
             local_files_only=True,
+            progress_callback=report.update,
         )
         if not callable(getattr(model, "shard", None)):
             raise ValueError("This model does not support distributed sharding")
@@ -1209,20 +1209,7 @@ class DistributedWorker:
             raise ValueError("Distributed serving requires an autoregressive model")
         report("sharding")
         model.shard(self.group)
-        lm = getattr(model, "language_model", model)
-        layers = getattr(lm, "layers", [])
-        report("evaluating_layers", completed_layers=0, total_layers=len(layers))
-        for index, layer in enumerate(layers):
-            mx.eval(layer.parameters())
-            mx.clear_cache()
-            report(
-                "evaluating_layers",
-                completed_layers=index + 1,
-                total_layers=len(layers),
-            )
-        # Include vision/audio/projector parameters without assuming their names.
-        report("evaluating_remaining_parameters")
-        mx.eval(model.parameters())
+        evaluate_model(model, report.update, clear_cache=True)
         model.eval()
         report("synchronizing")
         mx.eval(mx.distributed.all_sum(mx.array(1.0), group=self.group, stream=mx.cpu))

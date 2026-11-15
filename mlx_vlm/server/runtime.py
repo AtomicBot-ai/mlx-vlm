@@ -67,6 +67,7 @@ class ServerRuntime:
     distributed_worker: Optional[Any] = None
     model_cache: ModelCacheRegistry = field(default_factory=ModelCacheRegistry)
     response_generator: Optional[Any] = None
+    model_load_progress: Optional[dict] = None
     audio_queue: Optional[Any] = None
     mesh_jobs: Optional[Any] = None
     realtime_engine: Optional[Any] = None

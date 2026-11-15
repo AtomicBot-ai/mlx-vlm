@@ -595,7 +595,9 @@ def _build_metrics_envelope(
     }
 
 
-def load_model_resources(model_path: str, adapter_path: Optional[str]):
+def load_model_resources(
+    model_path: str, adapter_path: Optional[str], *, progress_callback=None
+):
     """
     Loads model, processor, and config based on paths.
     Handles potential loading errors.
@@ -608,9 +610,17 @@ def load_model_resources(model_path: str, adapter_path: Optional[str]):
         trust_remote_code = (
             os.environ.get("MLX_TRUST_REMOTE_CODE", "false").lower() == "true"
         )
+        progress_kwargs = (
+            {"progress_callback": progress_callback}
+            if progress_callback is not None
+            else {}
+        )
         if runtime.distributed_worker is not None:
             model, processor = runtime.distributed_worker.load(
-                model_path, adapter_path, trust_remote_code=trust_remote_code
+                model_path,
+                adapter_path,
+                trust_remote_code=trust_remote_code,
+                **progress_kwargs,
             )
         else:
             model, processor = load(
@@ -619,6 +629,7 @@ def load_model_resources(model_path: str, adapter_path: Optional[str]):
                 trust_remote_code=trust_remote_code,
                 expert_cache_gb=get_expert_cache_gb(),
                 max_kv_size=get_configured_context_limit(),
+                **progress_kwargs,
             )
         if hasattr(model, "system_one"):
             from ..models.d1_lfm3_vl.d1 import REFUSAL
@@ -1074,8 +1085,10 @@ class ResponseGenerator:
         draft_model_path: Optional[str] = None,
         draft_kind: Optional[str] = None,
         prefill_step_size: Optional[int] = None,
+        load_progress_callback=None,
     ):
         self.model_path = model_path
+        self.load_progress_callback = load_progress_callback
         self.adapter_path = adapter_path
         self.model = None
         self.processor = None
@@ -1165,9 +1178,14 @@ class ResponseGenerator:
                 pass
 
     def _initialize_model(self):
+        callback = getattr(self, "load_progress_callback", None)
         model, processor, config = load_model_resources(
-            self.model_path, self.adapter_path
+            self.model_path,
+            self.adapter_path,
+            **({"progress_callback": callback} if callback is not None else {}),
         )
+        if callback is not None:
+            callback({"stage": "initializing_generator"})
 
         stop_tokens = set(
             resolve_eos_token_ids(
@@ -1183,6 +1201,8 @@ class ResponseGenerator:
             "MLX_VLM_DRAFT_MODEL"
         )
         if draft_model_path:
+            if callback is not None:
+                callback({"stage": "loading_draft", "draft_model": draft_model_path})
             from ..speculative.drafters import (
                 load_drafter,
                 validate_drafter_compatibility,

@@ -765,18 +765,12 @@ async def responses_input_tokens_endpoint(request: Request):
         )
         _ensure_effective_input(chat_messages, images=images)
 
-        if runtime.distributed_worker is not None:
-            # Keep authenticated health/progress polling responsive during the
-            # coordinator's model-loading warmup. MLX still loads on its owner thread.
-            model, processor, config = await asyncio.to_thread(
-                get_cached_model,
-                openai_request.model,
-                _adapter_path_or_inherit(openai_request),
-            )
-        else:
-            model, processor, config = get_cached_model(
-                openai_request.model, _adapter_path_or_inherit(openai_request)
-            )
+        # Keep health/progress polling responsive; MLX loads on its owner thread.
+        model, processor, config = await asyncio.to_thread(
+            get_cached_model,
+            openai_request.model,
+            _adapter_path_or_inherit(openai_request),
+        )
         del model
         chat_tools, _ = _response_tool_registry(openai_request.tools)
         gen_args = _build_gen_args(
@@ -825,8 +819,8 @@ async def responses_compact_endpoint(http_request: Request, request: CompactRequ
         model=request.model,
         tenant=tenant,
     )
-    model, processor, config = get_cached_model(
-        request.model, _adapter_path_or_inherit(request)
+    model, processor, config = await asyncio.to_thread(
+        get_cached_model, request.model, _adapter_path_or_inherit(request)
     )
     result = await compaction.compact_response_context(
         request,
@@ -891,8 +885,8 @@ def _response_stream_error(exc, response):
 
 async def _responses_compaction_trigger(request, items, tenant, covered=frozenset()):
     """Return a single opaque item, with progress while a summary is running."""
-    model, processor, config = get_cached_model(
-        request.model, _adapter_path_or_inherit(request)
+    model, processor, config = await asyncio.to_thread(
+        get_cached_model, request.model, _adapter_path_or_inherit(request)
     )
     compact_request = CompactRequest(
         **{**request.model_dump(), "stream": False, "max_output_tokens": 1024}
@@ -1098,8 +1092,10 @@ async def responses_endpoint(request: Request):
         )
         compaction_args = None
         if openai_request.context_management:
-            model, processor, config = get_cached_model(
-                openai_request.model, _adapter_path_or_inherit(openai_request)
+            model, processor, config = await asyncio.to_thread(
+                get_cached_model,
+                openai_request.model,
+                _adapter_path_or_inherit(openai_request),
             )
             compaction_args = (
                 openai_request,
@@ -1149,8 +1145,10 @@ async def responses_endpoint(request: Request):
         _ensure_effective_input(chat_messages, images=images)
 
         # Get model, processor, config - loading if necessary
-        model, processor, config = get_cached_model(
-            openai_request.model, _adapter_path_or_inherit(openai_request)
+        model, processor, config = await asyncio.to_thread(
+            get_cached_model,
+            openai_request.model,
+            _adapter_path_or_inherit(openai_request),
         )
 
         chat_tools, tool_registry = _response_tool_registry(openai_request.tools)
@@ -2040,7 +2038,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
         compacted_context = None
         if request.context_management != []:
             _prepare_chat_tool_choice([], request.tools, request.tool_choice)
-            model, processor, config = get_cached_model(request.model, adapter_path)
+            model, processor, config = await asyncio.to_thread(
+                get_cached_model, request.model, adapter_path
+            )
             if request.context_management or (
                 compaction._context_limit(config, required=False) is not None
                 and all(
@@ -2119,7 +2119,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             request.tool_choice,
         )
 
-        model, processor, config = get_cached_model(request.model, adapter_path)
+        model, processor, config = await asyncio.to_thread(
+            get_cached_model, request.model, adapter_path
+        )
 
         video_resolution = resolve_video_inputs(
             processor,

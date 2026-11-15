@@ -14,7 +14,7 @@ import threading
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace as NS
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import ANY, AsyncMock, Mock
 
 import httpx
 import pytest
@@ -832,11 +832,16 @@ def test_worker_uses_native_lazy_loader_before_sharding(cluster, monkeypatch):
     worker = DistributedWorker.__new__(DistributedWorker)
     worker.model_dir = cluster.model_dir
     worker.group = object()
-    assert worker.load(str(path), None) == (model, processor)
+    events = []
+    assert worker.load(str(path), None, progress_callback=events.append) == (
+        model,
+        processor,
+    )
     native.assert_called_once_with(
         str(path),
         lazy=True,
         sharding_group=worker.group,
+        progress_callback=ANY,
         trust_remote_code=False,
         local_files_only=True,
     )
@@ -851,8 +856,16 @@ def test_worker_uses_native_lazy_loader_before_sharding(cluster, monkeypatch):
     assert measurements[0]["stage"] == "evaluating_layers"
     assert measurements[0]["completed_layers"] == 0  # Not counted before mx.eval.
     assert measurements[0]["total_layers"] == 1
+    assert measurements[0]["stage_percent"] == 0.0
     assert measurements[-1]["stage"] == "synchronizing"
     assert worker.load_progress["stage"] == "ready"
+    assert events[-1] == worker.load_progress
+    assert any(e.get("completed_layers") == 1 for e in events)
+    assert [e["stage_percent"] for e in events if "completed_layers" in e] == [
+        0.0,
+        100.0,
+    ]
+    assert worker.load_progress["stage_percent"] is None
     native.side_effect = RuntimeError("broken checkpoint")
     with pytest.raises(RuntimeError, match="broken checkpoint"):
         worker.load(str(path), None)

@@ -546,7 +546,9 @@ async def anthropic_messages_endpoint(http_request: Request):
             if "adapter_path" in request.model_fields_set
             else _INHERIT_ADAPTER
         )
-        model, processor, config = get_cached_model(request.model, adapter_path)
+        model, processor, config = await asyncio.to_thread(
+            get_cached_model, request.model, adapter_path
+        )
 
         try:
             processed_messages, images, tools, tool_choice = (
@@ -1246,7 +1248,9 @@ async def anthropic_count_tokens_endpoint(http_request: Request):
     try:
         body = _normalize_anthropic_system_messages(await http_request.json())
         request = _anthropic_request_with_derived_fields(AnthropicRequest(**body))
-        model, processor, config = get_cached_model(request.model)
+        model, processor, config = await asyncio.to_thread(
+            get_cached_model, request.model
+        )
         try:
             processed_messages, images, tools, tool_choice = (
                 _anthropic_messages_to_internal(request)

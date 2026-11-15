@@ -25,6 +25,7 @@ from ..generate.edit_image import load_image_edit_model
 from ..generate.image import is_image_generation_model, load_image_generation_model
 from ..generate.image_defaults import ImageSamplingDefaults, resolve_image_defaults
 from ..generate.three_d import load_3d_model
+from ..load_progress import LoadingProgress
 from ..reranker import RerankerKind, reranker_kind
 from ..structured import build_json_schema_logits_processor
 from ..tools import _infer_tool_parser_from_processor
@@ -192,6 +193,7 @@ def _server_runtime_snapshot() -> dict:
         "request_queue_depth": queue_depth,
         "audio_queue_depth": audio_queue_depth,
         "preload_failures": dict(runtime.preload_failures),
+        "model_load_progress": runtime.model_load_progress,
         "apc": (
             {"enabled": False}
             if runtime.apc_manager is None
@@ -637,7 +639,7 @@ def _audio_cache_group(model_kind: str) -> str:
     return "audio"
 
 
-_distributed_model_load_lock = RLock()
+_model_load_lock = RLock()
 
 
 def get_cached_model(
@@ -647,11 +649,12 @@ def get_cached_model(
     model_kind: str = "auto",
     revision: str | None = None,
 ):
-    # Token-count warmup runs off the worker's HTTP event loop. Serialize cache
-    # initialization with other requests so concurrent callers reuse one loader.
+    # Text loading runs off the HTTP loop; concurrent callers reuse one loader.
+    # Dedicated audio/image workers retain their own initialization lifecycle.
     with (
-        _distributed_model_load_lock
+        _model_load_lock
         if runtime.distributed_worker is not None
+        or model_kind in ("auto", "text_generation")
         else nullcontext()
     ):
         return _get_cached_model(
@@ -1052,27 +1055,36 @@ def _get_cached_model(
         overrides=cfg.apc_overrides(),
     )
 
-    response_generator = ResponseGenerator(
-        model_path=model_path,
-        adapter_path=adapter_path,
-        vision_cache=vision_cache,
-        kv_bits=kv_bits,
-        kv_key_bits=kv_key_bits,
-        kv_value_bits=kv_value_bits,
-        kv_key_scheme=kv_key_scheme,
-        kv_value_scheme=kv_value_scheme,
-        kv_group_size=kv_group_size,
-        kv_quant_scheme=kv_quant_scheme,
-        quantized_kv_start=quantized_kv_start,
-        top_logprobs_k=get_top_logprobs_k(),
-        apc_manager=runtime.apc_manager,
-        draft_model_path=cfg.draft_model,
-        draft_kind=cfg.draft_kind,
-    )
+    def publish_loading(event):
+        runtime.model_load_progress = {**event, "adapter_path": adapter_path}
+
+    progress = LoadingProgress(model_path, publish_loading)
+    progress("starting")
+    response_generator = None
     try:
+        response_generator = ResponseGenerator(
+            model_path=model_path,
+            adapter_path=adapter_path,
+            vision_cache=vision_cache,
+            kv_bits=kv_bits,
+            kv_key_bits=kv_key_bits,
+            kv_value_bits=kv_value_bits,
+            kv_key_scheme=kv_key_scheme,
+            kv_value_scheme=kv_value_scheme,
+            kv_group_size=kv_group_size,
+            kv_quant_scheme=kv_quant_scheme,
+            quantized_kv_start=quantized_kv_start,
+            top_logprobs_k=get_top_logprobs_k(),
+            apc_manager=runtime.apc_manager,
+            draft_model_path=cfg.draft_model,
+            draft_kind=cfg.draft_kind,
+            load_progress_callback=progress.update,
+        )
         model, processor, config = response_generator.wait_until_ready()
     except Exception:
-        response_generator.stop_and_join()
+        progress("failed")
+        if response_generator is not None:
+            response_generator.stop_and_join()
         vision_cache.clear()
         raise
 
@@ -1098,6 +1110,7 @@ def _get_cached_model(
     registry.set(cache_group, cache)
     runtime.response_generator = response_generator
     runtime.apc_manager = cache["apc_manager"]
+    progress("ready")
 
     return model, processor, config
 
@@ -1132,6 +1145,7 @@ def unload_model_sync():
 
     runtime.response_generator = None
     runtime.apc_manager = None
+    runtime.model_load_progress = None
     gc.collect()
     mx.clear_cache()
     if unloaded_any:
@@ -1366,6 +1380,7 @@ async def health_check(request: Request):
     result = {
         "status": "healthy",
         "loaded_model": runtime["loaded_model"],
+        "model_load_progress": runtime["model_load_progress"],
         "loaded_adapter": runtime["loaded_adapter"],
         "loaded_models": runtime["loaded_models"],
         "loaded_context_size": runtime["loaded_context_size"],
@@ -1480,21 +1495,32 @@ async def unload_model_endpoint(request: Request):
     Unload the currently loaded model from memory.
     """
     _require_management_api_key(request)
-    snapshot = _server_runtime_snapshot()
-    unloaded_info = {
-        "model_name": snapshot["loaded_model"],
-        "adapter_name": snapshot["loaded_adapter"],
-        "models": snapshot["loaded_models"],
-    }
+    # Loading now yields the HTTP loop. Do not unload a half-initialized model.
+    if not _model_load_lock.acquire(blocking=False):
+        raise HTTPException(
+            409, {"code": "model_loading", "message": "Retry after loading finishes"}
+        )
+    try:
+        snapshot = _server_runtime_snapshot()
+        unloaded_info = {
+            "model_name": snapshot["loaded_model"],
+            "adapter_name": snapshot["loaded_adapter"],
+            "models": snapshot["loaded_models"],
+        }
 
-    if not unload_model_sync():  # Use the synchronous unload function
-        return {"status": "no_model_loaded", "message": "No model is currently loaded"}
+        if not unload_model_sync():  # Use the synchronous unload function
+            return {
+                "status": "no_model_loaded",
+                "message": "No model is currently loaded",
+            }
 
-    return {
-        "status": "success",
-        "message": "Model unloaded successfully",
-        "unloaded": unloaded_info,
-    }
+        return {
+            "status": "success",
+            "message": "Model unloaded successfully",
+            "unloaded": unloaded_info,
+        }
+    finally:
+        _model_load_lock.release()
 
 
 def main():
