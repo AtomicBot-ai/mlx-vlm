@@ -35,9 +35,12 @@ print(result["prob_1"])
 confidently inconsistent. This is not a symmetric confidence score. No decision
 threshold is applied automatically.
 
-The supplied value-head prompt is preserved exactly: original image first,
-rendered image second, no system message, no assistant prefix, and no inserted
-newline after either image placeholder. Candidate text is passed unchanged.
+The value-head prompt matches the [pinned OpenBMB reference](https://github.com/OpenBMB/MiniCPM-OCR/blob/74c8876056c536ee55b204cc842112c515764512/scripts/minicpm-ocr-jev/infer_vllm.py#L50-L115):
+original image first, rendered image second, a newline after each image
+placeholder, and the suffix
+`<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n`.
+The value head pools the last token of this empty assistant/think turn.
+Candidate text is passed unchanged.
 The processor preserves the checkpoint's 65,536–16,777,216 pixel budget per image.
 Images with aspect ratios above 199:1 are padded on a white canvas as in the
 reference. Rendering OCR text into an image is an upstream step; a renderer is
@@ -49,8 +52,8 @@ processed individually after image encoding to preserve recurrent state. The
 score head is excluded from quantization. Shifted language normalization scales
 remain FP32, with activations cast back to the input dtype.
 
-For closer agreement with the supplied reference scores, convert to FP32 and
-disable reduced-precision matrix operations when launching:
+To evaluate at FP32 precision, convert to FP32 and disable reduced-precision
+matrix operations when launching:
 
 ```bash
 mlx_vlm.convert --hf-path /path/to/Jev-checkpoint \
@@ -64,8 +67,8 @@ MLX_ENABLE_TF32=0 python -m mlx_vlm.models.minicpm_ocr_jev \
 
 MLX can otherwise use reduced-precision matrix operations on supported hardware. See
 [MLX numerical precision](https://ml-explore.github.io/mlx/build/html/usage/precision.html).
-On the 12 supplied samples, FP32 model probabilities matched Transformers to
-within `4.8e-7` with identical processed inputs. Against the supplied batched GPU
-scores, the maximum probability differences were `0.00441` for FP32 and `0.00919`
-for BF16. The latter comparison includes preprocessing and execution differences.
-Validate any routing threshold with the deployed precision and input pipeline.
+Earlier numerical comparisons used a prompt that omitted these image newlines
+and the assistant/think suffix; they do not validate the corrected prompt.
+Scores change with this correction. Revalidate numerical agreement and any
+routing threshold with the corrected prompt, deployed precision, and input
+pipeline.
