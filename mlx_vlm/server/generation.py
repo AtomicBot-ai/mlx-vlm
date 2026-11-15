@@ -62,6 +62,7 @@ DEFAULT_LOG_PROGRESS_INTERVAL = 10
 DEFAULT_ENABLE_THINKING = False
 METRICS_HISTORY_LIMIT = 100
 METRICS_RECENT_LIMIT = 32
+_DRAFT_BLOCK_SIZE_FROM_ENV = object()
 
 
 class PromptTooLongError(ValueError):
@@ -71,6 +72,27 @@ class PromptTooLongError(ValueError):
 def _get_draft_block_size_from_env():
     draft_block_size_str = os.environ.get("MLX_VLM_DRAFT_BLOCK_SIZE")
     return int(draft_block_size_str) if draft_block_size_str else None
+
+
+def load_local_drafter(target, path, kind, block_size):
+    """Load a local drafter, retaining autoregressive fallback on incompatibility."""
+    path = path or os.environ.get("MLX_VLM_DRAFT_MODEL")
+    kind = kind or os.environ.get("MLX_VLM_DRAFT_KIND")
+    if not path:
+        return None, None
+    from ..speculative.drafters import load_drafter, validate_drafter_compatibility
+
+    draft, resolved_kind = load_drafter(path, kind=kind)
+    try:
+        validate_drafter_compatibility(target, draft, resolved_kind)
+    except ValueError as exc:
+        logger.warning(
+            "Speculative drafter is incompatible with the target model; "
+            "falling back to autoregressive generation: %s",
+            exc,
+        )
+        return None, None
+    return draft, resolved_kind
 
 
 def _notify_queues(queues, *items):
@@ -1086,6 +1108,8 @@ class ResponseGenerator:
         draft_kind: Optional[str] = None,
         prefill_step_size: Optional[int] = None,
         load_progress_callback=None,
+        draft_block_size=_DRAFT_BLOCK_SIZE_FROM_ENV,
+        draft_loader=load_local_drafter,
     ):
         self.model_path = model_path
         self.load_progress_callback = load_progress_callback
@@ -1097,6 +1121,8 @@ class ResponseGenerator:
         self.vision_cache = vision_cache
         self.draft_model_path = draft_model_path
         self.draft_kind_override = draft_kind
+        self.draft_block_size = draft_block_size
+        self.draft_loader = draft_loader
         self.draft_model = None
         self.kv_bits = kv_bits
         self.kv_key_bits = kv_key_bits
@@ -1196,44 +1222,34 @@ class ResponseGenerator:
         stop_tokens.update(getattr(processor, "additional_eos_token_ids", ()))
 
         draft_model = None
-        draft_kind = self.draft_kind_override or os.environ.get("MLX_VLM_DRAFT_KIND")
-        draft_model_path = self.draft_model_path or os.environ.get(
-            "MLX_VLM_DRAFT_MODEL"
-        )
+        draft_kind = self.draft_kind_override
+        draft_model_path = self.draft_model_path
+        draft_loader = getattr(self, "draft_loader", load_local_drafter)
         if draft_model_path:
             if callback is not None:
                 callback({"stage": "loading_draft", "draft_model": draft_model_path})
-            from ..speculative.drafters import (
-                load_drafter,
-                validate_drafter_compatibility,
-            )
-
             logger.info(
                 "Loading speculative drafter (%s): %s",
                 draft_kind or "auto",
                 draft_model_path,
             )
-            draft_model, resolved_kind = load_drafter(draft_model_path, kind=draft_kind)
-            if draft_kind is None:
+        if draft_loader is not None:
+            draft_model, resolved_kind = draft_loader(
+                model,
+                draft_model_path,
+                draft_kind,
+                self._effective_draft_block_size(),
+            )
+            if draft_model is not None and draft_kind is None:
                 logger.info("Auto-detected speculative draft kind: %s", resolved_kind)
-            elif resolved_kind != draft_kind:
+            elif draft_model is not None and resolved_kind != draft_kind:
                 logger.warning(
                     "Drafter requires draft kind %s; using it instead of %s.",
                     resolved_kind,
                     draft_kind,
                 )
             draft_kind = resolved_kind
-            try:
-                validate_drafter_compatibility(model, draft_model, draft_kind)
-            except ValueError as e:
-                logger.warning(
-                    "Speculative drafter is incompatible with the target model; "
-                    "falling back to autoregressive generation: %s",
-                    e,
-                )
-                draft_model = None
-                draft_kind = None
-            else:
+            if draft_model is not None:
                 logger.info("Drafter ready; speculative decoding enabled.")
 
         self.model = model
@@ -1249,6 +1265,14 @@ class ResponseGenerator:
         if self.apc_manager is not None:
             language_model = getattr(model, "language_model", model)
             self.apc_mode = _apc.model_apc_mode(language_model)
+
+    def _effective_draft_block_size(self):
+        size = getattr(self, "draft_block_size", _DRAFT_BLOCK_SIZE_FROM_ENV)
+        return (
+            _get_draft_block_size_from_env()
+            if size is _DRAFT_BLOCK_SIZE_FROM_ENV
+            else size
+        )
 
     def generate(
         self,
@@ -1900,7 +1924,7 @@ class ResponseGenerator:
                 apc_manager=self.apc_manager,
                 draft_model=self.draft_model,
                 draft_kind=self.draft_kind,
-                draft_block_size=_get_draft_block_size_from_env(),
+                draft_block_size=self._effective_draft_block_size(),
                 greedy_sampling=args.temperature == 0,
                 prefill_step_size=self._effective_prefill_step_size(),
             )

@@ -1693,3 +1693,273 @@ def test_preparation_cancelled_while_waiting_for_staging_lock(cluster, transport
             with pytest.raises(InterruptedError, match="cancelled"):
                 waiting.result(timeout=2)
     assert not stager.sources and not stager.worker_transfers
+
+
+async def test_coordinator_maps_draft_snapshots_to_each_worker(
+    coordinator, monkeypatch
+):
+    from mlx_vlm.server.cluster_types import SpeculativeDraft
+
+    coordinator.draft = SpeculativeDraft(model="org/draft", kind="dflash", block_size=3)
+    coordinator.draft_target = ("org/model", None)
+    coordinator.draft_path = "/models/draft-snapshot"
+    seen = []
+    for rank, worker in enumerate(coordinator.config.workers):
+        coordinator.stager.worker_paths[(coordinator.draft_path, worker.url)] = (
+            f"/rank{rank}/draft-snapshot"
+        )
+
+    def handler(request):
+        rank = int(request.url.host[-1])
+        if request.method == "GET":
+            info = _health(rank)
+            info["distributed_worker"]["speculative_drafters"] = ["dflash", "mtp"]
+            return httpx.Response(200, json=info)
+        body = json.loads(request.content)
+        seen.append(body["_distributed_draft"])
+        assert body["_distributed_draft"] == {
+            "model": f"/rank{rank}/draft-snapshot",
+            "revision": None,
+            "kind": "dflash",
+            "block_size": 3,
+        }
+        return httpx.Response(200, json={"output": "same answer"})
+
+    _transport(monkeypatch, handler)
+    result, status = await coordinator.relay(
+        "/v1/responses", {"model": "org/model", "input": "hi"}
+    )
+    assert status == 200 and result["output"] == "same answer" and len(seen) == 2
+    with pytest.raises(HTTPException, match="draft_target_mismatch"):
+        await coordinator.relay("/v1/responses", {"model": "org/other"})
+    with pytest.raises(HTTPException, match="Draft configuration"):
+        await coordinator.relay(
+            "/v1/responses", {"model": "org/model", "_distributed_draft": None}
+        )
+
+
+async def test_old_workers_reject_speculation_before_staging(coordinator, monkeypatch):
+    from mlx_vlm.server.cluster_types import SpeculativeDraft
+
+    coordinator.draft = SpeculativeDraft(model="org/model")
+    coordinator.draft_target = ("org/model", None)
+    _transport(
+        monkeypatch, lambda r: httpx.Response(200, json=_health(int(r.url.host[-1])))
+    )
+    with pytest.raises(HTTPException, match="health/group check failed"):
+        await coordinator.relay("/v1/responses", {"model": "org/model"})
+    coordinator.stager.prepare.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", [None, "local", "peer", "different"])
+def test_worker_draft_loading_agrees_before_scheduling(cluster, monkeypatch, failure):
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    from mlx_vlm.server import distributed_schedule
+    from mlx_vlm.speculative import drafters
+
+    path = cluster.model_dir / "draft-snapshot"
+    path.mkdir(parents=True)
+    (path / MANIFEST).write_text("{}")
+    worker = DistributedWorker.__new__(DistributedWorker)
+    worker.model_dir = cluster.model_dir
+    worker.group = object()
+    draft = nn.Linear(2, 2)
+    loader = Mock(return_value=(draft, "dflash"))
+    if failure == "local":
+        loader.side_effect = ValueError("incompatible weights")
+    monkeypatch.setattr(drafters, "load_drafter", loader)
+    observed = []
+
+    def exchange(group, state):
+        observed.append(state)
+        peer = dict(state)
+        if failure == "peer":
+            peer["error"] = "peer draft is missing"
+        if failure == "different":
+            peer["block_size"] = 8
+        return [state, peer]
+
+    monkeypatch.setattr(distributed_schedule, "gather_json", exchange)
+    if failure:
+        with pytest.raises(ValueError, match="Distributed draft"):
+            worker.load_drafter(object(), str(path), "dflash", 3)
+    else:
+        assert worker.load_drafter(object(), str(path), "dflash", 3) == (
+            draft,
+            "dflash",
+        )
+        assert observed[0]["error"] is None
+        assert not draft.training
+        mx.eval(draft.parameters())
+    assert observed[0]["snapshot"] == path.name
+    assert observed[0]["block_size"] == 3
+
+
+def test_worker_never_resolves_unstaged_draft_from_hub(cluster, monkeypatch):
+    from mlx_vlm.server import distributed_schedule
+    from mlx_vlm.speculative import drafters
+
+    worker = DistributedWorker.__new__(DistributedWorker)
+    worker.model_dir = cluster.model_dir
+    worker.group = object()
+    loader = Mock()
+    monkeypatch.setattr(drafters, "load_drafter", loader)
+    monkeypatch.setattr(
+        distributed_schedule, "gather_json", lambda group, state: [state, state]
+    )
+    with pytest.raises(ValueError, match="coordinator-staged"):
+        worker.load_drafter(object(), "org/draft", None, None)
+    loader.assert_not_called()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("block_size", [None, 3])
+def test_worker_generator_uses_only_coordinated_draft_settings(
+    monkeypatch, enabled, block_size
+):
+    from mlx_vlm.server.cluster_types import SpeculativeDraft
+
+    target, draft = NS(), NS()
+    processor, config = NS(tokenizer=NS()), NS(eos_token_id=[])
+    worker = NS(load_drafter=Mock(return_value=(draft, "dflash")))
+    monkeypatch.setattr(runtime, "distributed_worker", worker)
+    monkeypatch.setenv("MLX_VLM_DRAFT_MODEL", "unrelated/local-model")
+    monkeypatch.setenv("MLX_VLM_DRAFT_KIND", "eagle3")
+    monkeypatch.setenv("MLX_VLM_DRAFT_BLOCK_SIZE", "99")
+    monkeypatch.setattr(
+        generation,
+        "load_model_resources",
+        Mock(return_value=(target, processor, config)),
+    )
+    options = server._app_module._draft_generator_options(
+        SpeculativeDraft(model="/models/draft", kind="dflash", block_size=block_size)
+        if enabled
+        else None
+    )
+    monkeypatch.setattr(generation.Thread, "start", lambda self: None)
+    gen = generation.ResponseGenerator("/models/target", **options)
+    # The loader remains bound even if global runtime state changes later.
+    monkeypatch.setattr(runtime, "distributed_worker", None)
+    gen._initialize_model()
+    if enabled:
+        worker.load_drafter.assert_called_once_with(
+            target, "/models/draft", "dflash", block_size
+        )
+        assert gen.draft_model is draft and gen.draft_kind == "dflash"
+        assert gen._effective_draft_block_size() == block_size
+    else:
+        worker.load_drafter.assert_not_called()
+        assert gen.draft_model is None and gen._effective_draft_block_size() is None
+
+
+def test_worker_model_cache_reloads_when_draft_settings_change(monkeypatch):
+    from mlx_vlm.server.cluster_types import SpeculativeDraft
+    from mlx_vlm.tests.test_server import _reset_runtime
+
+    _reset_runtime(monkeypatch, model_cache={})
+    monkeypatch.setattr(runtime, "distributed_worker", NS(load_drafter=Mock()))
+    resources = NS(), NS(), NS(model_type="test")
+    created, stopped = [], []
+
+    def make(**options):
+        created.append(options)
+        return NS(
+            wait_until_ready=lambda: resources,
+            stop_and_join=lambda: stopped.append(True),
+        )
+
+    monkeypatch.setattr(server._app_module, "ResponseGenerator", make)
+    monkeypatch.setattr(server._app_module._apc, "from_env", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        server._app_module, "is_image_generation_model", lambda _: False
+    )
+    drafts = [
+        None,
+        SpeculativeDraft(model="/models/draft", kind="dflash", block_size=3),
+        SpeculativeDraft(model="/models/draft", kind="dflash", block_size=4),
+        None,
+    ]
+    for draft in drafts:
+        token = request_scope.set(RequestScope("request", draft=draft))
+        try:
+            server.get_cached_model("/models/target")
+            server.get_cached_model("/models/target")
+        finally:
+            request_scope.reset(token)
+    assert len(created) == 4 and len(stopped) == 3
+    assert [c["draft_block_size"] for c in created] == [None, 3, 4, None]
+    assert [c["draft_model_path"] for c in created] == [
+        None,
+        "/models/draft",
+        "/models/draft",
+        None,
+    ]
+
+
+def test_worker_draft_failure_does_not_fall_back_to_ar(monkeypatch):
+    from mlx_vlm.server.cluster_types import SpeculativeDraft
+
+    monkeypatch.setattr(
+        runtime,
+        "distributed_worker",
+        NS(load_drafter=Mock(side_effect=ValueError("incompatible draft"))),
+    )
+    monkeypatch.setattr(
+        generation,
+        "load_model_resources",
+        Mock(return_value=(NS(), NS(tokenizer=NS()), NS(eos_token_id=[]))),
+    )
+    options = server._app_module._draft_generator_options(
+        SpeculativeDraft(model="/models/draft")
+    )
+    monkeypatch.setattr(generation.Thread, "start", lambda self: None)
+    gen = generation.ResponseGenerator("/models/target", **options)
+    with pytest.raises(ValueError, match="incompatible draft"):
+        gen._initialize_model()
+    assert gen.model is None
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_local_generator_resolves_draft_settings_before_loading(monkeypatch, explicit):
+    from mlx_vlm.speculative import drafters
+
+    monkeypatch.setattr(runtime, "distributed_worker", None)
+    monkeypatch.setattr(
+        runtime,
+        "config",
+        replace(
+            runtime.config,
+            draft_model="explicit-draft" if explicit else None,
+            draft_kind="dflash" if explicit else None,
+        ),
+    )
+    monkeypatch.setenv("MLX_VLM_DRAFT_MODEL", "env-draft")
+    monkeypatch.setenv("MLX_VLM_DRAFT_KIND", "mtp")
+    monkeypatch.setenv("MLX_VLM_DRAFT_BLOCK_SIZE", "6")
+    options = server._app_module._draft_generator_options(None)
+    path, kind = ("explicit-draft", "dflash") if explicit else ("env-draft", "mtp")
+    assert options["draft_model_path"] == path
+    assert options["draft_kind"] == kind
+    assert options["draft_block_size"] == 6
+    target, draft = NS(), NS()
+    loader = Mock(return_value=(draft, kind))
+    validate = Mock()
+    monkeypatch.setattr(drafters, "load_drafter", loader)
+    monkeypatch.setattr(drafters, "validate_drafter_compatibility", validate)
+    monkeypatch.setattr(
+        generation,
+        "load_model_resources",
+        Mock(return_value=(target, NS(tokenizer=NS()), NS(eos_token_id=[]))),
+    )
+    monkeypatch.setattr(generation.Thread, "start", lambda self: None)
+    gen = generation.ResponseGenerator("local-target", **options)
+    monkeypatch.setenv("MLX_VLM_DRAFT_MODEL", "later-draft")
+    monkeypatch.setenv("MLX_VLM_DRAFT_KIND", "eagle3")
+    monkeypatch.setenv("MLX_VLM_DRAFT_BLOCK_SIZE", "99")
+    gen._initialize_model()
+    loader.assert_called_once_with(path, kind=kind)
+    validate.assert_called_once_with(target, draft, kind)
+    assert gen.draft_model is draft and gen.draft_kind == kind
+    assert gen._effective_draft_block_size() == 6

@@ -77,8 +77,8 @@ result = generate(
 
 For CLI generation or the sharded example, add
 `--draft-model thinkingmachines/Inkling-2-Small`. The default draft block contains
-one anchor and seven proposals. Distributed DSpark uses the sharded Python/example
-path; cluster API workers do not support speculative drafters.
+one anchor and seven proposals. Distributed DSpark supports the sharded Python/example
+path and the [cluster API's draft option](../../../docs/cluster-api.md#speculative-decoding).
 
 ## Notes
 

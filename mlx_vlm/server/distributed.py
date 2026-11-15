@@ -403,6 +403,9 @@ class Coordinator:
         self.waiters = deque()
         self.active = 0
         self.model = None
+        self.draft = None
+        self.draft_target = None
+        self.draft_path = None
         self.primary = 0
         self.seed = secrets.randbelow(2**31)
         self.failure = config.model_dir / ".cluster-failed.json"
@@ -439,6 +442,12 @@ class Coordinator:
             for check in checks:
                 check.raise_for_status()
                 info = check.json().get("distributed_worker") or {}
+                if self.draft is not None and not {"dflash", "mtp"}.issubset(
+                    info.get("speculative_drafters", [])
+                ):
+                    raise ValueError(
+                        "Every worker must support coordinated speculative loading"
+                    )
                 if self.launch_id and (
                     info.get("launch_id") != self.launch_id
                     or info.get("backend") != self.config.launch.backend
@@ -625,11 +634,23 @@ class Coordinator:
                 )
         if body.get("adapter_path"):
             raise HTTPException(400, "Distributed adapters are not supported")
+        if "_distributed_draft" in body:
+            raise HTTPException(
+                400, "Draft configuration is managed by /v1/cluster/start"
+            )
         if not isinstance(body.get("model"), str) or not body["model"].strip():
             raise HTTPException(422, "A model identifier is required")
         revision = body.get("distributed_revision")
         if revision is not None and not isinstance(revision, str):
             raise HTTPException(422, "distributed_revision must be a string")
+        if self.draft is not None and (body["model"], revision) != self.draft_target:
+            raise HTTPException(
+                409,
+                {
+                    "code": "draft_target_mismatch",
+                    "message": "Stop and start the group to change the speculative target or draft.",
+                },
+            )
         if (
             path.endswith("/compact") or body.get("context_management")
         ) and self.config.compaction_key_file is None:
@@ -692,6 +713,17 @@ class Coordinator:
                         worker.url.rstrip("/") + path,
                         json={
                             **request,
+                            "_distributed_draft": (
+                                {
+                                    **self.draft.model_dump(),
+                                    "model": self.stager.worker_paths.get(
+                                        (self.draft_path, worker.url), self.draft_path
+                                    ),
+                                    "revision": None,
+                                }
+                                if self.draft is not None
+                                else None
+                            ),
                             "model": self.stager.worker_paths.get(
                                 (model_path, worker.url), model_path
                             ),
@@ -1146,6 +1178,7 @@ class DistributedWorker:
         )
         return {
             "protocol_version": 2,
+            "speculative_drafters": ["dflash", "mtp"],
             "inference_validated_at": getattr(self, "inference_validated_at", None),
             "instance_id": self.instance_id,
             "group_id": os.environ.get("MLX_VLM_GROUP_ID")
@@ -1177,6 +1210,46 @@ class DistributedWorker:
             raise
         report("ready")
         return result
+
+    def load_drafter(self, target, path, kind, block_size):
+        """Load replicated draft weights and agree on success before scheduling."""
+        import mlx.core as mx
+
+        from ..speculative.drafters import load_drafter, validate_drafter_compatibility
+        from .distributed_schedule import gather_json
+
+        draft = None
+        error = None
+        try:
+            path = Path(path).resolve()
+            if path.parent != self.model_dir or not (path / MANIFEST).is_file():
+                raise ValueError("Draft must be a coordinator-staged checkpoint")
+            draft, kind = load_drafter(str(path), kind=kind)
+            if kind not in {"dflash", "mtp"}:
+                raise ValueError("Distributed drafting supports DFlash/DSpark and MTP")
+            validate_drafter_compatibility(target, draft, kind)
+            mx.eval(draft.parameters())
+            draft.eval()
+        except Exception as exc:
+            error = str(exc)
+        states = gather_json(
+            self.group,
+            {
+                "phase": "draft_loading",
+                "snapshot": Path(path).name,
+                "kind": kind,
+                "block_size": block_size,
+                "error": error,
+            },
+        )
+        if any(state.get("error") for state in states):
+            raise ValueError(
+                "Distributed draft loading failed: "
+                + next(state["error"] for state in states if state.get("error"))
+            )
+        if any(state != states[0] for state in states):
+            raise ValueError("Distributed draft configurations differ")
+        return draft, kind
 
     def _load(self, model_path, adapter_path, trust_remote_code, report):
         import mlx.core as mx

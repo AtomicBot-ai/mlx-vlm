@@ -370,7 +370,7 @@ def main():
             )
         ):
             parser.error(
-                "Distributed workers load coordinator-staged models on demand; preloads, adapters and drafters are unsupported"
+                "Distributed workers load coordinator-staged models on demand; configure drafts through /v1/cluster/start instead of worker CLI flags"
             )
         if any(
             name.startswith("MLX_VLM_PRELOAD_") for name in os.environ

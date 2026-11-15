@@ -153,6 +153,13 @@ class Members(Contract):
         return value
 
 
+class SpeculativeDraft(Contract):
+    model: str = Field(min_length=1)
+    revision: str | None = None
+    kind: Literal["dflash", "mtp"] | None = None
+    block_size: int | None = Field(default=None, ge=2)
+
+
 class StartGroup(Contract):
     mode: Literal["attach", "launch"] = "attach"
     model: str | None = None
@@ -163,11 +170,24 @@ class StartGroup(Contract):
         description="Experimental fast synchronization for this managed launch; "
         "omit to use launch.fast_sync from the server configuration.",
     )
+    draft: SpeculativeDraft | None = None
 
     @model_validator(mode="after")
     def fast_sync_requires_launch(self):
         if self.fast_sync is not None and self.mode != "launch":
             raise ValueError("fast_sync requires mode='launch' and fresh workers")
+        return self
+
+    @model_validator(mode="after")
+    def draft_requires_target(self):
+        if self.draft is not None and not self.model:
+            raise ValueError("A target model is required with a speculative draft")
+        if (
+            self.draft is not None
+            and self.draft.model == self.model
+            and self.draft.revision is None
+        ):
+            self.draft = self.draft.model_copy(update={"revision": self.revision})
         return self
 
 
@@ -216,6 +236,7 @@ class Capabilities(Contract):
     generation_progress: bool = True
     stored_responses: bool = False
     previous_response_id: bool = False
+    speculative_drafters: list[str] = Field(default_factory=lambda: ["dflash", "mtp"])
     authenticated_weight_delivery: bool = True
     checkpoint_transfer: list[str] = Field(
         default_factory=lambda: ["ssh_rsync", "jaccl_rdma"]
@@ -239,6 +260,7 @@ class ClusterState(Contract):
     running_members: list[str]
     backend: str | None
     active_model: str | None
+    draft: SpeculativeDraft | None = None
     active_requests: int
     ownership: Literal["external", "server"]
     fast_sync: bool | None = None

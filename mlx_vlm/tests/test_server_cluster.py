@@ -1131,3 +1131,89 @@ async def test_failed_group_can_stop_without_contacting_dead_session_endpoints(
     assert not control.running and control.state == "stopped"
     assert operation.result["collective_disposal_acknowledged"] is False
     assert operation.result["external_restart_required"] is False
+
+
+@pytest.mark.parametrize("bundle", [False, True])
+async def test_start_stages_and_reports_speculative_draft(
+    control, monkeypatch, tmp_path, bundle
+):
+    from mlx_vlm.server.cluster_types import SpeculativeDraft
+
+    await register_pair(control)
+    monkeypatch.setattr(control, "check_model", AsyncMock())
+    monkeypatch.setattr(management.Coordinator, "_health", AsyncMock())
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    (snapshot / "config.json").write_text('{"model_type": "inkling2_dspark"}')
+    stage = AsyncMock(return_value=str(snapshot))
+    monkeypatch.setattr(control, "stage_model", stage)
+    monkeypatch.setattr(control, "load_model", AsyncMock(return_value=({}, 200)))
+    draft = SpeculativeDraft(
+        model="org/target" if bundle else "org/draft", block_size=3
+    )
+    operation = await control.begin(
+        "start", StartGroup(model="org/target", draft=draft), None
+    )
+    await asyncio.gather(*control.tasks)
+    assert operation.status == "succeeded", operation.error
+    assert stage.await_count == (1 if bundle else 2)
+    if not bundle:
+        assert stage.call_args.args[2:4] == ("org/draft", None)
+        assert stage.call_args.kwargs == {"validate_sharding": False}
+    coordinator = runtime.distributed_coordinator
+    assert coordinator.draft_target == ("org/target", None)
+    assert coordinator.draft_path == str(snapshot)
+    assert control.snapshot().draft == draft.model_copy(update={"kind": "dflash"})
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"draft": {"model": "org/draft"}},
+        {"model": "org/target", "draft": {"model": "org/draft", "block_size": 1}},
+        {"model": "org/target", "draft": {"model": "org/draft", "kind": "eagle3"}},
+    ],
+)
+def test_start_rejects_invalid_speculative_configuration(body):
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        StartGroup.model_validate(body)
+
+
+def test_bundled_draft_inherits_pinned_target_revision():
+    body = StartGroup.model_validate(
+        {"model": "org/target", "revision": "pinned", "draft": {"model": "org/target"}}
+    )
+    assert body.draft.revision == "pinned"
+    explicit = StartGroup.model_validate(
+        {
+            "model": "org/target",
+            "revision": "pinned",
+            "draft": {"model": "org/target", "revision": "different"},
+        }
+    )
+    assert explicit.draft.revision == "different"
+
+
+async def test_auto_detected_unsupported_draft_never_loads_workers(
+    control, monkeypatch, tmp_path
+):
+    await register_pair(control)
+    monkeypatch.setattr(control, "check_model", AsyncMock())
+    monkeypatch.setattr(management.Coordinator, "_health", AsyncMock())
+    (tmp_path / "config.json").write_text('{"model_type": "eagle3"}')
+    monkeypatch.setattr(control, "stage_model", AsyncMock(return_value=str(tmp_path)))
+    load = AsyncMock()
+    monkeypatch.setattr(control, "load_model", load)
+    operation = await control.begin(
+        "start",
+        StartGroup.model_validate(
+            {"model": "org/target", "draft": {"model": "org/draft"}}
+        ),
+        None,
+    )
+    await asyncio.gather(*control.tasks)
+    assert operation.status == "failed" and operation.error.code == "unsupported_draft"
+    load.assert_not_called()
+    assert runtime.distributed_coordinator is None

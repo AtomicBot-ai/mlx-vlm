@@ -368,8 +368,14 @@ native cache and replays decoder history without generating old text again.
 Close the current reader before resuming (concurrent claims return
 `continuation_busy`). Paused/completed retained sessions pin the model until
 expiry or explicit disposal with cluster stop. Stored retrieval/deletion,
-`previous_response_id`, adapters, speculative drafters, diffusion models, and
+`previous_response_id`, adapters, diffusion models, and
 custom `model_file` architectures remain unsupported. Other modality endpoints remain local-only.
+
+DFlash/DSpark and MTP drafts can be selected through
+[`POST /v1/cluster/start`](cluster-api.md#speculative-decoding). Both target and
+draft checkpoints are staged on every worker before loading; draft weights remain
+replicated. Worker CLI/environment draft settings are still rejected. Use the
+cluster start contract to configure or disable drafting for the whole group.
 
 Workers disable automatic prefix caching, vision caching, and the expiring
 chat-compaction cache. These independent caches could otherwise skip work on

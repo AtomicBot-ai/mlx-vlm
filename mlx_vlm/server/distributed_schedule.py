@@ -14,11 +14,14 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from .cluster_types import SpeculativeDraft
+
 
 @dataclass
 class RequestScope:
     request_id: str
     sequence: int = 0
+    draft: SpeculativeDraft | None = None
 
     def next_id(self):
         self.sequence += 1

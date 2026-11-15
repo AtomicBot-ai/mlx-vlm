@@ -44,6 +44,7 @@ from .generation import (
     ResponseGenerator,
     ServerMetricsStore,
     _build_metrics_envelope,
+    _get_draft_block_size_from_env,
     get_configured_context_limit,
     get_kv_group_size,
     get_kv_quant_scheme,
@@ -52,6 +53,7 @@ from .generation import (
     get_quantized_kv_split_bits,
     get_quantized_kv_start,
     get_top_logprobs_k,
+    load_local_drafter,
 )
 from .meshes import register_routes as register_mesh_routes
 from .model_discovery import MODEL_PATHS_ENV, discover_models, model_reasoning_efforts
@@ -662,6 +664,25 @@ def get_cached_model(
         )
 
 
+def _draft_generator_options(draft):
+    """Resolve serving policy before handing draft loading to the GPU thread."""
+    worker = runtime.distributed_worker
+    if worker is not None:
+        return dict(
+            draft_model_path=draft.model if draft is not None else None,
+            draft_kind=draft.kind if draft is not None else None,
+            draft_block_size=draft.block_size if draft is not None else None,
+            draft_loader=worker.load_drafter if draft is not None else None,
+        )
+    cfg = runtime.config
+    return dict(
+        draft_model_path=cfg.draft_model or os.environ.get("MLX_VLM_DRAFT_MODEL"),
+        draft_kind=cfg.draft_kind or os.environ.get("MLX_VLM_DRAFT_KIND"),
+        draft_block_size=_get_draft_block_size_from_env(),
+        draft_loader=load_local_drafter,
+    )
+
+
 def _get_cached_model(
     model_path: str,
     adapter_path=_INHERIT_ADAPTER,
@@ -719,6 +740,13 @@ def _get_cached_model(
         effective_model_kind,
         runtime.config.fingerprint(kinds={effective_model_kind}),
     )
+    draft = None
+    if runtime.distributed_worker is not None:
+        from .distributed_schedule import request_scope
+
+        scope = request_scope.get()
+        draft = scope.draft if scope is not None else None
+        cache_key += (draft.model_dump_json() if draft is not None else None,)
     if revision is not None:
         cache_key += (revision,)
     cached_cache = registry.for_kind(cache_group)
@@ -1062,6 +1090,7 @@ def _get_cached_model(
     progress("starting")
     response_generator = None
     try:
+        draft_options = _draft_generator_options(draft)
         response_generator = ResponseGenerator(
             model_path=model_path,
             adapter_path=adapter_path,
@@ -1076,8 +1105,7 @@ def _get_cached_model(
             quantized_kv_start=quantized_kv_start,
             top_logprobs_k=get_top_logprobs_k(),
             apc_manager=runtime.apc_manager,
-            draft_model_path=cfg.draft_model,
-            draft_kind=cfg.draft_kind,
+            **draft_options,
             load_progress_callback=progress.update,
         )
         model, processor, config = response_generator.wait_until_ready()
@@ -1349,7 +1377,21 @@ async def route_distributed_request(request: Request, call_next):
                 raise HTTPException(
                     400, "Send requests through the distributed coordinator"
                 )
-            token = request_scope.set(RequestScope(request_id))
+            from pydantic import ValidationError
+
+            from .cluster_types import SpeculativeDraft
+
+            try:
+                draft = (
+                    SpeculativeDraft.model_validate(body["_distributed_draft"])
+                    if body.get("_distributed_draft") is not None
+                    else None
+                )
+            except ValidationError as error:
+                raise HTTPException(
+                    422, "Invalid coordinated draft configuration"
+                ) from error
+            token = request_scope.set(RequestScope(request_id, draft=draft))
             try:
                 return await call_next(request)
             finally:

@@ -467,6 +467,7 @@ class ClusterManager:
             active_model=(
                 coordinator.model[0] if coordinator and coordinator.model else None
             ),
+            draft=coordinator.draft if coordinator else None,
             active_requests=coordinator.active if coordinator else 0,
             ownership=(
                 "server" if coordinator and coordinator.launcher else "external"
@@ -478,11 +479,22 @@ class ClusterManager:
             ),
             memory=self.aggregate(),
             capabilities=Capabilities(
+                speculative_drafters=[
+                    kind
+                    for kind in ("dflash", "mtp")
+                    if all(
+                        kind
+                        in (self.nodes[n].identity.worker or {}).get(
+                            "speculative_drafters", []
+                        )
+                        for n in self.running
+                    )
+                ],
                 resumable=not self.running
                 or all(
                     (self.nodes[n].identity.worker or {}).get("protocol_version") == 2
                     for n in self.running
-                )
+                ),
             ),
             operation_id=self.current,
         )
@@ -794,7 +806,11 @@ class ClusterManager:
                             expected = coordinator.stager.worker_paths.get(
                                 (staged, worker.url), staged
                             )
-                            measured = info.get("load_progress") or {}
+                            measured = (
+                                data.get("model_load_progress")
+                                or info.get("load_progress")
+                                or {}
+                            )
                             node["stage"] = "waiting_for_load"
                             if measured.get("model") == expected:
                                 node.update(measured)
@@ -853,6 +869,10 @@ class ClusterManager:
                     retryable=True,
                 )
             coordinator = Coordinator(config)
+            coordinator.draft = body.draft
+            coordinator.draft_target = (
+                (body.model, body.revision) if body.draft else None
+            )
             coordinator.stager.transfers = self.transfers
             if config.launch:
                 if config.launch.backend != self.backend:
@@ -938,6 +958,30 @@ class ClusterManager:
                 staged = await self.stage_model(
                     operation, coordinator.stager, body.model, body.revision
                 )
+                if body.draft is not None:
+                    from ..speculative.drafters import resolve_drafter_kind
+
+                    draft = body.draft
+                    if (draft.model, draft.revision) == (body.model, body.revision):
+                        draft_path = staged
+                    else:
+                        await self.phase(operation, "preparing_draft")
+                        draft_path = await self.stage_model(
+                            operation,
+                            coordinator.stager,
+                            draft.model,
+                            draft.revision,
+                            validate_sharding=False,
+                        )
+                    kind = resolve_drafter_kind(Path(draft_path), draft.kind)
+                    if kind not in {"dflash", "mtp"}:
+                        fail(
+                            "unsupported_draft",
+                            "Distributed drafting supports DFlash/DSpark and MTP.",
+                            422,
+                        )
+                    coordinator.draft = draft.model_copy(update={"kind": kind})
+                    coordinator.draft_path = draft_path
                 _, status = await self.load_model(operation, coordinator, body, staged)
                 if status >= 400:
                     fail(
