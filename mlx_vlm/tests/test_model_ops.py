@@ -1617,8 +1617,16 @@ def test_transform_modelopt_leaves_other_fp8_exports_unchanged(moe_quant_algo):
     assert quantization is None
 
 
-@pytest.mark.parametrize("family", ["deepseek_v4", "deepseek_v41"])
-def test_deepseek_mixed_fp8_nvfp4_strict_load(tmp_path, family):
+@pytest.mark.parametrize(
+    "family, expert_mode, scale_fmt",
+    [
+        ("deepseek_v4", "nvfp4", "ue8m0"),
+        ("deepseek_v41", "nvfp4", "ue8m0"),
+        ("deepseek_v4", "mxfp4", "ue8m0"),
+        ("deepseek_v4", "mxfp4", "e8m0"),
+    ],
+)
+def test_deepseek_mixed_fp8_fp4_strict_load(tmp_path, family, expert_mode, scale_fmt):
     module = importlib.import_module(f"mlx_vlm.models.{family}")
     config = module.ModelConfig.from_dict(
         dict(
@@ -1643,6 +1651,12 @@ def test_deepseek_mixed_fp8_nvfp4_strict_load(tmp_path, family):
             kv_source_layer_ids=[],
             index_source_layer_ids=[],
             vision_num_layers=0,
+            vision_n_layers=1 if family == "deepseek_v4" else 0,
+            vision_dim=8,
+            vision_n_heads=2,
+            vision_inter_dim=12,
+            vision_patch_size=2,
+            vision_downsample_ratio=2,
             hc_mult=2,
             hc_sinkhorn_iters=2,
         )
@@ -1661,16 +1675,25 @@ def test_deepseek_mixed_fp8_nvfp4_strict_load(tmp_path, family):
             name = {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"}[projection]
             decoded = []
             for e in range(2):
-                factor = mx.array(0.137 + e * 0.211, mx.float32)
-                packed, scales = mx.quantize(value[e] / factor, mode="nvfp4")
+                factor = mx.array(
+                    0.137 + e * 0.211 if expert_mode == "nvfp4" else 1.0, mx.float32
+                )
+                packed, scales = mx.quantize(value[e] / factor, mode=expert_mode)
                 prefix = f"{root}.experts.{e}.{name}"
-                raw[prefix + ".weight"] = packed.view(mx.uint8)
-                raw[prefix + ".weight_scale"] = scales
-                raw[prefix + ".weight_scale_2"] = factor
-                decoded.append(mx.dequantize(packed, scales, mode="nvfp4") * factor)
+                if expert_mode == "nvfp4":
+                    raw[prefix + ".weight"] = packed.view(mx.uint8)
+                    raw[prefix + ".weight_scale"] = scales
+                    raw[prefix + ".weight_scale_2"] = factor
+                else:
+                    # Released DeepSeek-V4 packs two FP4 values per signed byte.
+                    raw[prefix + ".weight"] = packed.view(mx.int8)
+                    raw[prefix + ".scale"] = scales
+                decoded.append(mx.dequantize(packed, scales, mode=expert_mode) * factor)
             expected_weights[key] = mx.stack(decoded)
-        elif key.endswith(".weight") and (
-            ".attn.w" in key or ".ffn.shared_experts." in key
+        elif (
+            source_key.startswith("model.")
+            and key.endswith(".weight")
+            and (".attn.w" in key or ".ffn.shared_experts." in key)
         ):
             shape = value.shape
             encoded = mx.to_fp8(value.reshape(-1, shape[-1]))
@@ -1689,22 +1712,33 @@ def test_deepseek_mixed_fp8_nvfp4_strict_load(tmp_path, family):
     saved_config = asdict(config)
     saved_config["quantization_config"] = {
         "quant_method": "fp8",
-        "quant_algo": "MIXED_PRECISION",
-        "moe_quant_algo": "NVFP4",
+        "fmt": "e4m3",
         "weight_block_size": [128, 128] if family == "deepseek_v4" else [32, 32],
-        "scale_fmt": "ue8m0",
+        "scale_fmt": scale_fmt,
     }
+    if expert_mode == "nvfp4":
+        saved_config["quantization_config"].update(
+            quant_algo="MIXED_PRECISION", moe_quant_algo="NVFP4"
+        )
+    else:
+        saved_config["expert_dtype"] = "fp4"
     (tmp_path / "config.json").write_text(json.dumps(saved_config))
     mx.save_safetensors(str(tmp_path / "model.safetensors"), raw)
     loaded = load_model(tmp_path, strict=True, lazy=False)
     expert = loaded.layers[0].ffn.switch_mlp.gate_proj
-    assert isinstance(expert, ScaledQuantizedSwitchLinear)
-    assert expert.mode == "nvfp4"
-    assert expert.group_size == 16
-    assert mx.allclose(expert.global_scale, mx.array([0.137, 0.348])).item()
+    assert expert.mode == expert_mode
+    if expert_mode == "nvfp4":
+        assert isinstance(expert, ScaledQuantizedSwitchLinear)
+        assert expert.group_size == 16
+        assert mx.allclose(expert.global_scale, mx.array([0.137, 0.348])).item()
+    else:
+        assert expert.group_size == 32
+        assert expert.bits == 4
     if family == "deepseek_v4":
         assert loaded.layers[0].attn.wq_a.mode == "mxfp8"
         assert loaded.layers[0].ffn.shared_experts.gate_proj.mode == "mxfp8"
+        for key, value in tree_flatten(loaded.vision.parameters()):
+            assert mx.array_equal(value, expected_weights["vision." + key]).item()
     reference.load_weights(list(expected_weights.items()))
     tokens = mx.array([[0, 42, 1]])
     expected = reference(tokens).logits

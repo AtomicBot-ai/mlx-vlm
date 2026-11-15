@@ -22,6 +22,9 @@ def make_quantization_config(config: dict) -> dict | None:
         and quantization.get("fmt", "e4m3") == "e4m3"
         and quantization.get("weight_block_size") == [128, 128]
         and quantization.get("store_dtype", "fp8") == "fp8"
+        # This converter requires floating-point scales. Exponent-only scale
+        # bytes must retain their architecture-specific loading path.
+        and quantization.get("scale_fmt") not in ("ue8m0", "e8m0")
     )
     return dict(MLX_MXFP8_QUANTIZATION) if is_supported else None
 
