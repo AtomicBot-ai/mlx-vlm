@@ -7137,6 +7137,15 @@ def test_lfm3_omni_quantized_checkpoint_roundtrip(tmp_path, lfm3_omni):
     np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
 
 
+class TestSkipMultimodalModule:
+    def test_gemma4_projectors(self):
+        from mlx_vlm.utils import skip_multimodal_module
+
+        assert skip_multimodal_module("embed_vision.embedding_projection")
+        assert skip_multimodal_module("embed_audio.embedding_projection")
+        assert not skip_multimodal_module("language_model.model.layers.0.mlp.gate_proj")
+
+
 class TestEncoderActivations:
     """Checkpoint activation names select the matching values and gradients."""
 

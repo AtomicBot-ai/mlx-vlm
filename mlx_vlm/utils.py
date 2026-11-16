@@ -164,6 +164,7 @@ def skip_multimodal_module(path: str) -> bool:
         "sam_model",
         "audio_model",
         "audio_tower",
+        "embed_audio",
         "code_predictor",
         "img_projector",
         "multi_modal_projector",
