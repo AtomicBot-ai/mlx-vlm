@@ -15,6 +15,7 @@ from mlx.utils import tree_flatten
 
 from mlx_vlm.tests.test_models import tiny_config
 from mlx_vlm.trainer.datasets.next_token import VisionDataset
+from mlx_vlm.trainer.peft import DoRAEmbedding
 from mlx_vlm.trainer.peft.lora import LoRaLayer
 from mlx_vlm.trainer.peft.lora_layers import LoRALinear
 from mlx_vlm.trainer.peft.utils import (
@@ -32,6 +33,21 @@ from mlx_vlm.trainer.vlm.cross_entropy.trainer import (
 from mlx_vlm.utils import load
 
 # Training workflows, adapter loading and numerical gradient contracts.
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+def test_dora_embedding_rejects_only_quantized_weights(quantized):
+    embedding = nn.Embedding(8, 64)
+    if quantized:
+        embedding = nn.QuantizedEmbedding.from_embedding(
+            embedding, group_size=64, bits=4
+        )
+        with pytest.raises(ValueError, match="does not yet support quantization"):
+            DoRAEmbedding.from_base(embedding, r=2)
+    else:
+        adapter = DoRAEmbedding.from_base(embedding, r=2)
+        ids = mx.array([1, 2])
+        assert mx.allclose(adapter(ids), embedding(ids), atol=1e-5).item()
 
 
 @pytest.fixture
