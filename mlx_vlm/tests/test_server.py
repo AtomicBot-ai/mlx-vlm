@@ -52,6 +52,7 @@ from mlx_vlm import apc, sample_utils
 from mlx_vlm.apc import hash_image_payload
 from mlx_vlm.generate import GenerationResult
 from mlx_vlm.generate.image import ImageGenerationResult
+from mlx_vlm.load_progress import ModelLoadCancelled
 from mlx_vlm.models.cache import KVCache
 from mlx_vlm.models.gpt_oss.processing_gpt_oss import (
     HARMONY_RESPONSE_TEMPLATE,
@@ -1620,6 +1621,8 @@ def _reset_runtime(monkeypatch, **overrides):
         model_cache=server.ModelCacheRegistry(),
         response_generator=None,
         model_load_progress=None,
+        preload_in_progress=False,
+        preload_failures={},
         apc_manager=None,
     )
     for name, value in (state | overrides).items():
@@ -2060,6 +2063,35 @@ def test_model_resources_forward_loading_observer(monkeypatch, distributed):
         "demo", None, progress_callback=events.append
     ) == (model, processor, model.config)
     assert events == [{"stage": "loading_checkpoint"}]
+
+
+def test_cancelled_loader_releases_partial_weights(monkeypatch, caplog):
+    owners = []
+
+    class Weights:
+        pass
+
+    def load(*args, progress_callback, **kwargs):
+        weights = Weights()
+        owners.append(weakref.ref(weights))
+        progress_callback({"stage": "evaluating_layers"})
+
+    def cancel(event):
+        raise ModelLoadCancelled("shutdown")
+
+    monkeypatch.setattr(generation, "load", load)
+    monkeypatch.setattr(server.runtime, "distributed_worker", None)
+    gen = _generator(load_progress_callback=cancel)
+    worker = Thread(target=gen._run)
+    worker.start()
+    worker.join(5)
+    assert not worker.is_alive()
+    assert gen._ready.is_set()
+    assert isinstance(gen._load_error, ModelLoadCancelled)
+    assert gen._load_error.__traceback__ is None
+    gc.collect()
+    assert owners[0]() is None
+    assert not any(r.levelno >= logging.ERROR for r in caplog.records)
 
 
 def test_server_caches_apc_mode_when_model_initializes(monkeypatch):
@@ -6994,7 +7026,10 @@ class TestResponseGenerator:
             monkeypatch.setenv("MLX_VLM_PRELOAD_" + key, kind)
         calls = []
 
-        def load(model_path, adapter_path=None, *, model_kind="auto"):
+        def load(
+            model_path, adapter_path=None, *, model_kind="auto", cancel_event=None
+        ):
+            assert (cancel_event is not None) == (model_kind == "text_generation")
             calls.append(model_kind)
             if model_kind == "audio_stt":
                 raise server.HTTPException(
@@ -7008,7 +7043,12 @@ class TestResponseGenerator:
 
         async def run():
             async with server._app_module.lifespan(server.app):
-                pass
+
+                async def wait_for_preloads():
+                    while server.runtime.preload_in_progress:
+                        await asyncio.sleep(0.001)
+
+                await asyncio.wait_for(wait_for_preloads(), 5)
 
         asyncio.run(run())
         assert calls == list(kinds.values())
@@ -7782,6 +7822,204 @@ def settings_client(monkeypatch, tmp_path):
         if not generator.stopped:
             generator.stop_and_join()
     client.close()
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_startup_preload_serves_progress_and_recovers(
+    settings_client, monkeypatch, fail
+):
+    _, generators = settings_client
+    for key in list(os.environ):
+        if key.startswith("MLX_VLM_PRELOAD_"):
+            monkeypatch.delenv(key)
+    monkeypatch.setenv("MLX_VLM_PRELOAD_MODEL", "demo")
+    monkeypatch.setenv("MLX_VLM_SERVER_API_KEY", "test-key")
+    entered, release = Event(), Event()
+    generator_class = server._app_module.ResponseGenerator
+    ready = generator_class.wait_until_ready
+
+    def loading(self):
+        self.load_progress_callback(
+            {"stage": "evaluating_layers", "completed_layers": 1, "total_layers": 2}
+        )
+        entered.set()
+        assert release.wait(5)
+        if fail and len(generators) == 1:
+            raise ValueError("broken checkpoint")
+        return ready(self)
+
+    monkeypatch.setattr(generator_class, "wait_until_ready", loading)
+    monkeypatch.setattr(
+        generator_class,
+        "_cpu_preprocess",
+        lambda *a, **k: {"input_ids": np.array([[1, 2, 3]])},
+        raising=False,
+    )
+    monkeypatch.setattr(openai, "apply_chat_template", lambda *a, **k: "prompt")
+    monkeypatch.setattr(
+        openai,
+        "_build_gen_args",
+        lambda *a, **k: NS(
+            to_template_kwargs=lambda: {}, preprocessing_kwargs=lambda: {}
+        ),
+    )
+
+    async def check():
+        async with server._app_module.lifespan(server.app):
+            # Lifespan startup has returned while the loader is still blocked.
+            try:
+                assert await asyncio.to_thread(entered.wait, 2)
+                async with httpx2.AsyncClient(
+                    transport=httpx2.ASGITransport(app=server.app),
+                    base_url="http://test",
+                    headers={"Authorization": "Bearer test-key"},
+                ) as client:
+                    denied = await client.get(
+                        "/health", headers={"Authorization": "wrong"}
+                    )
+                    assert denied.status_code == 401
+                    health = await asyncio.wait_for(client.get("/health"), 1)
+                    body = health.json()
+                    assert body["status"] == "healthy" and not body["model_ready"]
+                    assert body["preload_in_progress"] and body["loaded_model"] is None
+                    assert body["model_load_progress"]["stage_percent"] == 50.0
+                    metrics = (await client.get("/metrics")).json()["server"]
+                    assert metrics["model_load_progress"] == body["model_load_progress"]
+                    for route in (
+                        "/v1/responses",
+                        "/v1/chat/completions",
+                        "/v1/messages",
+                        "/v1/responses/input_tokens",
+                    ):
+                        pending = await client.post(
+                            route,
+                            json={
+                                "model": "demo",
+                                "input": "Hello",
+                                "messages": [{"role": "user", "content": "Hello"}],
+                                "max_tokens": 8,
+                            },
+                        )
+                        assert pending.status_code == 503
+                        assert pending.json()["detail"]["code"] == "model_loading"
+                        assert pending.headers["Retry-After"] == "1"
+                    assert (await client.post("/unload")).status_code == 409
+                    assert (
+                        await client.patch("/v1/settings", json={})
+                    ).status_code == 409
+                    assert len(generators) == 1
+                    release.set()
+
+                    async def finished():
+                        while server.runtime.preload_in_progress:
+                            await asyncio.sleep(0.001)
+
+                    await asyncio.wait_for(finished(), 2)
+                    body = (await client.get("/health")).json()
+                    assert body["model_ready"] is not fail
+                    assert body["model_load_progress"]["stage"] == (
+                        "failed" if fail else "ready"
+                    )
+                    if fail:
+                        assert generators[0].stopped
+                        assert (
+                            body["preload_failures"]["text_generation"]["error"]
+                            == "broken checkpoint"
+                        )
+                    # Successful preloads are reused; failed ones can be retried normally.
+                    retry = await client.post(
+                        "/v1/responses/input_tokens",
+                        json={"model": "demo", "input": "Hello"},
+                    )
+                    assert retry.status_code == 200
+                    assert len(generators) == (2 if fail else 1)
+                    assert (await client.get("/health")).json()["model_ready"]
+            finally:
+                release.set()
+        assert all(g.stopped for g in generators)
+        assert (
+            not server.runtime.model_cache and server.runtime.response_generator is None
+        )
+
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("cancel_shutdown", [False, True])
+def test_shutdown_cancels_preload_at_next_boundary(
+    settings_client, monkeypatch, cancel_shutdown
+):
+    _, generators = settings_client
+    monkeypatch.setenv("MLX_VLM_PRELOAD_MODEL", "demo")
+    monkeypatch.setenv("MLX_VLM_PRELOAD_MESH_MODEL", "must-not-start")
+    entered, release = Event(), Event()
+    generator_class = server._app_module.ResponseGenerator
+    ready = Mock(wraps=generator_class.wait_until_ready)
+
+    def loading(self):
+        self.load_progress_callback(
+            {"stage": "evaluating_layers", "completed_layers": 0, "total_layers": 2}
+        )
+        entered.set()
+        # Stand in for one indivisible native evaluation already in progress.
+        assert release.wait(5)
+        self.load_progress_callback(
+            {"stage": "evaluating_layers", "completed_layers": 1, "total_layers": 2}
+        )
+        return ready(self)
+
+    monkeypatch.setattr(generator_class, "wait_until_ready", loading)
+    mesh = Mock(side_effect=AssertionError("Shutdown must skip the next preload"))
+    monkeypatch.setattr(server._app_module, "load_3d_model", mesh)
+
+    async def check():
+        context = server._app_module.lifespan(server.app)
+        await context.__aenter__()
+        assert await asyncio.to_thread(entered.wait, 2)
+        closing = asyncio.create_task(context.__aexit__(None, None, None))
+        try:
+            await asyncio.sleep(0.05)
+            if cancel_shutdown:
+                closing.cancel()
+                await asyncio.sleep(0)
+            assert not closing.done() and not generators[0].stopped
+        finally:
+            release.set()
+            if cancel_shutdown:
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(closing, 2)
+            else:
+                await asyncio.wait_for(closing, 2)
+        assert generators[0].stopped and not server.runtime.model_cache
+        assert not server.runtime.preload_in_progress
+        assert not server.runtime.preload_failures
+        ready.assert_not_called()
+        mesh.assert_not_called()
+
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("when", ["before_start", "after_initialize"])
+def test_preload_cancellation_does_not_publish_model(settings_client, when):
+    _, generators = settings_client
+    stopping = Event()
+    if when == "before_start":
+        stopping.set()
+
+    original = server._app_module.ResponseGenerator.wait_until_ready
+
+    def ready(self):
+        result = original(self)
+        stopping.set()
+        return result
+
+    with patch.object(server._app_module.ResponseGenerator, "wait_until_ready", ready):
+        with pytest.raises(ModelLoadCancelled):
+            server._app_module.get_cached_model("demo", cancel_event=stopping)
+    assert len(generators) == (when == "after_initialize")
+    assert all(g.stopped for g in generators)
+    assert not server.runtime.model_cache
+    assert server.runtime.response_generator is None
+    assert server.runtime.apc_manager is None
 
 
 @pytest.mark.parametrize("fail", [False, True])

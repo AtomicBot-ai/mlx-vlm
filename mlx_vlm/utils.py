@@ -24,7 +24,12 @@ from PIL import Image, ImageOps
 from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
 
-from .load_progress import LoadingProgress, ProgressCallback, evaluate_model
+from .load_progress import (
+    LoadingProgress,
+    ModelLoadCancelled,
+    ProgressCallback,
+    evaluate_model,
+)
 from .models.base import BaseImageProcessor
 from .quantization.checkpoint import (
     merge_quantization_configs,
@@ -899,7 +904,8 @@ def load(
         progress_callback: Optional callable receiving stage, elapsed time and
             measured file/layer counts. Callbacks run on the loading thread.
             ``loaded`` means model/processor loading finished; with lazy=True,
-            parameter evaluation is still deferred. Exceptions report ``failed``.
+            parameter evaluation is still deferred. ModelLoadCancelled reports
+            ``cancelled``; other exceptions report ``failed``.
         quantize_activations (bool, optional): If True, convert QuantizedLinear layers
             to QQLinear layers for activation quantization. Only supported for models
             quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
@@ -943,10 +949,13 @@ def load(
             processor.image_processor = image_processor
         if hasattr(model, "attach_processor"):
             model.attach_processor(processor)
+        report("loaded", lazy=lazy)
+    except ModelLoadCancelled:
+        report("cancelled")
+        raise
     except BaseException:
         report("failed")
         raise
-    report("loaded", lazy=lazy)
     return model, processor
 
 

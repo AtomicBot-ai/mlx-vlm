@@ -35,6 +35,7 @@ from ..generate.diffusion import (
     is_diffusion_model,
     stream_diffusion_generate_from_kwargs,
 )
+from ..load_progress import ModelLoadCancelled
 from ..models.cache import cache_nbytes
 from ..sample_utils import (
     apply_p_less,
@@ -660,6 +661,8 @@ def load_model_resources(
         config = model.config
         logger.info("Model and processor loaded successfully.")
         return model, processor, config
+    except ModelLoadCancelled:
+        raise
     except Exception as e:
         logger.exception("Error loading model %s: %s", model_path, e)
         raise HTTPException(status_code=400, detail=f"Failed to load model: {e}")
@@ -2136,6 +2139,12 @@ class ResponseGenerator:
         """Own batch scheduling and publish each decode phase before prefill."""
         try:
             self._initialize_model()
+        except ModelLoadCancelled as e:
+            # Do not retain loader frames and their partially materialized weights.
+            self._load_error = ModelLoadCancelled(str(e))
+            self._ready.set()
+            logger.info("Model loading cancelled: %s", self.model_path)
+            return
         except Exception as e:
             self._load_error = e
             self._ready.set()

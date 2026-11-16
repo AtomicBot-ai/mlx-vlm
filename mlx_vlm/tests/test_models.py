@@ -4722,6 +4722,37 @@ def test_layer_loading_progress_follows_evaluation(monkeypatch):
         assert mx.array_equal(value, expected[key])
 
 
+@pytest.mark.parametrize("stage", ["loading_checkpoint", "loaded"])
+def test_loading_cancellation_skips_remaining_files_and_layers(tmp_path, stage):
+    from mlx_vlm import utils
+    from mlx_vlm.load_progress import ModelLoadCancelled, evaluate_model
+
+    _write_checkpoint(tmp_path)
+    events = []
+
+    def cancel(event):
+        events.append(event)
+        if event["stage"] == stage or event.get("completed_layers") == 1:
+            raise ModelLoadCancelled("shutdown")
+
+    with (
+        patch.object(utils, "_load_safetensors", wraps=utils._load_safetensors) as read,
+        patch.object(utils, "load_processor", return_value=object()),
+        patch.object(utils, "load_image_processor", return_value=None),
+    ):
+        with pytest.raises(ModelLoadCancelled):
+            utils.load(str(tmp_path), progress_callback=cancel)
+    assert read.call_count == (stage == "loaded")
+    assert events[-1]["stage"] == "cancelled"
+
+    model = nn.Module()
+    model.layers = [nn.Linear(4, 4), nn.Linear(4, 4)]
+    with patch.object(mx, "eval", wraps=mx.eval) as evaluate:
+        with pytest.raises(ModelLoadCancelled):
+            evaluate_model(model, cancel)
+    assert evaluate.call_count == 1
+
+
 def test_qwen3_omni_audio_batch_matches_repeated_input():
     from mlx_vlm.models.qwen3_omni_moe.audio import AudioModel
     from mlx_vlm.models.qwen3_omni_moe.config import AudioConfig
