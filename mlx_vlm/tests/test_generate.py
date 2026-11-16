@@ -2274,6 +2274,22 @@ def test_sampling_filter_matches_numpy(name, values, reference, tolerance):
         assert (output != -mx.inf).tolist() == [True, False, False, False, False]
 
 
+@pytest.mark.parametrize("special_tokens", [[], [0]])
+@pytest.mark.parametrize("probability", [0.0, 1.0])
+def test_xtc_keeps_the_same_candidates_alone_and_in_a_batch(
+    special_tokens, probability
+):
+    scores = mx.log(
+        mx.array([[0.7, 0.2, 0.1], [0.34, 0.33, 0.33], [0.98, 0.015, 0.005]])
+    )
+    batched = sampling.apply_xtc(scores, probability, 0.1, special_tokens)
+    individual = mx.stack(
+        [sampling.apply_xtc(row, probability, 0.1, special_tokens) for row in scores]
+    )
+    assert mx.array_equal(batched, individual).item()
+    assert mx.all(mx.any(mx.isfinite(batched), axis=-1)).item()
+
+
 @pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
 @pytest.mark.parametrize(
     "typical_p,expected",
