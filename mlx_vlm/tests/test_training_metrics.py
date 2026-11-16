@@ -183,8 +183,8 @@ def test_preference_losses_report_metrics_without_changing_objectives():
         elif kind == "ipo":
             expected = (logits - 5) ** 2
         else:
-            expected = -nn.log_sigmoid(0.1 * logits) + 50 * mx.maximum(
-                reference - chosen, 0
+            expected = -nn.log_sigmoid(
+                0.1 * (logits - 50 * mx.maximum(reference - chosen, 0))
             )
         assert mx.allclose(losses, expected).item()
     losses, metrics = orpo_objective(chosen, rejected)
@@ -197,6 +197,34 @@ def test_preference_losses_report_metrics_without_changing_objectives():
     )
     assert mx.allclose(legacy_loss, losses.mean()).item()
     assert isinstance(legacy_metrics, dict)
+
+
+@pytest.mark.parametrize(
+    "chosen,beta,delta",
+    [(-2.0, 0.1, 50.0), (-0.5, 0.1, 50.0), (-2.0, 0.3, 50.0), (-2.0, 0.1, 0.0)],
+)
+def test_dpop_loss_and_gradients_match_equation_3(chosen, beta, delta):
+    # https://arxiv.org/html/2402.13228v2#S4
+    def loss(scores):
+        losses, _ = dpo_objective(
+            scores[:1],
+            scores[1:],
+            mx.array([-1.0]),
+            mx.array([-2.0]),
+            beta=beta,
+            delta=delta,
+            loss_type="dpop",
+        )
+        return losses.sum()
+
+    margin = beta * (chosen + 2.0 - delta * max(-1.0 - chosen, 0.0))
+    slope = 1.0 / (1.0 + math.exp(margin))
+    chosen_scale = 1.0 + delta if chosen < -1.0 else 1.0
+    scores = mx.array([chosen, -3.0])
+    assert loss(scores).item() == pytest.approx(math.log1p(math.exp(-margin)))
+    assert mx.grad(loss)(scores).tolist() == pytest.approx(
+        [-beta * chosen_scale * slope, beta * slope]
+    )
 
 
 @pytest.mark.parametrize("compiled", [False, True])

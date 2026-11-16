@@ -30,7 +30,7 @@ def dpo_objective(
         penalty = mx.maximum(
             mx.zeros_like(policy_chosen), reference_chosen - policy_chosen
         )
-        losses = -nn.log_sigmoid(beta * logits) + delta * penalty
+        losses = -nn.log_sigmoid(beta * (logits - delta * penalty))
     else:
         raise ValueError("loss_type must be sigmoid, hinge, ipo, or dpop.")
     chosen_reward = beta * (policy_chosen - reference_chosen)
