@@ -1,4 +1,3 @@
-import inspect
 import json
 import warnings
 from enum import Enum
@@ -902,17 +901,6 @@ def get_chat_template(
 
     chat_template_override = kwargs.get("chat_template", None)
 
-    def _supports_template_kw(template_processor: Any, name: str) -> bool:
-        try:
-            signature = inspect.signature(template_processor.apply_chat_template)
-        except (TypeError, ValueError):
-            return False
-
-        return name in signature.parameters or any(
-            parameter.kind == inspect.Parameter.VAR_KEYWORD
-            for parameter in signature.parameters.values()
-        )
-
     def _template_references_kw(template_processor: Any, name: str) -> bool:
         templates = [
             chat_template_override,
@@ -969,16 +957,17 @@ def get_chat_template(
         if "tools" in template_kwargs:
             # Equivalent schemas must render the same token prefix for APC.
             template_kwargs["tools"] = _sort_tool_schema_keys(template_kwargs["tools"])
-        if "enable_thinking" not in template_kwargs and _supports_template_kw(
-            template_processor, "enable_thinking"
-        ):
-            template_kwargs["enable_thinking"] = False
+        # Omission (or None) preserves both Python and Jinja template defaults.
+        if template_kwargs.get("enable_thinking") is None:
+            template_kwargs.pop("enable_thinking", None)
         if (
             "thinking_mode" not in template_kwargs
-            and template_kwargs.get("enable_thinking") is True
+            and isinstance(template_kwargs.get("enable_thinking"), bool)
             and _template_references_kw(template_processor, "thinking_mode")
         ):
-            template_kwargs["thinking_mode"] = "enabled"
+            template_kwargs["thinking_mode"] = (
+                "enabled" if template_kwargs["enable_thinking"] else "disabled"
+            )
 
         try:
             return template_processor.apply_chat_template(
@@ -1179,8 +1168,5 @@ def apply_chat_template(
     # Some models only need the last message
     if model_type in ["paligemma", "florence2", "falcon_ocr"]:
         return messages[-1]
-
-    if model_type == "qwen3_omni_moe" and "enable_thinking" not in kwargs:
-        kwargs["enable_thinking"] = True
 
     return get_chat_template(processor, messages, add_generation_prompt, **kwargs)
