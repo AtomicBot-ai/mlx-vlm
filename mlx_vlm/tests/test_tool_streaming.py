@@ -148,6 +148,21 @@ INT_TOOLS = [
     }
 ]
 
+ARRAY_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "run_batch",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "calls": {"type": "array"},
+                },
+            },
+        },
+    }
+]
+
 NO_PARAM_TOOLS = [
     {
         "type": "function",
@@ -184,6 +199,12 @@ NO_PARAM_TOOLS = [
             INT_TOOLS,
             "<tool_call><function=write_file><parameter=count>twenty</parameter>"
             "<parameter=content>x</parameter></function></tool_call>",
+            [],
+        ),
+        (
+            "qwen3_coder",
+            ARRAY_TOOLS,
+            '<tool_call><function=run_batch><parameter=calls>[{"arguments": {"cwd": "/workspace/project-a"}, {"arguments": {}}, {"arguments": {"cwd": "/workspace/project-b"}}]</parameter></function></tool_call>',
             [],
         ),
     ],
