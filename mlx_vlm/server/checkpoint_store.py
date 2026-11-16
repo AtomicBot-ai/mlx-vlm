@@ -15,6 +15,7 @@ import json
 import os
 import re
 import stat
+import struct
 import sys
 import threading
 import uuid
@@ -23,6 +24,10 @@ from pathlib import Path
 
 CHUNK_BYTES = 16 * 1024 * 1024
 MANIFEST = ".mlx-vlm-distributed.json"
+# Darwin getattrlist constants from <sys/attr.h>.
+ATTR_BIT_MAP_COUNT = 5
+ATTR_VOL_UUID = 0x00040000
+ATTR_VOL_INFO = 0x80000000
 
 
 def cancelled(stop):
@@ -30,11 +35,44 @@ def cancelled(stop):
         raise InterruptedError("Checkpoint preparation cancelled")
 
 
+def _volume_identity(path, device):
+    # Darwin assigns st_dev at mount time; it is not a persistent volume ID.
+    # getattrlist's ATTR_VOL_UUID is stable across reboots. Unsupported filesystems
+    # retain the conservative device-number check (and reverify on a cache miss).
+    if sys.platform == "darwin":
+        attrs = ctypes.create_string_buffer(
+            struct.pack(
+                "=HHIIIII",
+                ATTR_BIT_MAP_COUNT,
+                0,
+                0,
+                ATTR_VOL_INFO | ATTR_VOL_UUID,
+                0,
+                0,
+                0,
+            )
+        )
+        result = ctypes.create_string_buffer(20)
+        if ctypes.CDLL(None).getattrlist(os.fsencode(path), attrs, result, 20, 0) == 0:
+            length = struct.unpack_from("=I", result.raw)[0]
+            volume = result.raw[4:20]
+            if length == 20 and any(volume):
+                return "volume-uuid:" + volume.hex()
+    return device
+
+
 def signature(path):
     s = Path(path).lstat()
     if stat.S_ISLNK(s.st_mode):
         raise ValueError("Snapshot symlinks are not permitted")
-    return [s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns, s.st_mode]
+    return [
+        _volume_identity(path, s.st_dev),
+        s.st_ino,
+        s.st_size,
+        s.st_mtime_ns,
+        s.st_ctime_ns,
+        s.st_mode,
+    ]
 
 
 def safe_path(root, name):

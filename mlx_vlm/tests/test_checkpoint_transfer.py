@@ -7,6 +7,7 @@ import io
 import json
 import os
 import queue
+import struct
 import sys
 import threading
 from pathlib import Path
@@ -975,3 +976,73 @@ def test_stream_hashes_each_source_byte_once_and_verifies_receiver(
             events[-1]["bytes_received"] + events[-1]["bytes_reused"]
             == events[-1]["bytes_verified"]
         )
+
+
+@pytest.mark.parametrize(
+    "platform,result,length,volume",
+    [
+        ("darwin", 0, 20, bytes(range(16))),
+        ("darwin", -1, 20, bytes(range(16))),
+        ("darwin", 0, 4, bytes(range(16))),
+        ("darwin", 0, 20, bytes(16)),
+        ("linux", 0, 20, bytes(range(16))),
+    ],
+)
+def test_volume_identity_falls_back_when_uuid_is_unavailable(
+    monkeypatch, platform, result, length, volume
+):
+    def getattrlist(path, attrs, output, size, options):
+        payload = struct.pack("=I", length) + volume
+        ctypes.memmove(output, payload, len(payload))
+        return result
+
+    call = Mock(side_effect=getattrlist)
+    monkeypatch.setattr(store, "sys", SimpleNamespace(platform=platform))
+    monkeypatch.setattr(
+        store.ctypes, "CDLL", lambda *args: SimpleNamespace(getattrlist=call)
+    )
+    expected = (
+        "volume-uuid:" + volume.hex()
+        if platform == "darwin" and result == 0 and length == 20 and any(volume)
+        else 1234
+    )
+    assert store._volume_identity("/checkpoint", 1234) == expected
+    assert call.call_count == (1 if platform == "darwin" else 0)
+
+
+def test_volume_uuid_survives_mount_number_change(snapshot, monkeypatch):
+    source, names, root, final, manifest = snapshot
+    original = store._volume_identity
+    if not isinstance(original(source, source.stat().st_dev), str):
+        pytest.skip("Persistent volume identity is Darwin-specific")
+    real_stat = Path.lstat
+
+    def remounted(path):
+        s = real_stat(path)
+        return SimpleNamespace(
+            **{
+                k: getattr(s, k)
+                for k in [
+                    "st_mode",
+                    "st_ino",
+                    "st_size",
+                    "st_mtime_ns",
+                    "st_ctime_ns",
+                    "st_uid",
+                ]
+            },
+            st_dev=s.st_dev + 100,
+        )
+
+    monkeypatch.setattr(Path, "lstat", remounted)
+    monkeypatch.setattr(
+        store,
+        "verify_chunks",
+        Mock(side_effect=AssertionError("Must reuse the persistent receipt")),
+    )
+    stream = Mock(side_effect=AssertionError("Must not transfer unchanged weights"))
+    assert store.prepare_snapshot(source, names, root, chunk=1024, stream=stream) == (
+        final,
+        manifest,
+    )
+    stream.assert_not_called()
