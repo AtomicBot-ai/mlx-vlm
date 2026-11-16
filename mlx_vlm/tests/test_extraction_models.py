@@ -3394,6 +3394,32 @@ class TestMiniCPMOcrJev:
         once = model.sanitize(source)
         _assert_weights_equal(model.sanitize(once), source)
 
+    @pytest.mark.parametrize("text", ["", "{text}", "\n A\n  B \t\n"])
+    def test_prompt_matches_reference(self, text):
+        from mlx_vlm.models.minicpm_ocr_jev import build_prompt
+
+        # OpenBMB/MiniCPM-OCR@74c8876056c536ee55b204cc842112c515764512
+        # scripts/minicpm-ocr-jev/infer_vllm.py:build_prompt
+        expected = (
+            "<|im_start|>user\n"
+            "<|vision_start|><|image_pad|><|vision_end|>\n"
+            f"OCR文本：\n{text}\n"
+            "<|vision_start|><|image_pad|><|vision_end|>\n"
+            "第一张图是原图，第二张图是上述 OCR 文本渲染得到的图片。\n"
+            "请判断该 OCR 文本及其对应渲染图是否与原图内容一致。\n"
+            "这是一个二分类任务：一致标为 1，不一致标为 0。"
+            "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        )
+        assert build_prompt(text) == expected
+
+    def test_prompt_reference_fingerprint(self):
+        import hashlib
+
+        from mlx_vlm.models.minicpm_ocr_jev import build_prompt
+
+        fingerprint = hashlib.md5(build_prompt("{text}").encode("utf-8")).hexdigest()
+        assert fingerprint == "9aab68e8ba8ab4da17ba9752bddb199c"
+
     def test_prompt_image_order_and_aspect_ratio(self):
         from PIL import Image
 
@@ -3402,11 +3428,6 @@ class TestMiniCPMOcrJev:
 
         text = "A\n  B "
         prompt = build_prompt(text)
-        assert prompt.count("<|image_pad|>") == 2
-        assert f"<|vision_end|>OCR文本：\n{text}\n" in prompt
-        assert "<|vision_end|>第一张图是原图" in prompt
-        assert prompt.endswith("<|im_end|>\n")
-        assert "assistant" not in prompt and "<think>" not in prompt
         original = Image.new("RGB", (400, 1), "black")
         rendering = Image.new("RGB", (10, 10), "red")
         padded = load_image(original)

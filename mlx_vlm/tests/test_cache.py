@@ -2970,9 +2970,9 @@ def test_tensor_limit_replaces_idle_history(managers, monkeypatch, tier):
 
 
 @parametrize("leased", [1, 2])
-def test_tensor_limit_preserves_active_blocks(managers, monkeypatch, leased):
+def test_tensor_limit_preserves_active_blocks(memory_manager, monkeypatch, leased):
     monkeypatch.setenv("APC_MAX_POOL_TENSORS", "8")
-    manager = managers("disk", blocks=8)
+    manager = memory_manager(disk=True)
     old = store_blocks(manager, list(range(32)))
     active = [(b.block_hash, list(b.keys), list(b.values)) for b in old[:leased]]
     manager.release(old[leased:])
