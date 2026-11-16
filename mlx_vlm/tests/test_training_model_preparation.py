@@ -32,6 +32,21 @@ class TinyModel(nn.Module):
 
 
 class ModelPreparationTest(unittest.TestCase):
+    def test_dora_preserves_outputs_for_quantized_base_layers(self):
+        for bits in (3, 4, 6, 8):
+            with self.subTest(bits=bits):
+                model = TinyModel()
+                model.projection = nn.QuantizedLinear.from_linear(
+                    model.projection, group_size=64, bits=bits
+                )
+                ids = mx.array([[1, 2]])
+                expected = model(ids)
+                mx.eval(expected)
+                prepare_model_for_training(
+                    model, train_type="dora", lora_rank=2, verbose=False
+                )
+                self.assertTrue(mx.allclose(model(ids), expected, atol=1e-5).item())
+
     def test_prepared_model_trains_directly_in_all_modes(self):
         for mode, bits in (
             ("lora", None),
