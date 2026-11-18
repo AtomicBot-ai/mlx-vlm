@@ -37,18 +37,16 @@ brackets, for example `<doclang> [<table>, <layout>]`.
 ## Fine connector path
 
 The 500M checkpoint has a fine connector path, which gives four times as many
-image tokens per tile, for dense pages. To use it, set the processor default
-before you generate:
+image tokens per tile, for dense pages. Ask the processor for it:
 
-```python
-from mlx_vlm import generate, load
-from mlx_vlm.prompt_utils import apply_chat_template
-
-model, processor = load("./granite-for-docling-500m-mlx")
-processor.image_processor.fine_route = True
-prompt = apply_chat_template(processor, model.config, "<doclang>", num_images=1)
-result = generate(model, processor, prompt, image=["page.png"], max_tokens=4096)
+```sh
+python -m mlx_vlm.generate --model ./granite-for-docling-500m-mlx \
+  --image page.png --prompt "<doclang>" --max-tokens 4096 --temperature 0 \
+  --processor-kwargs '{"fine_route": true}'
 ```
+
+In Python, pass `fine_route=True` to `generate`. For `batch_generate`, set
+`processor.image_processor.fine_route = True` before the call.
 
 `Model.predict_fine_route(pixel_values, pixel_attention_mask)` uses the density
 router to tell which pages need the fine path. The 2B checkpoint has no fine

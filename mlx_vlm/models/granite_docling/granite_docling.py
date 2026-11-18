@@ -92,14 +92,16 @@ class Model(nn.Module):
         flat[positions] = image_features.astype(flat.dtype)
         inputs_embeds = flat.reshape(B, L, D)
 
-        deepstack_visual_embeds = [
-            f.astype(inputs_embeds.dtype) for f in deepstack_features
-        ]
+        # Dense (batch, length, layers, hidden) with zeros at text positions, so
+        # batched prefill pads and slices it like inputs_embeds.
+        stacked = mx.stack(deepstack_features, axis=1).astype(inputs_embeds.dtype)
+        deepstack = mx.zeros((B * L, *stacked.shape[1:]), dtype=stacked.dtype)
+        deepstack[positions] = stacked
+        deepstack_visual_embeds = deepstack.reshape(B, L, *stacked.shape[1:])
         if not self.training:
             mx.eval(deepstack_visual_embeds)
         return InputEmbeddingsFeatures(
             inputs_embeds=inputs_embeds,
-            visual_pos_masks=image_mask,
             deepstack_visual_embeds=deepstack_visual_embeds,
         )
 
@@ -137,7 +139,6 @@ class Model(nn.Module):
             inputs_embeds=features.inputs_embeds,
             mask=mask,
             cache=cache,
-            visual_pos_masks=features.visual_pos_masks,
             deepstack_visual_embeds=features.deepstack_visual_embeds,
             logits_to_keep=kwargs.get("logits_to_keep", 0),
         )

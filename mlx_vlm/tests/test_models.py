@@ -7933,6 +7933,13 @@ class TestGraniteDocling:
             model, self._prompt(4, 2), media, chunk_sizes=(3, 5, 7)
         )
 
+    def test_batch_rows_match_single_rows(self):
+        # Two rows with their own images: batch, single-row and chunked prefill agree.
+        model = self._model()
+        ids = mx.concatenate([self._prompt(4, 2)] * 2)
+        media = {"pixel_values": mx.random.normal((2, 2, 3, 16, 16))}
+        ModelChecks().prefill_parity(model, ids, media, chunk_sizes=(3, 5))
+
     def test_deepstack_features_change_the_output(self):
         model = self._model()
         ids = self._prompt(4, 1)
@@ -7943,11 +7950,10 @@ class TestGraniteDocling:
         with_deepstack = language(
             ids,
             inputs_embeds=features.inputs_embeds,
-            visual_pos_masks=features.visual_pos_masks,
             deepstack_visual_embeds=features.deepstack_visual_embeds,
         ).logits
         without = language(ids, inputs_embeds=features.inputs_embeds).logits
-        assert len(features.deepstack_visual_embeds) == 3
+        assert features.deepstack_visual_embeds.shape == (*ids.shape, 3, 32)
         assert not mx.allclose(with_deepstack, without)
 
     def test_fine_route_gives_four_times_the_image_tokens(self):
@@ -7957,7 +7963,8 @@ class TestGraniteDocling:
         features = model.get_input_embeddings(
             fine_ids, pixel_values=pixel_values, tile_fine_mask=mx.array([True])
         )
-        assert features.deepstack_visual_embeds[0].shape == (16, 32)
+        image_rows = mx.any(features.deepstack_visual_embeds != 0, axis=(2, 3))
+        assert int(image_rows.sum()) == 16
         with pytest.raises(ValueError, match="do not match"):
             model.get_input_embeddings(fine_ids, pixel_values=pixel_values)
 

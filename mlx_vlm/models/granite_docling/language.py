@@ -1,8 +1,7 @@
-from typing import Any, List, Optional
+from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
 from ..base import (
     LanguageModelOutput,
@@ -88,15 +87,22 @@ class TransformerBlock(nn.Module):
         return h + r * self.residual_multiplier
 
 
-def _add_deepstack(
-    hidden_states: mx.array, visual_pos_masks: np.ndarray, visual_embeds: mx.array
-) -> mx.array:
-    """Add DeepStack features to the hidden states at the image token positions."""
-    B, L, D = hidden_states.shape
-    positions = mx.array(np.flatnonzero(visual_pos_masks), dtype=mx.uint32)
-    flat = hidden_states.reshape(B * L, D)
-    flat = flat.at[positions].add(visual_embeds.astype(flat.dtype))
-    return flat.reshape(B, L, D)
+def _deepstack_window(deepstack_visual_embeds: mx.array, window: int, cache):
+    """Columns of the full-prompt DeepStack array for the current window.
+
+    Single-sequence chunked prefill passes the array for the full prompt with
+    each chunk. Batched prefill slices it before the call.
+    """
+    if deepstack_visual_embeds.shape[1] == window:
+        return deepstack_visual_embeds
+    start = cache_position_offset(cache)
+    part = deepstack_visual_embeds[:, start : start + window]
+    if part.shape[1] == 0:
+        return None  # Generated tokens have no image features.
+    if part.shape[1] < window:
+        pad = mx.zeros((part.shape[0], window - part.shape[1], *part.shape[2:]))
+        part = mx.concatenate([part, pad.astype(part.dtype)], axis=1)
+    return part
 
 
 class GraniteDoclingTextModel(nn.Module):
@@ -116,9 +122,9 @@ class GraniteDoclingTextModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache=None,
-        visual_pos_masks: Optional[mx.array] = None,
-        deepstack_visual_embeds: Optional[List[mx.array]] = None,
+        deepstack_visual_embeds: Optional[mx.array] = None,
     ) -> mx.array:
+        """deepstack_visual_embeds: (batch, length, layers, hidden), zero at text."""
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(inputs)
         # The multiplier applies to every input embedding, image tokens included.
@@ -129,45 +135,20 @@ class GraniteDoclingTextModel(nn.Module):
         if mask is None:
             mask = create_attention_mask(h, cache[0])
 
-        deepstack_masks = None
-        if deepstack_visual_embeds is not None and visual_pos_masks is not None:
-            visual_pos_masks, deepstack_visual_embeds = _align_to_window(
-                visual_pos_masks, deepstack_visual_embeds, h.shape[1], cache[0]
+        num_deepstack = 0
+        if deepstack_visual_embeds is not None:
+            deepstack_visual_embeds = _deepstack_window(
+                deepstack_visual_embeds, h.shape[1], cache[0]
             )
-            if visual_pos_masks.any():
-                deepstack_masks = visual_pos_masks
+        if deepstack_visual_embeds is not None:
+            num_deepstack = deepstack_visual_embeds.shape[2]
 
         for layer_idx, (layer, c) in enumerate(zip(self.layers, cache)):
             h = layer(h, mask, c)
-            if deepstack_masks is not None and layer_idx < len(deepstack_visual_embeds):
-                h = _add_deepstack(
-                    h, deepstack_masks, deepstack_visual_embeds[layer_idx]
-                )
+            if layer_idx < num_deepstack:
+                h = h + deepstack_visual_embeds[:, :, layer_idx].astype(h.dtype)
 
         return self.norm(h)
-
-
-def _align_to_window(visual_pos_masks, deepstack_visual_embeds, window: int, cache):
-    """Select the image positions and DeepStack rows of the current window.
-
-    get_input_embeddings returns the mask and the features for the full prompt.
-    Chunked prefill calls the model with one slice of the prompt at a time, so
-    keep only the columns from the cache offset to the end of this slice. The
-    features are batch-major, the same order as np.nonzero on the mask.
-    """
-    mask = np.array(visual_pos_masks).astype(bool)
-    if mask.shape[-1] == window:
-        return mask, deepstack_visual_embeds
-    start = cache_position_offset(cache)
-    columns = np.nonzero(mask)[1]
-    keep = mx.array(
-        np.flatnonzero((columns >= start) & (columns < start + window)),
-        dtype=mx.uint32,
-    )
-    return (
-        mask[:, start : start + window],
-        [embeds[keep] for embeds in deepstack_visual_embeds],
-    )
 
 
 class LanguageModel(nn.Module):
@@ -186,8 +167,7 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache=None,
-        visual_pos_masks: Optional[mx.array] = None,
-        deepstack_visual_embeds: Optional[List[mx.array]] = None,
+        deepstack_visual_embeds: Optional[mx.array] = None,
         logits_to_keep: Optional[int] = 0,
         **kwargs,
     ):
@@ -196,7 +176,6 @@ class LanguageModel(nn.Module):
             inputs_embeds=inputs_embeds,
             mask=mask,
             cache=cache,
-            visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
         )
         projection = (
