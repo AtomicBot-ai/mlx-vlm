@@ -74,6 +74,7 @@ from mlx_vlm.utils import (
     load_video,
     prepare_inputs,
     process_image,
+    resize_image,
     resolve_video_sampling,
     should_add_special_tokens,
 )
@@ -5128,3 +5129,18 @@ def test_inkling2_image_padding_transparency_and_placeholder_counts():
         processor(text="<image><image>", images=transparent)
     with pytest.raises(ValueError, match="More images"):
         processor(text="hello", images=transparent)
+
+
+class TestResizeImageGuards:
+    def test_extreme_aspect_ratio_keeps_a_positive_dimension(self):
+        img = Image.new("RGB", (10000, 2))
+        resized = resize_image(img, (320, 320))
+        assert resized.size == (320, 1)
+
+    def test_regular_downscale_is_unchanged(self):
+        img = Image.new("RGB", (640, 480))
+        assert resize_image(img, (320, 320)).size == (320, 240)
+
+    def test_small_image_upscale_behavior_is_unchanged(self):
+        img = Image.new("RGB", (100, 150))
+        assert resize_image(img, (320, 320)).size == (213, 320)

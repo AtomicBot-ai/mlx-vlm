@@ -1406,7 +1406,9 @@ def load_image(
 def resize_image(img, max_size):
 
     ratio = min(max_size[0] / img.width, max_size[1] / img.height)
-    new_size = (int(img.width * ratio), int(img.height * ratio))
+    # Extreme aspect ratios truncate one side to zero; PIL rejects 0-size
+    # images, so keep at least one pixel on each axis.
+    new_size = (max(1, int(img.width * ratio)), max(1, int(img.height * ratio)))
     return img.resize(new_size)
 
 
