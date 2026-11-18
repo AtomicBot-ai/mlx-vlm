@@ -52,6 +52,24 @@ In Python, pass `fine_route=True` to `generate`. For `batch_generate`, set
 router to tell which pages need the fine path. The 2B checkpoint has no fine
 path.
 
+## Vision feature cache
+
+The model supports the vision feature cache (`generate(..., vision_cache=...)`
+and the server). The cache keeps the image tokens and the DeepStack features,
+so cached and fresh results are identical. The coarse and fine paths have
+different cache entries.
+
+The cache helps when several prompts use the same page, for example several
+task selections. One page, repeated requests:
+
+| Model | Prefill, no cache | Prefill, cache |
+|---|---|---|
+| 2B 8-bit | 0.77 s | 0.37 s |
+| 500M bf16, coarse | 0.17 s | 0.10 s |
+| 500M bf16, fine | 0.23 s | 0.16 s |
+
+The first request on a page is a miss. Generation speed does not change.
+
 ## Limits
 
 - No tool calling: the chat template has no tool format.
