@@ -9,6 +9,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_reduce
 
+from .. import _generation_stream
 from ..kv_quant import from_legacy as kv_quant_from_legacy
 from ..models import cache
 from ..turboquant import HybridQuantKVCache, TurboQuantKVCache, turboquant_enabled
@@ -31,8 +32,7 @@ DEFAULT_PREFILL_BATCH_SIZE = 8
 DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH = 64
 DEFAULT_DIFFUSION_MAX_DENOISING_STEPS = 48
 
-# A stream on the default device just for generation
-generation_stream = mx.new_thread_local_stream(mx.default_device())
+generation_stream = _generation_stream.generation_stream
 
 
 class DiffusionRNG:

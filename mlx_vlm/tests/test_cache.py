@@ -1983,15 +1983,17 @@ def test_disk_policy_and_metadata(managers, monkeypatch):
 
 
 def test_exact_promotion_and_priority(managers, monkeypatch):
+    # Exercise promotion and LRU priority independently of runner memory pressure.
+    monkeypatch.setenv("APC_DISK_MIN_FREE_RAM_GB", "0")
     monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
     tokens = [list(range(20)), list(range(100, 120))]
-    writer = managers("disk")
+    writer = managers("disk", budget=4096)
     for value, ids in enumerate(tokens, 1):
         assert writer.store_exact_cache(ids, [allocated(20, value)])
     writer.disk.flush()
     writer.close()
     monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "1")
-    reader = managers("disk")
+    reader = managers("disk", budget=4096)
     for index, hits in [(0, 1), (0, 1), (1, 2), (0, 3)]:
         warm, count = reader.lookup_exact_cache(tokens[index] + [999])
         assert warm is not None and count == 20 and reader.stats.disk_hits == hits

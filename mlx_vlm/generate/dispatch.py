@@ -12,6 +12,7 @@ import mlx.nn as nn
 from transformers import PreTrainedTokenizer
 
 from .. import apc as _apc
+from .._generation_stream import on_generation_stream
 from ..kv_quant import from_legacy as kv_quant_from_legacy
 from ..models import cache
 from ..prompt_utils import apply_chat_template
@@ -811,6 +812,7 @@ def _prefix_cache_trim_amount(kv_cache: List[Any], prefix_len: int) -> Optional[
 from .ar import generate_step
 
 
+@on_generation_stream
 def stream_generate(
     model: nn.Module,
     processor: ProcessorLike | PreTrainedTokenizer,

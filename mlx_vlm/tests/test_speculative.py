@@ -1587,6 +1587,92 @@ def test_mistral_dspark_standard_generation(
     assert generated(model, draft, **options) == expected
 
 
+@parametrize("family", ["mistral", "inkling"])
+@parametrize("entrypoint", ["step", "stream"])
+def test_dspark_generation_stays_on_one_stream(family, entrypoint, monkeypatch):
+    from mlx_vlm.generate.common import generation_stream
+
+    if family == "mistral":
+        lm, draft = mistral_dspark_case()
+        model = NS(
+            language_model=lm,
+            get_input_embeddings=lambda ids, *args, **kwargs: InputEmbeddingsFeatures(
+                inputs_embeds=lm.model.embed_tokens(ids)
+            ),
+        )
+    else:
+        model, draft = inkling2_dspark_case()
+        lm = model.language_model
+
+    seen = {}
+    with mx.stream(generation_stream):
+        expected_stream = mx.default_stream(mx.default_device())
+
+    def observe(cls, name):
+        original = getattr(cls, name)
+
+        def call(self, *args, **kwargs):
+            stream = mx.default_stream(mx.default_device())
+            seen.setdefault(name, []).append(stream)
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(cls, name, call)
+
+    observe(type(lm), "__call__")
+    stages = ["reset", "draft_block"]
+    if family == "mistral":
+        stages.append("prepare_target_hidden")
+    for name in stages:
+        observe(type(draft), name)
+
+    expected = generated(model)
+    caller_stream = mx.new_stream(mx.default_device())
+    with mx.stream(caller_stream):
+        if entrypoint == "step":
+            actual = generated(model, draft)
+        else:
+            from mlx_vlm.generate import dispatch
+            from mlx_vlm.tests.test_generate import MockProcessor
+
+            prepare = dispatch._prepare_generation_inputs
+
+            def prepare_inputs(*args, **kwargs):
+                seen.setdefault("prepare_inputs", []).append(
+                    mx.default_stream(mx.default_device())
+                )
+                return prepare(*args, **kwargs)
+
+            monkeypatch.setattr(dispatch, "_prepare_generation_inputs", prepare_inputs)
+            processor = MockProcessor()
+            processor.tokenizer.stopping_criteria = lambda token: False
+            if family == "mistral":
+                model.config = NS(model_type="mistral_large4", eos_token_id=[])
+            iterator = dispatch.stream_generate(
+                model,
+                processor,
+                "",
+                input_ids=mx.array([[1, 2, 3, 4]]),
+                pixel_values=None,
+                mask=None,
+                max_tokens=12,
+                temperature=0,
+                seed=41,
+                prefill_step_size=None,
+                draft_model=draft,
+                draft_kind="dflash",
+            )
+            for result in iterator:
+                assert mx.default_stream(mx.default_device()) == caller_stream
+            actual = result.token_ids
+            stages.append("prepare_inputs")
+        assert mx.default_stream(mx.default_device()) == caller_stream
+    assert actual == expected
+    assert set(seen) == {"__call__", *stages}
+    assert all(
+        stream == expected_stream for streams in seen.values() for stream in streams
+    )
+
+
 def test_mistral_dspark_greedy_matches_bf16_logprob_ties():
     target, _ = mistral_dspark_case()
     target.set_dtype(mx.bfloat16)

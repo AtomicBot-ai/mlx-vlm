@@ -132,6 +132,7 @@ jobs:
             extras: test
             tests: >-
               tests/test_gated_delta.py
+              tests/test_generation_stream.py
               tests/test_inkling_kernel_gates.py
               tests/test_interpolate.py
               tests/test_models.py
