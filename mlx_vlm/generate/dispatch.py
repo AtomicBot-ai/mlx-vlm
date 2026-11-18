@@ -1,5 +1,6 @@
 import argparse
 import codecs
+import inspect
 import json
 import logging
 import sys
@@ -736,6 +737,11 @@ def _prime_cached_prefix_rope_state(
     it when continuing from a non-empty KV cache. If APC trims the prompt to
     only the uncached suffix, the suffix alone is not enough to recompute the
     original prompt's RoPE delta, so derive it from the full prompt first.
+
+    Models that scale video temporal positions by real time (Qwen2.5-VL) take
+    ``second_per_grid_ts``; forward it when the signature accepts it so the
+    primed positions match the prefill that would have run on the full prompt.
+    Other mRoPE models keep their existing positional signature.
     """
     lm = getattr(model, "language_model", None)
     get_rope_index = getattr(lm, "get_rope_index", None)
@@ -744,11 +750,21 @@ def _prime_cached_prefix_rope_state(
     if not (hasattr(lm, "_rope_deltas") or hasattr(lm, "_position_ids")):
         return True
     try:
+        rope_kwargs: Dict[str, Any] = {}
+        try:
+            accepts_video_timing = (
+                "second_per_grid_ts" in inspect.signature(get_rope_index).parameters
+            )
+        except (TypeError, ValueError):
+            accepts_video_timing = False
+        if accepts_video_timing:
+            rope_kwargs["second_per_grid_ts"] = kwargs.get("second_per_grid_ts", None)
         position_ids, rope_deltas = get_rope_index(
             full_input_ids,
             kwargs.get("image_grid_thw", None),
             kwargs.get("video_grid_thw", None),
             mask,
+            **rope_kwargs,
         )
     except Exception as e:
         logger.warning(

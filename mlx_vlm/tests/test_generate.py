@@ -1725,6 +1725,80 @@ def test_cached_prefix_rope_forwards_full_prompt_metadata():
     assert bool(mx.array_equal(language_model._rope_deltas, rope_deltas))
 
 
+def test_cached_prefix_rope_forwards_video_timing_when_supported():
+    # PR #2760 regression: Qwen2.5-VL's get_rope_index scales video temporal
+    # positions by second_per_grid_ts, so priming without it produced a
+    # different _rope_deltas than prefill and corrupted APC prefix reuse.
+    seen = {}
+    position_ids = mx.array([[0, 1, 2]], dtype=mx.int32)
+    rope_deltas = mx.array([[9]], dtype=mx.int32)
+
+    class VideoRopeLanguageModel:
+        _position_ids = None
+        _rope_deltas = None
+
+        @staticmethod
+        def get_rope_index(
+            input_ids,
+            image_grid_thw=None,
+            video_grid_thw=None,
+            attention_mask=None,
+            second_per_grid_ts=None,
+        ):
+            seen["second_per_grid_ts"] = second_per_grid_ts
+            return position_ids, rope_deltas
+
+    seconds = mx.array([0.5, 1.0])
+    kwargs = {
+        "video_grid_thw": mx.array([[2, 4, 4]]),
+        "second_per_grid_ts": seconds,
+    }
+
+    ok = _prime_cached_prefix_rope_state(
+        SimpleNamespace(language_model=VideoRopeLanguageModel()),
+        mx.array([[1, 2, 3]], dtype=mx.int32),
+        None,
+        kwargs,
+    )
+
+    assert ok is True
+    assert seen["second_per_grid_ts"] is seconds
+    assert bool(mx.array_equal(kwargs["rope_deltas"], rope_deltas))
+
+
+def test_cached_prefix_rope_keeps_legacy_signature_working():
+    seen = {}
+    position_ids = mx.array([[0, 1, 2]], dtype=mx.int32)
+    rope_deltas = mx.array([[0]], dtype=mx.int32)
+
+    class LegacyRopeLanguageModel:
+        _position_ids = None
+        _rope_deltas = None
+
+        @staticmethod
+        def get_rope_index(
+            input_ids,
+            image_grid_thw=None,
+            video_grid_thw=None,
+            attention_mask=None,
+        ):
+            seen["called"] = True
+            return position_ids, rope_deltas
+
+    kwargs = {"second_per_grid_ts": mx.array([0.5])}
+
+    ok = _prime_cached_prefix_rope_state(
+        SimpleNamespace(language_model=LegacyRopeLanguageModel()),
+        mx.array([[1, 2, 3]], dtype=mx.int32),
+        None,
+        kwargs,
+    )
+
+    assert ok is True
+    assert seen["called"] is True
+    assert bool(mx.array_equal(kwargs["position_ids"], position_ids))
+
+
 class TestPrefixCacheReuseTrim:
     def test_hybrid_with_untrimmable_state_is_not_reusable(self):
         # conv/linear-attention layers keep an ArraysCache, which has no trim()
