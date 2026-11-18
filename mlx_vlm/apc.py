@@ -445,17 +445,21 @@ def _sequence_hash(token_ids: Sequence[int], extra_hash: int, block_size: int) -
 
 
 def hash_image_payload(
-    pixel_values: Optional[mx.array] = None,
+    pixel_values: mx.array | np.ndarray | list | tuple | None = None,
     image_ref: Any = None,
 ) -> int:
     """Stable content hash of an image payload.
 
-    Prefers hashing the actual ``pixel_values`` tensor (so resize/transform
-    differences invalidate the cache). Falls back to hashing the source
-    identifier (path / URL / repr).
+    Hashes the processed ``pixel_values`` tensor or folds nested slices
+    element-wise so resize and transform differences invalidate the cache.
+    Falls back to hashing the source identifier (path / URL / repr).
     """
     if pixel_values is not None:
         try:
+            if isinstance(pixel_values, (list, tuple)):
+                folded = _hash_payload(pixel_values)
+                if folded is not None:
+                    return folded
             return _tensor_content_hash(pixel_values)
         except Exception:
             pass
