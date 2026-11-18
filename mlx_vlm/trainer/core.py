@@ -73,14 +73,6 @@ def get_learning_rate(
     learning_rate: float,
     min_learning_rate: float,
 ):
-    """Cosine schedule for the legacy recipes.
-
-    Delegates to the shared implementation so both APIs use one schedule and
-    the same validation. Unlike the old inline formula this raises
-    ``ValueError`` for ``iters < 1``, ``warmup_steps`` outside
-    ``[0, iters]``, or negative learning rates; those inputs previously
-    divided by zero at ``warmup_steps == iters`` or produced nonsense.
-    """
     from mlx_vlm.trainer.common.utils import get_learning_rate as _get_learning_rate
 
     return _get_learning_rate(
