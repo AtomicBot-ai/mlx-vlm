@@ -5137,6 +5137,14 @@ class TestResizeImageGuards:
         resized = resize_image(img, (320, 320))
         assert resized.size == (320, 1)
 
+    @pytest.mark.parametrize("target", [(320, 0), (-1, 320)])
+    def test_non_positive_target_dimensions_raise(self, target):
+        img = Image.new("RGB", (640, 480))
+        with pytest.raises(
+            ValueError, match="resize target dimensions must be positive"
+        ):
+            resize_image(img, target)
+
     def test_regular_downscale_is_unchanged(self):
         img = Image.new("RGB", (640, 480))
         assert resize_image(img, (320, 320)).size == (320, 240)
