@@ -3512,6 +3512,36 @@ def test_prepare_inputs_text_options_do_not_forward_media_or_generation_options(
     assert unrelated.keys().isdisjoint(spy.call_args.kwargs)
 
 
+def test_prepare_inputs_forwards_declared_image_processor_options():
+    received = {}
+
+    class Processor:
+        image_processor = NS(
+            valid_kwargs=type(
+                "ImageKwargs",
+                (),
+                {"__annotations__": {"fine_route": bool, "device": str}},
+            )
+        )
+
+        def __call__(self, images=None, text=None, **kwargs):
+            received.update(kwargs)
+            return {"input_ids": mx.array([[1, 2]]), "pixel_values": mx.zeros((1, 3))}
+
+    prepare_inputs(
+        Processor(),
+        images=[_make_image(8, 8)],
+        prompts="<image>",
+        fine_route=True,
+        device="cpu",
+        temperature=0.7,
+        max_tokens=16,
+    )
+
+    assert received["fine_route"] is True
+    assert {"device", "temperature", "max_tokens"}.isdisjoint(received)
+
+
 @pytest.mark.parametrize("wrapped", [False, True])
 @pytest.mark.parametrize(
     "call,expected,error",
