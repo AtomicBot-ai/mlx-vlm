@@ -1854,6 +1854,38 @@ def test_hashes_and_dependencies():
     assert P.model_key_dependencies(None, None) == ()
 
 
+@pytest.mark.parametrize("sequence", [list, tuple])
+def test_ragged_image_payloads_scope_exact_cache(prefix_manager, sequence):
+    def image_cache_key(value):
+        slices = (
+            np.zeros((3, 2, 8), dtype=np.float32),
+            np.full((3, 2, 4), value, dtype=np.float32),
+        )
+        pixels = sequence((sequence(slices),))
+        return P.semantic_extra_hash(
+            image_hash=P.hash_image_payload(pixel_values=pixels)
+        )
+
+    manager = prefix_manager(budget=1 << 20)
+    prefix = list(range(32))
+    tokens = prefix + [32]
+    keys = [image_cache_key(value) for value in (0, 1)]
+    assert keys[0] != keys[1]
+
+    for value, key in enumerate(keys):
+        assert manager.lookup_exact_cache(tokens, extra_hash=key) == (None, 0)
+        assert manager.store_exact_cache(
+            prefix, [allocated(len(prefix), value)], extra_hash=key
+        )
+
+    for value in (0, 1):
+        restored, count = manager.lookup_exact_cache(
+            tokens, extra_hash=image_cache_key(value)
+        )
+        assert count == len(prefix)
+        assert restored[0].keys[0, 0, 0, 0].item() == value
+
+
 def test_blocks_and_statistics(managers):
     manager = managers(blocks=16)
     tokens = list(range(53))
