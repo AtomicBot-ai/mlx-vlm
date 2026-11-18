@@ -2764,19 +2764,97 @@ def test_apply_chat_template_preserves_explicit_thinking_enabled():
     assert result.endswith("<think>\n")
 
 
-def test_qwen3_omni_enables_thinking_by_default():
+@pytest.mark.parametrize(
+    "model_type", ["qwen3_omni_moe", "qwen3_5_moe", "minimax_m3_vl"]
+)
+def test_apply_chat_template_preserves_unspecified_thinking(model_type):
     processor = MagicMock(chat_template="{{ messages }}")
     processor.apply_chat_template.return_value = "prompt"
 
     result = apply_chat_template(
-        processor, {"model_type": "qwen3_omni_moe"}, "Describe this image."
+        processor, {"model_type": model_type}, "Describe this image."
     )
 
     assert result == "prompt"
-    assert processor.apply_chat_template.call_args.kwargs["enable_thinking"] is True
+    assert "enable_thinking" not in processor.apply_chat_template.call_args.kwargs
 
 
-def test_apply_chat_template_maps_enable_thinking_for_thinking_mode_templates():
+@pytest.mark.parametrize("model_type", ["qwen3_omni_moe", "qwen3_5_moe"])
+@pytest.mark.parametrize("enabled", [None, True, False])
+def test_qwen_template_only_inserts_empty_thinking_when_explicitly_disabled(
+    model_type, enabled
+):
+    # Generation suffix from Qwen3-Omni-30B-A3B-Instruct (issue #2745).
+    tokenizer = fast_tokenizer(chat_template="""
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+    {%- if enable_thinking is defined and enable_thinking is false %}
+        {{- '<think>\n\n</think>\n\n' }}
+    {%- endif %}
+{%- endif %}
+""")
+    kwargs = {} if enabled is None else {"enable_thinking": enabled}
+    result = apply_chat_template(
+        tokenizer, {"model_type": model_type}, "Describe this image.", **kwargs
+    )
+    assert result == "<|im_start|>assistant\n" + (
+        "<think>\n\n</think>\n\n" if enabled is False else ""
+    )
+
+
+@pytest.mark.parametrize("default", [True, False])
+def test_template_processor_keeps_its_python_thinking_default(default):
+    class Processor:
+        chat_template = "{{ messages }}"
+
+        def apply_chat_template(
+            self,
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=default,
+        ):
+            return enable_thinking
+
+    assert get_chat_template(Processor(), [], True) is default
+
+
+@pytest.mark.parametrize("default", [True, False])
+@pytest.mark.parametrize("kwargs", [{}, {"enable_thinking": None}])
+def test_template_keeps_its_jinja_thinking_default(default, kwargs):
+    tokenizer = fast_tokenizer(
+        chat_template="{{ enable_thinking | default(" + str(default).lower() + ") }}"
+    )
+    assert apply_chat_template(
+        tokenizer, {"model_type": "qwen3_5_moe"}, "Hi", **kwargs
+    ) == str(default)
+
+
+@pytest.mark.parametrize(
+    "kwargs,expected",
+    [
+        ({}, "adaptive"),
+        ({"enable_thinking": None}, "adaptive"),
+        ({"enable_thinking": True}, "enabled"),
+        ({"enable_thinking": False}, "disabled"),
+        ({"enable_thinking": True, "thinking_mode": "disabled"}, "disabled"),
+        ({"enable_thinking": False, "thinking_mode": "adaptive"}, "adaptive"),
+    ],
+)
+def test_thinking_mode_preserves_default_and_explicit_override(kwargs, expected):
+    tokenizer = fast_tokenizer(
+        chat_template="{{ thinking_mode | default('adaptive') }}"
+    )
+    assert (
+        apply_chat_template(tokenizer, {"model_type": "minimax_m3_vl"}, "Hi", **kwargs)
+        == expected
+    )
+
+
+@pytest.mark.parametrize("enabled,mode", [(True, "enabled"), (False, "disabled")])
+def test_apply_chat_template_maps_enable_thinking_for_thinking_mode_templates(
+    enabled, mode
+):
     class ThinkingModeProcessor:
         chat_template = "{% if thinking_mode == 'enabled' %}<mm:think>{% endif %}"
 
@@ -2796,12 +2874,12 @@ def test_apply_chat_template_maps_enable_thinking_for_thinking_mode_templates():
         {"model_type": "minimax_m3_vl"},
         "Describe this image.",
         num_images=1,
-        enable_thinking=True,
+        enable_thinking=enabled,
     )
 
     assert result == "prompt"
-    assert processor.kwargs["enable_thinking"] is True
-    assert processor.kwargs["thinking_mode"] == "enabled"
+    assert processor.kwargs["enable_thinking"] is enabled
+    assert processor.kwargs["thinking_mode"] == mode
 
 
 class TestModelSpecificPromptContracts:

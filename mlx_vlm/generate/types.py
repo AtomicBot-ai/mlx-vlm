@@ -52,7 +52,7 @@ class GenerateKwargs(TypedDict, total=False):
     thinking_budget: int | None
     thinking_end_token: str
     thinking_start_token: str | None
-    enable_thinking: bool
+    enable_thinking: bool | None
     skip_special_tokens: bool
     vision_cache: Any
     prompt_cache_state: Any
