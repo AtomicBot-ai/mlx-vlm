@@ -3411,3 +3411,16 @@ def test_ernie_echo_batch_padding_completion_and_late_arrival(batch_size):
         assert [actual[uid] for uid in uids] == expected
     finally:
         gen.close()
+
+
+class TestApplyMinPZeroThreshold:
+    def test_zero_threshold_keeps_every_token(self):
+        logprobs = mx.array([[-0.1, -2.5, -8.0, -20.0]], dtype=mx.float32)
+        result = sampling.apply_min_p(logprobs, 0.0)
+        assert mx.array_equal(result, logprobs).item()
+
+    def test_positive_threshold_still_filters(self):
+        logprobs = mx.array([[-0.1, -2.5, -8.0, -20.0]], dtype=mx.float32)
+        filtered = sampling.apply_min_p(logprobs, 0.5)
+        assert filtered[0, 0] == logprobs[0, 0]
+        assert mx.isinf(filtered[0, 1:]).all().item()
