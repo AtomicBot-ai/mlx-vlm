@@ -1719,6 +1719,18 @@
     {
       "id": "qwen3_5",
       "module": "qwen3_5",
+      "regression": {
+        "checks": ["execution_cache", "padded_batch", "chunked_prefill", "sanitize"],
+        "config": {"image_token_id": 29, "video_token_id": 28, "vision_start_token_id": 30, "vision_end_token_id": 31},
+        "execution_plan": [0, 1],
+        "cache_types": ["ArraysCache", "KVCache"],
+        "fp32_parameters": ["*.A_log"],
+        "discarded_weights": ["model.language_model.mtp.weight"]
+      },
+      "invalid_configs": [
+        {"id": "incomplete-rope", "config": {"text_config": {"rope_parameters": {"type": "default"}}}},
+        {"id": "unsupported-deepstack", "config": {"vision_config": {"deepstack_visual_indexes": [0]}}}
+      ],
       "config": {
         "text_config": {
           "model_type": "qwen3_5",
@@ -1762,6 +1774,93 @@
         "mrope_deltas"
       ],
       "vision": {"input_shape": [4, 1176], "feature_layer": 0, "grid_thw": [[1, 2, 2]]}
+    },
+    {
+      "id": "sensenova_loop",
+      "module": "sensenova_loop",
+      "regression": {
+        "checks": ["execution_cache", "padded_batch", "chunked_prefill", "sanitize"],
+        "config": {"text_config": {"full_attention_interval": 4}},
+        "execution_plan": [0, 1, 2, 1, 2, 3],
+        "cache_types": ["ArraysCache", "KVCache", "ArraysCache", "KVCache", "ArraysCache", "KVCache"],
+        "fp32_parameters": ["*.mhc_attn.*", "*.mhc_ffn.*"],
+        "discarded_weights": ["model.language_model.loop_gate.logits"]
+      },
+      "invalid_configs": [
+        {"id": "missing-loop", "config": {"loop_settings": null}},
+        {"id": "zero-passes", "config": {"loop_settings": {"eval_count": 0, "counts": [0]}}},
+        {"id": "variable-passes", "config": {"loop_settings": {"counts": [1, 2]}}},
+        {"id": "crossing-phase", "config": {"mhc": {"start": 0}}},
+        {"id": "invalid-streams", "config": {"mhc": {"streams": 3}}},
+        {"id": "zero-iterations", "config": {"mhc": {"iterations": 0}}}
+      ],
+      "config": {
+        "text_config": {
+          "model_type": "qwen3_5_text",
+          "hidden_size": 16,
+          "intermediate_size": 32,
+          "linear_num_value_heads": 2,
+          "linear_num_key_heads": 2,
+          "linear_key_head_dim": 32,
+          "linear_value_head_dim": 8,
+          "linear_conv_kernel_dim": 3,
+          "num_hidden_layers": 4,
+          "full_attention_interval": 2,
+          "num_attention_heads": 2,
+          "rms_norm_eps": 1e-05,
+          "vocab_size": 32,
+          "num_key_value_heads": 2,
+          "max_position_embeddings": 128,
+          "head_dim": 8,
+          "rope_parameters": {
+            "type": "default",
+            "mrope_section": [1, 0, 0],
+            "rope_theta": 10000,
+            "partial_rotary_factor": 0.25
+          },
+          "layer_types": [
+            "linear_attention",
+            "full_attention",
+            "linear_attention",
+            "full_attention"
+          ]
+        },
+        "vision_config": {
+          "depth": 1,
+          "hidden_size": 16,
+          "intermediate_size": 32,
+          "out_hidden_size": 16,
+          "num_heads": 2
+        },
+        "model_type": "sensenova_loop",
+        "loop_settings": {
+          "start": 1,
+          "end": 3,
+          "eval_count": 2,
+          "counts": [2]
+        },
+        "mhc": {
+          "start": 1,
+          "end": 3,
+          "streams": 2,
+          "iterations": 20,
+          "fixed_identity": false,
+          "pre_scale": 1.0
+        },
+        "image_token_id": 29,
+        "video_token_id": 28,
+        "vision_start_token_id": 30,
+        "vision_end_token_id": 31
+      },
+      "checks": [
+        "language",
+        "vision",
+        "request_positions",
+        "chunked_positions",
+        "mrope_deltas"
+      ],
+      "vision": {"input_shape": [4, 1176], "feature_layer": 0, "grid_thw": [[1, 2, 2]]},
+      "language": {"num_layers": 6}
     },
     {
       "id": "qwen3_5_text",

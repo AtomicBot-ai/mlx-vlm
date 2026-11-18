@@ -63,6 +63,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 |-------|---------------|
 | Inkling 2 Small | [Docs](mlx_vlm/models/inkling2/README.md) |
 | LFM3 / LFM3-VL | [Docs](mlx_vlm/models/lfm3/README.md) |
+| SenseNova-Loop-9B | [Docs](mlx_vlm/models/sensenova_loop/README.md) |
 | LFM3-Audio | [Docs](mlx_vlm/models/lfm3_audio/README.md) |
 | LFM3-Omni | [Docs](mlx_vlm/models/lfm3_omni/README.md) |
 | DeepSeek-OCR | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/deepseekocr/README.md) |

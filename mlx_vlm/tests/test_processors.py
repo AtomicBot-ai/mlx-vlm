@@ -2251,6 +2251,7 @@ def test_extract_text_from_content(content, expected):
         ("qwen3_omni_moe", "qwen-image-audio"),
         ("gemma4_unified", "video-audio"),
         ("prism_hadamard_qwen35", "image-video"),
+        ("sensenova_loop", "images"),
         ("step3p7", "patch"),
     ],
 )
@@ -2263,9 +2264,12 @@ def test_prompt_media_format(family, kind):
         text, options = "What do you see?", dict(num_images=1)
     elif kind == "image-video":
         options = dict(num_images=2, video="clip.mp4")
+    elif kind == "images":
+        options = dict(num_images=2)
     text_part = dict(type="text", text=text, content=text)
     expected = {
         "image-audio": [dict(type="image"), text_part, dict(type="audio")],
+        "images": [dict(type="image"), dict(type="image"), text_part],
         "qwen-image-audio": [dict(type="audio"), dict(type="image"), text_part],
         "video-audio": [
             dict(type="video", video="clip.mp4", max_pixels=224 * 224, fps=1),

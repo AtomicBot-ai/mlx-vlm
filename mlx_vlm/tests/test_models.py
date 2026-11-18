@@ -33,9 +33,10 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import pytest
-from mlx.utils import tree_flatten, tree_map
+from mlx.utils import tree_flatten, tree_map, tree_map_with_path
 
 from mlx_vlm import embedding_loader
+from mlx_vlm.generate.ar import _make_cache
 from mlx_vlm.models.base import InputEmbeddingsFeatures, create_attention_mask
 from mlx_vlm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
 from mlx_vlm.models.lfm2_encoder import Model as Lfm2Encoder
@@ -918,12 +919,13 @@ class ModelChecks:
         self.assert_close(output.text_embeds, changed_padding.text_embeds)
         self.assert_close(mx.linalg.norm(output.text_embeds, axis=-1), mx.ones((1,)))
 
-    def assert_close(self, actual, expected, *, logits=False):
+    def assert_close(self, actual, expected, *, logits=False, tolerance=None):
         assert actual.shape == expected.shape
-        tolerance = 5e-3 if actual.dtype == mx.float16 else 1e-4
-        # One-token attention uses a different Metal kernel from full prefill.
-        if logits:
-            tolerance = max(tolerance, 2e-3)
+        if tolerance is None:
+            tolerance = 5e-3 if actual.dtype == mx.float16 else 1e-4
+            # One-token attention uses a different Metal kernel from full prefill.
+            if logits:
+                tolerance = max(tolerance, 2e-3)
         actual, expected = actual.astype(mx.float32), expected.astype(mx.float32)
         mx.eval(actual, expected)
         actual, expected = np.array(actual), np.array(expected)
@@ -935,7 +937,17 @@ class ModelChecks:
             rtol=tolerance,
         )
 
-    def prefill_parity(self, model, ids, media, chunk_sizes, *, features=None):
+    def prefill_parity(
+        self,
+        model,
+        ids,
+        media,
+        chunk_sizes,
+        *,
+        features=None,
+        chunk_patterns=(),
+        tolerance=None,
+    ):
         """Compare full, cached and chunked prefill, then decode one new token."""
         language = model.language_model
         if features is None:
@@ -965,11 +977,19 @@ class ModelChecks:
                         **row_media,
                     ).logits
                 )
-            self.assert_close(reference, mx.concatenate(solo), logits=True)
-        for size in (ids.shape[1] - 1, *chunk_sizes):
+            self.assert_close(
+                reference, mx.concatenate(solo), logits=True, tolerance=tolerance
+            )
+        schedules = [
+            [min(size, ids.shape[1] - start) for start in range(0, ids.shape[1], size)]
+            for size in (ids.shape[1] - 1, *chunk_sizes)
+        ]
+        for schedule in (*schedules, *chunk_patterns):
+            assert sum(schedule) == ids.shape[1]
             cache, chunks = make_prompt_cache(language), []
-            for start in range(0, ids.shape[1], size):
-                stop = min(start + size, ids.shape[1])
+            start = 0
+            for size in schedule:
+                stop = start + size
                 chunks.append(
                     language(
                         ids[:, start:stop],
@@ -978,10 +998,19 @@ class ModelChecks:
                         **features,
                     ).logits
                 )
-            self.assert_close(mx.concatenate(chunks, axis=1), reference, logits=True)
+                start = stop
+            self.assert_close(
+                mx.concatenate(chunks, axis=1),
+                reference,
+                logits=True,
+                tolerance=tolerance,
+            )
             decode = {k: v for k, v in features.items() if k != "position_ids"}
             self.assert_close(
-                language(token, cache=cache, **decode).logits, extended, logits=True
+                language(token, cache=cache, **decode).logits,
+                extended,
+                logits=True,
+                tolerance=tolerance,
             )
 
     def multimodal(
@@ -1534,6 +1563,194 @@ def test_model_contract(case):
     for kind in case["checks"]:
         args, kwargs = check_arguments(kind, case, model, config)
         getattr(checks, kind)(*args, **kwargs)
+
+
+def regression_cases(check):
+    return [
+        case
+        for case in DATA["cases"]
+        if check in case.get("regression", {}).get("checks", ())
+    ]
+
+
+def regression_config(case, overrides=None):
+    """Reuse a model case with ordinary constructor-value overrides."""
+    fields = copy.deepcopy(case["config"])
+    for updates in (case.get("regression", {}).get("config", {}), overrides or {}):
+        for name, value in updates.items():
+            if isinstance(value, dict) and isinstance(fields.get(name), dict):
+                fields[name].update(copy.deepcopy(value))
+            else:
+                fields[name] = copy.deepcopy(value)
+    module = importlib.import_module("mlx_vlm.models." + case["module"])
+    return module, build_config(module, fields)
+
+
+def regression_model(case):
+    module, config = regression_config(case)
+    mx.random.seed(17)
+    model = module.Model(config)
+    # Exercise protected routing weights away from their zero initialization.
+    patterns = case["regression"].get("fp32_parameters", ())
+    model.update(
+        tree_map_with_path(
+            lambda path, value: (
+                0.1 * mx.random.normal(value.shape)
+                if path.endswith(".weight")
+                and any(fnmatchcase(path, p) for p in patterns)
+                else value
+            ),
+            model.parameters(),
+        )
+    )
+    model.eval()
+    return model
+
+
+@pytest.mark.parametrize(
+    "case", regression_cases("execution_cache"), ids=lambda c: c["id"]
+)
+def test_decoder_execution_and_cache_ownership(case):
+    model = regression_model(case)
+    resolved, model_type = get_model_and_args(asdict(model.config))
+    assert resolved.Model is type(model) and model_type == case["module"]
+    language = model.language_model
+    physical, visits = language.model.layers, language.layers
+    plan = case["regression"]["execution_plan"]
+    assert len(physical) == model.config.text_config.num_hidden_layers
+    assert len(visits) == len(plan)
+    assert all(layer is physical[index] for layer, index in zip(visits, plan))
+    cache = language.make_cache()
+    assert [type(c).__name__ for c in cache] == case["regression"]["cache_types"]
+    assert len({id(c) for c in cache}) == len(plan)
+    language(mx.array([[1, 2, 3]]), cache=cache)
+    for i, entry in enumerate(cache):
+        if isinstance(entry, KVCache):
+            assert entry.offset == 3
+        for j in range(i):
+            if plan[i] == plan[j]:
+                current, previous = (
+                    (entry.keys, cache[j].keys)
+                    if isinstance(entry, KVCache)
+                    else (entry[1], cache[j][1])
+                )
+                assert not mx.allclose(current, previous).item(), (i, j)
+    assert not any(
+        "_execution" in key for key, _ in tree_flatten(language.parameters())
+    )
+
+
+@pytest.mark.parametrize(
+    "case", regression_cases("padded_batch"), ids=lambda c: c["id"]
+)
+def test_padded_batch_matches_individual_decoding(case):
+    language = regression_model(case).language_model
+    ids = mx.array([[0, 0, 1, 2], [3, 4, 5, 6]])
+    cache = _make_cache(language, [2, 0])
+    actual = language(ids, cache=cache, mask=ids != 0).logits[:, -1:]
+    next_ids = mx.array([[7], [8]])
+    decoded = language(next_ids, cache=cache).logits
+    for row, pad in enumerate([2, 0]):
+        solo_cache = language.make_cache()
+        expected = language(ids[row : row + 1, pad:], cache=solo_cache).logits[:, -1:]
+        expected_decoded = language(next_ids[row : row + 1], cache=solo_cache).logits
+        for batched, solo in ((actual, expected), (decoded, expected_decoded)):
+            ModelChecks().assert_close(batched[row : row + 1], solo, tolerance=3e-5)
+
+
+@pytest.mark.parametrize(
+    "case", regression_cases("chunked_prefill"), ids=lambda c: c["id"]
+)
+@pytest.mark.parametrize("with_image", [False, True], ids=["text", "image"])
+@pytest.mark.parametrize("chunks", [(1, 2, 1, 2), (3, 3)])
+def test_chunked_prefill_and_decode_match_full(case, with_image, chunks):
+    model = regression_model(case)
+    config = model.config
+    ids, media = mx.array([[1, 2, 3, 4, 5, 6]]), {}
+    if with_image:
+        ids = mx.array(
+            [
+                [
+                    1,
+                    config.vision_start_token_id,
+                    config.image_token_id,
+                    config.vision_end_token_id,
+                    2,
+                    3,
+                ]
+            ]
+        )
+        vision = case["vision"]
+        media = dict(
+            pixel_values=mx.random.normal(tuple(vision["input_shape"])),
+            image_grid_thw=mx.array(vision["grid_thw"]),
+        )
+    ModelChecks().prefill_parity(
+        model, ids, media, (), chunk_patterns=[chunks], tolerance=3e-5
+    )
+
+
+@pytest.mark.parametrize(
+    "case,invalid",
+    [
+        pytest.param(case, invalid, id=f"{case['id']}-{invalid['id']}")
+        for case in DATA["cases"]
+        for invalid in case.get("invalid_configs", ())
+    ],
+)
+def test_invalid_model_config(case, invalid):
+    with pytest.raises(ValueError):
+        module, config = regression_config(case, invalid["config"])
+        module.Model(config)
+
+
+@pytest.mark.parametrize("case", regression_cases("sanitize"), ids=lambda c: c["id"])
+def test_hybrid_backbone_sanitize_is_idempotent(case):
+    model = regression_model(case)
+    parameters = dict(tree_flatten(model.parameters()))
+    norm = mx.arange(model.config.text_config.hidden_size, dtype=mx.float32) / 100
+    expected_norm = np.array(norm) + 1
+    conv = parameters["language_model.model.layers.0.linear_attn.conv1d.weight"]
+    patch = parameters["vision_tower.patch_embed.proj.weight"]
+    # Qwen-compatible checkpoints store convolutions in channel-first order.
+    weights = {
+        "model.language_model.layers.1.input_layernorm.weight": norm,
+        "model.language_model.layers.0.linear_attn.conv1d.weight": conv.moveaxis(1, 2),
+        "model.visual.patch_embed.proj.weight": patch.transpose(0, 4, 1, 2, 3),
+    }
+    preserved = {
+        key: value
+        for key, value in parameters.items()
+        if any(fnmatchcase(key, p) for p in case["regression"]["fp32_parameters"])
+    }
+    weights.update(
+        {
+            key.replace("language_model.model", "model.language_model"): value
+            for key, value in preserved.items()
+        }
+    )
+    discarded = case["regression"]["discarded_weights"]
+    weights.update({key: mx.zeros(1) for key in discarded})
+    once = model.sanitize(weights)
+    assert set(once) == preserved.keys() | {
+        "language_model.model.layers.1.input_layernorm.weight",
+        "language_model.model.layers.0.linear_attn.conv1d.weight",
+        "vision_tower.patch_embed.proj.weight",
+    }
+    twice = model.sanitize(once)
+    assert once.keys() == twice.keys()
+    for key in once:
+        assert mx.array_equal(once[key], twice[key]).item(), key
+    np.testing.assert_allclose(
+        np.array(once["language_model.model.layers.1.input_layernorm.weight"]),
+        expected_norm,
+    )
+    for key, expected in {
+        **preserved,
+        "language_model.model.layers.0.linear_attn.conv1d.weight": conv,
+        "vision_tower.patch_embed.proj.weight": patch,
+    }.items():
+        assert mx.array_equal(once[key], expected).item(), key
 
 
 @pytest.fixture

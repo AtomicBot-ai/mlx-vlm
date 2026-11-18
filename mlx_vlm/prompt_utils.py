@@ -56,6 +56,7 @@ MODEL_CONFIG = {
     "mage_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "llava_onevision2": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_5": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "sensenova_loop": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "prism_hadamard_qwen35": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_5_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen4_exp": MessageFormat.LIST_WITH_IMAGE_FIRST,

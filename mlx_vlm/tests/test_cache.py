@@ -1683,10 +1683,9 @@ def coordinate(manager, caches):
 @pytest.fixture
 def managers(tmp_path, monkeypatch):
     """Own writers and readers, including reopened namespaces and memory budgets."""
-    # Keep one real host-memory reading per case. Budget/pressure tests override
-    # this explicitly; repeated vm_stat processes add no cache-lifecycle coverage.
-    free_ram = P._free_ram_bytes()
-    monkeypatch.setattr(P, "_free_ram_bytes", lambda: free_ram)
+    # Lifecycle tests must not depend on the runner's current memory pressure.
+    # Budget/pressure tests override this explicitly to exercise admission limits.
+    monkeypatch.setattr(P, "_free_ram_bytes", lambda: 1 << 40)
     owned = []
 
     def make(
@@ -1966,10 +1965,10 @@ def test_disk_policy_and_metadata(managers, monkeypatch):
         tokens, allow_memory_overlap=True, max_prefix_tokens=32, min_prefix_tokens=32
     ) == (None, 0)
     manager._disk_min_free_ram_bytes = 2
-    monkeypatch.setattr(P, "_free_ram_bytes", lambda: 1)
     lookup = manager.lookup_prefix_disk_cache
-    assert lookup(tokens, allow_memory_overlap=True) == (None, 0)
-    monkeypatch.undo()
+    with monkeypatch.context() as pressure:
+        pressure.setattr(P, "_free_ram_bytes", lambda: 1)
+        assert lookup(tokens, allow_memory_overlap=True) == (None, 0)
     writer = managers("disk", namespace="metadata")
     tokens = list(range(16))
     writer.release(store_blocks(writer, tokens, extra_hash=1))
