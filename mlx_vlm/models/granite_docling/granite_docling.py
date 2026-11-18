@@ -63,6 +63,14 @@ class Model(nn.Module):
         tiles = flat[mx.array(np.flatnonzero(tile_mask), dtype=mx.uint32)]
         return tiles.transpose(0, 2, 3, 1), tile_mask.sum(-1).tolist()
 
+    def encode_images(self, pixel_values: mx.array, **kwargs) -> list:
+        """Image tokens, stacked DeepStack features and route, for the vision cache."""
+        tiles, _ = self._real_tiles(pixel_values, kwargs.get("pixel_attention_mask"))
+        # The processor returns tile_fine_mask only when it was called with fine_route=True.
+        fine = kwargs.get("tile_fine_mask") is not None
+        image_features, deepstack_features = self.vision_model(tiles, fine=fine)
+        return [image_features, mx.stack(deepstack_features, axis=1), mx.array(fine)]
+
     def get_input_embeddings(
         self,
         input_ids: Optional[mx.array] = None,
@@ -73,10 +81,18 @@ class Model(nn.Module):
         if pixel_values is None:
             return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
 
-        tiles, _ = self._real_tiles(pixel_values, kwargs.get("pixel_attention_mask"))
-        # The processor returns tile_fine_mask only when it was called with fine_route=True.
         fine = kwargs.get("tile_fine_mask") is not None
-        image_features, deepstack_features = self.vision_model(tiles, fine=fine)
+        vision_cache, image_key = kwargs.get("vision_cache"), kwargs.get("_image_key")
+        cached = kwargs.get("cached_image_features")
+        if cached is None and vision_cache is not None and image_key is not None:
+            cached = vision_cache.get(image_key)
+        # Use a cached entry only when it has the requested route.
+        if cached is None or bool(cached[2].item()) != fine:
+            cached = self.encode_images(pixel_values, **kwargs)
+            if vision_cache is not None and image_key is not None:
+                mx.eval(cached)
+                vision_cache.put(image_key, cached)
+        image_features, stacked = cached[0], cached[1]
 
         image_mask = input_ids == self.config.image_token_id
         mask_np = np.array(image_mask)
@@ -94,7 +110,7 @@ class Model(nn.Module):
 
         # Dense (batch, length, layers, hidden) with zeros at text positions, so
         # batched prefill pads and slices it like inputs_embeds.
-        stacked = mx.stack(deepstack_features, axis=1).astype(inputs_embeds.dtype)
+        stacked = stacked.astype(inputs_embeds.dtype)
         deepstack = mx.zeros((B * L, *stacked.shape[1:]), dtype=stacked.dtype)
         deepstack[positions] = stacked
         deepstack_visual_embeds = deepstack.reshape(B, L, *stacked.shape[1:])

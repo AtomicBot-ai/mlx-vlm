@@ -7968,6 +7968,58 @@ class TestGraniteDocling:
         with pytest.raises(ValueError, match="do not match"):
             model.get_input_embeddings(fine_ids, pixel_values=pixel_values)
 
+    def test_cached_vision_features_match_and_follow_the_route(self):
+        model = self._model(use_fine_route=True)
+        pixel_values = mx.random.normal((1, 1, 3, 16, 16))
+        ids = self._prompt(4, 1)
+        coarse = model.encode_images(pixel_values)
+        mx.eval(coarse)
+        fresh = model.get_input_embeddings(ids, pixel_values=pixel_values)
+        vision_call = type(model.vision_model).__call__
+        with patch.object(
+            type(model.vision_model), "__call__", side_effect=AssertionError
+        ):
+            cached = model.get_input_embeddings(
+                ids, pixel_values=pixel_values, cached_image_features=coarse
+            )
+        for key in ("inputs_embeds", "deepstack_visual_embeds"):
+            assert mx.array_equal(getattr(fresh, key), getattr(cached, key))
+
+        # A cached coarse entry must not serve a fine request.
+        with patch.object(
+            type(model.vision_model),
+            "__call__",
+            autospec=True,
+            side_effect=vision_call,
+        ) as spy:
+            fine = model.get_input_embeddings(
+                self._prompt(16, 1),
+                pixel_values=pixel_values,
+                tile_fine_mask=mx.array([True]),
+                cached_image_features=coarse,
+            )
+        assert spy.call_count == 1
+        image_rows = mx.any(fine.deepstack_visual_embeds != 0, axis=(2, 3))
+        assert int(image_rows.sum()) == 16
+
+    def test_server_vision_cache_stores_and_reuses_features(self):
+        from mlx_vlm.vision_cache import VisionFeatureCache
+
+        model = self._model()
+        pixel_values = mx.random.normal((1, 1, 3, 16, 16))
+        ids = self._prompt(4, 1)
+        cache = VisionFeatureCache()
+        options = {"vision_cache": cache, "_image_key": "page"}
+        first = model.get_input_embeddings(ids, pixel_values=pixel_values, **options)
+        assert cache.get("page") is not None
+        with patch.object(
+            type(model.vision_model), "__call__", side_effect=AssertionError
+        ):
+            second = model.get_input_embeddings(
+                ids, pixel_values=pixel_values, **options
+            )
+        assert mx.array_equal(first.inputs_embeds, second.inputs_embeds)
+
     def test_fine_route_needs_the_fine_connector(self):
         model = self._model()
         with pytest.raises(ValueError, match="no fine connector path"):
