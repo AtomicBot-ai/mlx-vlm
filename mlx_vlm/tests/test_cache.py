@@ -1897,6 +1897,9 @@ def test_layer_major_threshold(managers, monkeypatch):
 
 def test_disk_block_lifecycle(managers, monkeypatch):
     monkeypatch.setenv("APC_DISK_SHARD_MAX_BLOCKS", "1")
+    # Disk writes are gated on free host RAM; pin the gate so runner pressure
+    # cannot turn a lifecycle assertion into a skip.
+    monkeypatch.setenv("APC_DISK_MIN_FREE_RAM_GB", "0")
     manager = managers("disk", blocks=1)
     first, second = list(range(48)), list(range(100, 148))
     manager.release(store_blocks(manager, first))
@@ -1920,7 +1923,10 @@ def test_disk_block_lifecycle(managers, monkeypatch):
 
 
 @parametrize("evicted", [1, 2])
-def test_disk_prefix_with_evicted_leading_blocks(managers, evicted):
+def test_disk_prefix_with_evicted_leading_blocks(managers, evicted, monkeypatch):
+    # Same free-RAM gate as test_disk_block_lifecycle: pin it so a busy runner
+    # cannot silently skip disk persistence.
+    monkeypatch.setenv("APC_DISK_MIN_FREE_RAM_GB", "0")
     manager = managers("disk", blocks=3)
     tokens = list(range(48))
     source = [filled(C.KVCache(), 48, heads=1, dim=4)]
