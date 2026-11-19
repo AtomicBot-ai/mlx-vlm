@@ -3033,6 +3033,39 @@ def test_parser_contract(name):
         assert result.remaining_text == text
 
 
+@pytest.mark.parametrize(
+    "query,limit,expected",
+    [
+        ("weather", "5", dict(query="weather", limit=5)),
+        ("null", "null", dict(query=None, limit=None)),
+    ],
+)
+def test_minimax_m2_nullable_parameters(query, limit, expected):
+    tools = [
+        dict(
+            type="function",
+            function=dict(
+                name="search",
+                parameters=dict(
+                    type="object",
+                    properties=dict(
+                        query={"anyOf": [{"type": "string"}, {"type": "null"}]},
+                        limit={"type": ["integer", "null"]},
+                    ),
+                ),
+            ),
+        )
+    ]
+    text = (
+        '<minimax:tool_call><invoke name="search">'
+        f'<parameter name="query">{query}</parameter>'
+        f'<parameter name="limit">{limit}</parameter>'
+        "</invoke></minimax:tool_call>"
+    )
+
+    assert _parse("minimax_m2", text, tools) == _call("search", **expected)
+
+
 @pytest.mark.parametrize("name", PARSER_NAMES)
 def test_parser_selection(name):
     # Specific formats must outrank the generic JSON fallback.
