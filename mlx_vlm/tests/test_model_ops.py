@@ -1297,6 +1297,9 @@ def test_qwen2_5_vl_video_rope_index_scales_temporal_positions():
     # so temporal positions step by tokens_per_second (2), not by 1.
     position_ids, deltas = lm.get_rope_index(input_ids, video_grid_thw=video_grid_thw)
     mx.eval(position_ids, deltas)
+    # get_rope_index returns integer positions (HF LongTensor parity), even
+    # though the temporal axis is scaled through a float intermediate.
+    assert position_ids.dtype == mx.int32
     assert position_ids[0, 0].tolist() == [0, 1, 3, 4, 5]
     assert position_ids[1, 0].tolist() == [0, 1, 1, 4, 5]
     assert position_ids[2, 0].tolist() == [0, 1, 1, 4, 5]
