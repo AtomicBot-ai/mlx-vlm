@@ -1913,14 +1913,6 @@ def process_inputs(
         for key in ("min_pixels", "max_pixels", "resized_height", "resized_width"):
             if kwargs.get(key) is not None:
                 args[key] = kwargs[key]
-        # Also forward the options that the image processor declares, such as
-        # Granite for Docling's fine_route.
-        image_processor = getattr(processor, "image_processor", None)
-        valid_kwargs = getattr(image_processor, "valid_kwargs", None)
-        declared = getattr(valid_kwargs, "__annotations__", {})
-        for key in declared.keys() - args.keys() - {"device"}:
-            if kwargs.get(key) is not None:
-                args[key] = kwargs[key]
 
     # Add audio if provided and supported
     if audio is not None and len(audio) > 0:

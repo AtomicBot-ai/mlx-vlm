@@ -14,8 +14,7 @@ Supported checkpoints:
 - [`ibm-granite/granite-for-docling-2b`](https://huggingface.co/ibm-granite/granite-for-docling-2b)
 - `ibm-granite/granite-for-docling-500m` (fine connector path and density router)
 
-The processor is `GraniteDoclingProcessor` from Transformers. It needs
-`transformers>=5.23.0`.
+The local Granite Docling processor uses Pillow for page tiling and resizing.
 
 ## Usage
 
