@@ -1404,9 +1404,13 @@ def load_image(
 
 
 def resize_image(img, max_size):
+    if max_size[0] <= 0 or max_size[1] <= 0:
+        raise ValueError("resize target dimensions must be positive")
 
     ratio = min(max_size[0] / img.width, max_size[1] / img.height)
-    new_size = (int(img.width * ratio), int(img.height * ratio))
+    # Extreme aspect ratios truncate one side to zero; PIL rejects 0-size
+    # images, so keep at least one pixel on each axis.
+    new_size = (max(1, int(img.width * ratio)), max(1, int(img.height * ratio)))
     return img.resize(new_size)
 
 

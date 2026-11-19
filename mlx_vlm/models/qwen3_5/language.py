@@ -1305,6 +1305,10 @@ class Qwen3_5Model(nn.Module):
         self.ssm_idx = 0
         self.fa_idx = args.full_attention_interval - 1
 
+    @property
+    def execution_layers(self):
+        return self.layers
+
     def __call__(
         self,
         inputs: mx.array,
@@ -1320,8 +1324,9 @@ class Qwen3_5Model(nn.Module):
         else:
             h = inputs_embeds
 
+        layers = self.execution_layers
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * len(layers)
 
         fa_cache = cache[self.fa_idx]
         # Row extraction keeps padded prefill equivalent to an unpadded prompt.
@@ -1441,11 +1446,11 @@ class Qwen3_5Model(nn.Module):
             if isinstance(fa_mask, str) and fa_mask == "left_padded_decode"
             else None
         )
-        _set_qwen3_5_decode_left_padding(cache, self.layers, decode_left_padding)
+        _set_qwen3_5_decode_left_padding(cache, layers, decode_left_padding)
 
         position_embeddings = None
         if position_ids is not None:
-            for layer in self.layers:
+            for layer in layers:
                 if not layer.is_linear:
                     if not layer.self_attn.rotary_emb.fused_apply:
                         position_embeddings = layer.self_attn.rotary_emb(
@@ -1454,7 +1459,7 @@ class Qwen3_5Model(nn.Module):
                     break
 
         capture_set = set(capture_layer_ids) if capture_layer_ids else set()
-        for i, (layer, c) in enumerate(zip(self.layers, cache)):
+        for i, (layer, c) in enumerate(zip(layers, cache)):
             mask = ssm_mask if layer.is_linear else fa_mask
             h = layer(
                 h,

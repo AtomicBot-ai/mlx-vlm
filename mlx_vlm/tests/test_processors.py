@@ -74,6 +74,7 @@ from mlx_vlm.utils import (
     load_video,
     prepare_inputs,
     process_image,
+    resize_image,
     resolve_video_sampling,
     should_add_special_tokens,
 )
@@ -2251,6 +2252,7 @@ def test_extract_text_from_content(content, expected):
         ("qwen3_omni_moe", "qwen-image-audio"),
         ("gemma4_unified", "video-audio"),
         ("prism_hadamard_qwen35", "image-video"),
+        ("sensenova_loop", "images"),
         ("step3p7", "patch"),
     ],
 )
@@ -2263,9 +2265,12 @@ def test_prompt_media_format(family, kind):
         text, options = "What do you see?", dict(num_images=1)
     elif kind == "image-video":
         options = dict(num_images=2, video="clip.mp4")
+    elif kind == "images":
+        options = dict(num_images=2)
     text_part = dict(type="text", text=text, content=text)
     expected = {
         "image-audio": [dict(type="image"), text_part, dict(type="audio")],
+        "images": [dict(type="image"), dict(type="image"), text_part],
         "qwen-image-audio": [dict(type="audio"), dict(type="image"), text_part],
         "video-audio": [
             dict(type="video", video="clip.mp4", max_pixels=224 * 224, fps=1),
@@ -2760,19 +2765,97 @@ def test_apply_chat_template_preserves_explicit_thinking_enabled():
     assert result.endswith("<think>\n")
 
 
-def test_qwen3_omni_enables_thinking_by_default():
+@pytest.mark.parametrize(
+    "model_type", ["qwen3_omni_moe", "qwen3_5_moe", "minimax_m3_vl"]
+)
+def test_apply_chat_template_preserves_unspecified_thinking(model_type):
     processor = MagicMock(chat_template="{{ messages }}")
     processor.apply_chat_template.return_value = "prompt"
 
     result = apply_chat_template(
-        processor, {"model_type": "qwen3_omni_moe"}, "Describe this image."
+        processor, {"model_type": model_type}, "Describe this image."
     )
 
     assert result == "prompt"
-    assert processor.apply_chat_template.call_args.kwargs["enable_thinking"] is True
+    assert "enable_thinking" not in processor.apply_chat_template.call_args.kwargs
 
 
-def test_apply_chat_template_maps_enable_thinking_for_thinking_mode_templates():
+@pytest.mark.parametrize("model_type", ["qwen3_omni_moe", "qwen3_5_moe"])
+@pytest.mark.parametrize("enabled", [None, True, False])
+def test_qwen_template_only_inserts_empty_thinking_when_explicitly_disabled(
+    model_type, enabled
+):
+    # Generation suffix from Qwen3-Omni-30B-A3B-Instruct (issue #2745).
+    tokenizer = fast_tokenizer(chat_template="""
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+    {%- if enable_thinking is defined and enable_thinking is false %}
+        {{- '<think>\n\n</think>\n\n' }}
+    {%- endif %}
+{%- endif %}
+""")
+    kwargs = {} if enabled is None else {"enable_thinking": enabled}
+    result = apply_chat_template(
+        tokenizer, {"model_type": model_type}, "Describe this image.", **kwargs
+    )
+    assert result == "<|im_start|>assistant\n" + (
+        "<think>\n\n</think>\n\n" if enabled is False else ""
+    )
+
+
+@pytest.mark.parametrize("default", [True, False])
+def test_template_processor_keeps_its_python_thinking_default(default):
+    class Processor:
+        chat_template = "{{ messages }}"
+
+        def apply_chat_template(
+            self,
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=default,
+        ):
+            return enable_thinking
+
+    assert get_chat_template(Processor(), [], True) is default
+
+
+@pytest.mark.parametrize("default", [True, False])
+@pytest.mark.parametrize("kwargs", [{}, {"enable_thinking": None}])
+def test_template_keeps_its_jinja_thinking_default(default, kwargs):
+    tokenizer = fast_tokenizer(
+        chat_template="{{ enable_thinking | default(" + str(default).lower() + ") }}"
+    )
+    assert apply_chat_template(
+        tokenizer, {"model_type": "qwen3_5_moe"}, "Hi", **kwargs
+    ) == str(default)
+
+
+@pytest.mark.parametrize(
+    "kwargs,expected",
+    [
+        ({}, "adaptive"),
+        ({"enable_thinking": None}, "adaptive"),
+        ({"enable_thinking": True}, "enabled"),
+        ({"enable_thinking": False}, "disabled"),
+        ({"enable_thinking": True, "thinking_mode": "disabled"}, "disabled"),
+        ({"enable_thinking": False, "thinking_mode": "adaptive"}, "adaptive"),
+    ],
+)
+def test_thinking_mode_preserves_default_and_explicit_override(kwargs, expected):
+    tokenizer = fast_tokenizer(
+        chat_template="{{ thinking_mode | default('adaptive') }}"
+    )
+    assert (
+        apply_chat_template(tokenizer, {"model_type": "minimax_m3_vl"}, "Hi", **kwargs)
+        == expected
+    )
+
+
+@pytest.mark.parametrize("enabled,mode", [(True, "enabled"), (False, "disabled")])
+def test_apply_chat_template_maps_enable_thinking_for_thinking_mode_templates(
+    enabled, mode
+):
     class ThinkingModeProcessor:
         chat_template = "{% if thinking_mode == 'enabled' %}<mm:think>{% endif %}"
 
@@ -2792,12 +2875,12 @@ def test_apply_chat_template_maps_enable_thinking_for_thinking_mode_templates():
         {"model_type": "minimax_m3_vl"},
         "Describe this image.",
         num_images=1,
-        enable_thinking=True,
+        enable_thinking=enabled,
     )
 
     assert result == "prompt"
-    assert processor.kwargs["enable_thinking"] is True
-    assert processor.kwargs["thinking_mode"] == "enabled"
+    assert processor.kwargs["enable_thinking"] is enabled
+    assert processor.kwargs["thinking_mode"] == mode
 
 
 class TestModelSpecificPromptContracts:
@@ -5158,3 +5241,26 @@ def test_inkling2_image_padding_transparency_and_placeholder_counts():
         processor(text="<image><image>", images=transparent)
     with pytest.raises(ValueError, match="More images"):
         processor(text="hello", images=transparent)
+
+
+class TestResizeImageGuards:
+    def test_extreme_aspect_ratio_keeps_a_positive_dimension(self):
+        img = Image.new("RGB", (10000, 2))
+        resized = resize_image(img, (320, 320))
+        assert resized.size == (320, 1)
+
+    @pytest.mark.parametrize("target", [(320, 0), (-1, 320)])
+    def test_non_positive_target_dimensions_raise(self, target):
+        img = Image.new("RGB", (640, 480))
+        with pytest.raises(
+            ValueError, match="resize target dimensions must be positive"
+        ):
+            resize_image(img, target)
+
+    def test_regular_downscale_is_unchanged(self):
+        img = Image.new("RGB", (640, 480))
+        assert resize_image(img, (320, 320)).size == (320, 240)
+
+    def test_small_image_upscale_behavior_is_unchanged(self):
+        img = Image.new("RGB", (100, 150))
+        assert resize_image(img, (320, 320)).size == (213, 320)

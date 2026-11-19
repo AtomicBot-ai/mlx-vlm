@@ -48,10 +48,10 @@ class MLXVisionChat:
         self.vision_cache = VisionFeatureCache()
         self.prompt_cache_state = PromptCacheState()
         thinking_mode = kwargs.pop("thinking_mode", None)
-        enable_thinking = kwargs.get("enable_thinking", False)
-        self.chat_template_kwargs = {
-            "enable_thinking": enable_thinking,
-        }
+        enable_thinking = kwargs.get("enable_thinking")
+        self.chat_template_kwargs = {}
+        if enable_thinking is not None:
+            self.chat_template_kwargs["enable_thinking"] = enable_thinking
         if thinking_mode is not None:
             self.chat_template_kwargs["thinking_mode"] = thinking_mode
         self.stream_kwargs = kwargs
@@ -296,10 +296,12 @@ def main():
     )
     parser.add_argument(
         "--enable-thinking",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help=(
-            "Enable thinking in the chat template. Templates that use "
-            "thinking_mode receive thinking_mode='enabled'."
+            "Enable or disable thinking in the chat template. When omitted, "
+            "use the model's template default. Templates that use thinking_mode "
+            "receive 'enabled' or 'disabled'."
         ),
     )
     parser.add_argument(
@@ -349,7 +351,8 @@ def main():
         kwargs["skip_special_tokens"] = args.skip_special_tokens
 
     # Thinking kwargs
-    kwargs["enable_thinking"] = args.enable_thinking
+    if args.enable_thinking is not None:
+        kwargs["enable_thinking"] = args.enable_thinking
     if args.thinking_mode is not None:
         kwargs["thinking_mode"] = args.thinking_mode
     if args.thinking_budget is not None:

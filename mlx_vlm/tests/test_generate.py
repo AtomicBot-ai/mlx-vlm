@@ -1497,6 +1497,55 @@ class TestThinkingBudgetCriteria:
         assert criteria.pop_forced_token_id() is None
 
 
+@pytest.mark.parametrize(
+    "override",
+    [
+        {},
+        {"enable_thinking": None},
+        {"enable_thinking": True},
+        {"enable_thinking": False},
+    ],
+)
+@pytest.mark.parametrize("prompt_ids", [[1, 99], [99, 50, 100, 1], [1, 2]])
+def test_stream_generate_budget_follows_default_thinking(override, prompt_ids):
+    tokenizer = FakeTokenizer()
+    model = SimpleNamespace(config=MockConfig(), language_model=SimpleNamespace())
+    with (
+        patch.object(
+            dispatch_module, "wired_limit", return_value=contextlib.nullcontext()
+        ),
+        patch.object(dispatch_module, "make_streaming_detokenizer"),
+        patch.object(
+            dispatch_module, "generate_step", return_value=iter(())
+        ) as generate,
+    ):
+        list(
+            dispatch_module.stream_generate(
+                model,
+                tokenizer,
+                prompt="",
+                input_ids=mx.array([prompt_ids]),
+                pixel_values=None,
+                mask=None,
+                prompt_cache=[],
+                thinking_budget=1,
+                **override,
+            )
+        )
+
+    criteria = generate.call_args.kwargs["thinking_budget_criteria"]
+    enabled = override.get("enable_thinking") is not False
+    assert criteria.in_thinking is (enabled and prompt_ids[-1] == 99)
+    if prompt_ids[-1] != 99:
+        # Ordinary answer tokens and closed blocks must not consume the budget.
+        assert criteria(50) is None
+        assert criteria.thinking_token_count == 0
+        criteria(99)  # The model can open a thinking block itself.
+    assert criteria(50) is None
+    assert criteria(51) == (10 if enabled else None)
+    assert criteria(52) == (100 if enabled else None)
+
+
 @pytest.mark.parametrize("reused_prefix", [0, 1, 2])
 def test_stream_generate_stores_checkpoint_only_before_decode(reused_prefix):
     class FakeStoppingCriteria:
@@ -3362,3 +3411,16 @@ def test_ernie_echo_batch_padding_completion_and_late_arrival(batch_size):
         assert [actual[uid] for uid in uids] == expected
     finally:
         gen.close()
+
+
+class TestApplyMinPZeroThreshold:
+    def test_zero_threshold_keeps_every_token(self):
+        logprobs = mx.array([[-0.1, -2.5, -8.0, -20.0]], dtype=mx.float32)
+        result = sampling.apply_min_p(logprobs, 0.0)
+        assert mx.array_equal(result, logprobs).item()
+
+    def test_positive_threshold_still_filters(self):
+        logprobs = mx.array([[-0.1, -2.5, -8.0, -20.0]], dtype=mx.float32)
+        filtered = sampling.apply_min_p(logprobs, 0.5)
+        assert filtered[0, 0] == logprobs[0, 0]
+        assert mx.isinf(filtered[0, 1:]).all().item()
