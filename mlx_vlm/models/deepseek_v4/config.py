@@ -81,3 +81,18 @@ class ModelConfig(BaseModelConfig):
         bad = [r for r in self.compress_ratios if r not in (0, 4, 128)]
         if bad:
             raise ValueError(f"Unsupported DeepSeek-V4 compress ratios: {bad}")
+
+
+def validate_sharding(config: dict, world_size: int):
+    """Validate partitioned query heads and expert widths; latent KV is replicated."""
+    args = ModelConfig.from_dict(config)
+    if world_size < 1:
+        raise ValueError("The worker count must be positive")
+    if args.num_attention_heads % (args.o_groups * world_size):
+        raise ValueError(
+            "The query heads in each output group must divide evenly across workers"
+        )
+    if args.moe_intermediate_size % world_size:
+        raise ValueError(
+            "The expert intermediate size must divide evenly across workers"
+        )

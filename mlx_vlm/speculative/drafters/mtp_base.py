@@ -145,6 +145,18 @@ class AutoregressiveMTPDraftModel(nn.Module):
         self._set_seed_from_hidden(logits_hidden[:, -1:, :], sampler, greedy)
         self._seed_hidden = pre_hc_hidden[:, -1:, ...]
 
+    def _prepare_verified_cache(
+        self, verify_hidden, draft_tokens, accepted, token_dtype
+    ):
+        """Return how many accepted inputs are already in the draft cache."""
+        keep_appended = min(int(accepted), self._round_appended)
+        trim = self._round_appended - keep_appended
+        if trim > 0:
+            for cache in self._cache:
+                cache.trim(trim)
+            self._next_position -= trim
+        return keep_appended
+
     def accept_verified_tokens(
         self,
         verify_hidden: mx.array,
@@ -155,12 +167,9 @@ class AutoregressiveMTPDraftModel(nn.Module):
         token_dtype: mx.Dtype = mx.int32,
         greedy: bool = False,
     ) -> None:
-        keep_appended = min(int(accepted), self._round_appended)
-        trim = self._round_appended - keep_appended
-        if trim > 0:
-            for cache in self._cache:
-                cache.trim(trim)
-            self._next_position -= trim
+        keep_appended = self._prepare_verified_cache(
+            verify_hidden, draft_tokens, int(accepted), token_dtype
+        )
 
         token_chunks = []
         hidden_chunks = []
@@ -212,12 +221,9 @@ class AutoregressiveMTPDraftModel(nn.Module):
             raise ValueError("This MTP drafter requires uniform batch acceptance.")
         accepted_i = accepted_set.pop()
 
-        keep_appended = min(accepted_i, self._round_appended)
-        trim = self._round_appended - keep_appended
-        if trim > 0:
-            for cache in self._cache:
-                cache.trim(trim)
-            self._next_position -= trim
+        keep_appended = self._prepare_verified_cache(
+            verify_hidden, draft_tokens, accepted_i, token_dtype
+        )
 
         token_chunks = []
         hidden_chunks = []

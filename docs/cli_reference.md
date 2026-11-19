@@ -24,5 +24,11 @@ python -m mlx_vlm generate --help
 
 Each command accepts `--help` for full usage information.
 
+For per-request `distributed: true`, start the public server with
+`--distributed-config cluster.json`. Include `launch` settings in that JSON to
+start and stop the worker group automatically over SSH. Omit `launch` when you
+manage `--distributed-worker` processes separately. See
+[distributed serving](distributed-serving.md).
+
 Decision CLI and HTTP examples, including `--decision-model` preloading, are in
 the [decision models guide](https://github.com/Neywa-Labs/mlx-vlm#decision-models).

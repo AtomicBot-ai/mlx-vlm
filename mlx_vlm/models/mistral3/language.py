@@ -223,12 +223,33 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         **kwargs,
     ):
-        out = self.model(inputs=inputs, cache=cache, inputs_embeds=inputs_embeds)
+        if kwargs.pop("speculative_verify", False):
+            from ...speculative.common import verify_forward
+
+            output, output_state = verify_forward(self, inputs, cache, **kwargs)
+            output.gdn_states = output_state
+            return output
+
+        capture_layer_ids = kwargs.get("capture_layer_ids")
+        hidden = [] if capture_layer_ids is not None else None
+        capture = (
+            dict(capture_layer_ids=capture_layer_ids, hidden_sink=hidden)
+            if capture_layer_ids is not None
+            else {}
+        )
+        out = self.model(
+            inputs=inputs, cache=cache, inputs_embeds=inputs_embeds, **capture
+        )
         if self.config.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
             out = self.lm_head(out)
-        return LanguageModelOutput(logits=out)
+        return LanguageModelOutput(logits=out, hidden_states=hidden)
+
+    def rollback_speculative_cache(self, caches, state, accepted, block_size):
+        from ...speculative.cache_state import rollback_speculative_cache
+
+        return rollback_speculative_cache(caches, state, accepted, block_size)
 
     def sanitize(self, weights):
         # Remove unused precomputed rotary freqs

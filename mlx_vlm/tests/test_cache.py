@@ -25,6 +25,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import pytest
+from mlx.utils import tree_flatten
 
 import mlx_vlm.models as models
 import mlx_vlm.turboquant as tq
@@ -84,7 +85,15 @@ from mlx_vlm.models.qwen4_exp.language import (
 )
 from mlx_vlm.models.unlimited_ocr.language import RingSlidingKVCache
 from mlx_vlm.models.z1t.language import AFTConv, Z1TCache
-from mlx_vlm.tests.test_models import DATA, build_config, model_case
+from mlx_vlm.speculative import dflash
+from mlx_vlm.speculative.common import verify_forward
+from mlx_vlm.tests.test_models import (
+    DATA,
+    build_config,
+    make_ernie55_model,
+    model_case,
+    tiny_language_model,
+)
 from mlx_vlm.turboquant import (
     BatchTurboQuantKVCache,
     TurboQuantKVCache,
@@ -3238,6 +3247,8 @@ def finish_batch(batch, sample=None):
 
 
 def embeddings(lm, tokens):
+    if callable(embed := getattr(lm.model, "embed", None)):
+        return embed(tokens)
     return lm.model.embed_tokens(tokens) * getattr(lm.model, "embed_scale", 1)
 
 
@@ -3394,7 +3405,7 @@ def test_diffusion_suffix(prefix_manager, tier):
     assert recorder.input_lengths[-1] == 1
 
 
-@parametrize("model_name", ["gemma4", "qwen3_5"])
+@parametrize("model_name", ["gemma4", "qwen3_5", "inkling2"])
 @parametrize("tier", ["memory", "disk"])
 @parametrize("path", ["stream", "batch"])
 def test_hybrid_prefix_generation(prefix_manager, model_name, tier, path):
@@ -4384,3 +4395,272 @@ def test_warm_rows_decode_while_cold_row_prefills(prefix_manager, model_name):
     assert manager._prefill_reserve_bytes == 0
     assert manager.memory_plan.lengths == []
     gen.close()
+
+
+def assert_cache_state_close(actual, expected, *, atol=0, rtol=0):
+    actual, expected = dict(tree_flatten(actual)), dict(tree_flatten(expected))
+    assert actual.keys() == expected.keys()
+    for key, value in actual.items():
+        reference = expected[key]
+        if value is None or reference is None:
+            assert value is reference, key
+        else:
+            assert value.shape == reference.shape, key
+            np.testing.assert_allclose(
+                np.array(value),
+                np.array(reference),
+                atol=atol,
+                rtol=rtol,
+                equal_nan=False,
+                err_msg=key,
+            )
+
+
+@pytest.mark.parametrize(
+    "family", ["qwen3", "llama", "mistral4", "kimi_k3", "deepseek_v41"]
+)
+@pytest.mark.parametrize("keep", [0, 1, 3])
+def test_target_hidden_capture_and_rejected_prefix(family, keep):
+    mx.random.seed(5)
+    model = tiny_language_model(family)
+    ordinary, speculative = C.make_prompt_cache(model), C.make_prompt_cache(model)
+    prompt, block = mx.array([[1, 2, 3, 4, 5, 6, 7]]), mx.array([[8, 9, 10]])
+    taps = [0, 1]
+    first = model(prompt, cache=ordinary, capture_layer_ids=taps)
+    assert_cache_state_close(first.logits, model(prompt, cache=speculative).logits)
+    assert len(first.hidden_states) == len(taps)
+    output, transaction = dflash._dflash_verify(model, block, speculative, taps)
+    expected = [
+        model(block[:, i : i + 1], cache=ordinary, capture_layer_ids=taps)
+        for i in range(keep)
+    ]
+    mx.eval(output.logits)
+    if keep:
+        model.rollback_speculative_cache(speculative, transaction, keep - 1, 3)
+    else:
+        transaction.commit([0])
+    if keep:
+        assert_cache_state_close(
+            output.logits[:, :keep],
+            mx.concatenate([out.logits for out in expected], axis=1),
+            atol=1e-4,
+            rtol=1e-4,
+        )
+        for index, hidden in enumerate(output.hidden_states):
+            assert_cache_state_close(
+                hidden[:, :keep],
+                mx.concatenate([out.hidden_states[index] for out in expected], axis=1),
+                atol=1e-4,
+                rtol=1e-4,
+            )
+    assert_cache_state_close(
+        [c.state for c in speculative],
+        [c.state for c in ordinary],
+        atol=1e-4,
+        rtol=1e-4,
+    )
+    assert_cache_state_close(
+        model(mx.array([[11]]), cache=speculative).logits,
+        model(mx.array([[11]]), cache=ordinary).logits,
+        atol=1e-4,
+        rtol=1e-4,
+    )
+
+
+@pytest.mark.parametrize(
+    "length,keep",
+    [
+        (1, [0, 1]),
+        (9, [1, 9]),
+        (11, None),
+        (11, "error"),
+        (11, [0, 0]),
+        (11, [1, 3]),
+        (11, [5, 11]),
+    ],
+)
+def test_kimi_block_verification_restores_batch_rows(length, keep, monkeypatch):
+    mx.random.seed(5)
+    model = tiny_language_model("kimi_k3")
+    references = [model.make_cache() for _ in range(2)]
+    for prompt, cache in zip([[1, 2, 3, 4], [2, 3]], references):
+        model(mx.array([prompt]), cache=cache)
+    caches = [
+        (C.BatchKVCache if isinstance(rows[0], C.KVCache) else type(rows[0])).merge(
+            rows
+        )
+        for rows in zip(*references)
+    ]
+    block = mx.array([list(range(5, 5 + length)), list(range(7, 7 + length))])
+    calls = []
+    forward = type(model.model).__call__
+
+    def record_forward(inner, inputs, *args, **kwargs):
+        calls.append(inputs.shape[1])
+        if keep == "error" and len(calls) == 2:
+            raise RuntimeError("failed verification")
+        return forward(inner, inputs, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(type(model.model), "__call__", record_forward)
+        if keep == "error":
+            with pytest.raises(RuntimeError, match="failed verification"):
+                dflash._dflash_verify(model, block, caches, [0, 1])
+            keep = None
+        else:
+            _, transaction = dflash._dflash_verify(model, block, caches, [0, 1])
+            if keep is None:
+                transaction.abort()
+            else:
+                transaction.commit(keep)
+    assert calls == ([length] if length <= 8 else [8, length - 8])
+    for row, count in enumerate(keep or [0, 0]):
+        for token in range(count):
+            model(block[row : row + 1, token : token + 1], cache=references[row])
+        restored = [cache.extract(row) for cache in caches]
+        assert_cache_state_close(
+            [cache.state for cache in restored],
+            [cache.state for cache in references[row]],
+            atol=1e-4,
+            rtol=1e-4,
+        )
+        assert_cache_state_close(
+            model(mx.array([[20]]), cache=restored).logits,
+            model(mx.array([[20]]), cache=references[row]).logits,
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+
+@pytest.mark.parametrize("abort", [False, True])
+def test_deepseek_v41_batch_cache_restores_all_state(abort):
+    model = tiny_language_model("deepseek_v41")
+    prompts = [mx.array([[1, 2, 3, 4, 5, 6, 7]]), mx.array([[2, 3, 4, 5]])]
+    caches = [model.make_cache()[0] for _ in prompts]
+    expected = [model.make_cache()[0] for _ in prompts]
+    for prompt, actual, reference in zip(prompts, caches, expected):
+        model(prompt, cache=[actual])
+        model(prompt, cache=[reference])
+    batch = type(caches[0]).merge(caches)
+    block = mx.array([[8, 9, 10], [5, 6, 7]])
+    _, transaction = verify_forward(model, block, [batch])
+    if abort:
+        transaction.abort()
+    else:
+        transaction.commit([1, 3])
+    for i, count in enumerate([0, 0] if abort else [1, 3]):
+        for j in range(count):
+            model(block[i : i + 1, j : j + 1], cache=[expected[i]])
+        assert_cache_state_close(
+            batch.rows[i].state, expected[i].state, atol=1e-5, rtol=1e-5
+        )
+        assert batch.rows[i].offset == expected[i].offset
+    assert not batch.is_speculating and not any(
+        row.is_speculating for row in batch.rows
+    )
+
+
+def test_inkling2_padded_batch_decode_and_extract():
+    from mlx_vlm.generate.ar import _make_cache
+    from mlx_vlm.models.inkling2 import Model, ModelConfig
+
+    mx.random.seed(23)
+    model = Model(ModelConfig.from_dict(model_case("inkling2")["config"]))
+    model.eval()
+    # Nonzero relative profiles expose ordering errors when a ring wraps.
+    for layer in model.layers:
+        layer.self_attn.rel_proj = mx.random.normal(layer.self_attn.rel_proj.shape)
+    ids = mx.array([[0, 0, 1, 2, 3, 4, 5], [6, 7, 8, 9, 10, 11, 12]])
+    cache = _make_cache(model.language_model, [2, 0])
+    chunks = [
+        model(ids[:, :3], cache=cache).logits,
+        model(ids[:, 3:], cache=cache).logits,
+    ]
+    logits = mx.concatenate(chunks, axis=1)
+    for row, padding in enumerate((2, 0)):
+        expected = model(ids[row : row + 1, padding:]).logits
+        np.testing.assert_allclose(
+            np.array(logits[row : row + 1, padding:]),
+            np.array(expected),
+            atol=2e-5,
+            rtol=2e-5,
+        )
+    token = mx.array([[13], [14]])
+    actual = model(token, cache=cache).logits
+    for row, padding in enumerate((2, 0)):
+        full = mx.concatenate(
+            [ids[row : row + 1, padding:], token[row : row + 1]], axis=1
+        )
+        expected = model(full).logits[:, -1:]
+        np.testing.assert_allclose(
+            np.array(actual[row : row + 1]), np.array(expected), atol=2e-5, rtol=2e-5
+        )
+    extracted = [layer.extract(0) for layer in cache]
+    next_token = mx.array([[15]])
+    expected = model(
+        mx.concatenate([ids[:1, 2:], token[:1], next_token], axis=1)
+    ).logits[:, -1:]
+    np.testing.assert_allclose(
+        np.array(model(next_token, cache=extracted).logits),
+        np.array(expected),
+        atol=2e-5,
+        rtol=2e-5,
+    )
+
+
+def test_ernie55_chunked_decode_compression_and_sparse_attention():
+    model = make_ernie55_model(learned=True)
+    tokens = mx.arange(19)[None]
+    expected = model(tokens).logits
+    for chunks in ([1] * 19, [2, 2, 3, 4, 8], [7, 1, 8, 3], [8, 8, 3]):
+        cache = model.make_cache()
+        actual, offset = [], 0
+        for size in chunks:
+            actual.append(model(tokens[:, offset : offset + size], cache=cache).logits)
+            offset += size
+        actual = mx.concatenate(actual, axis=1)
+        np.testing.assert_allclose(actual, expected, atol=2e-5, rtol=2e-5)
+        assert cache[0][1].pooled.shape[1] == 2
+        assert cache[0][1].remainder == 3
+        assert cache[1][0].offset == 19
+        assert cache[1][1].offset == 19
+    # Future tokens must not leak through a completed compressor window.
+    changed = mx.concatenate([tokens[:, :7], mx.full((1, 12), 99)], axis=1)
+    np.testing.assert_allclose(
+        model(changed).logits[:, :7], expected[:, :7], atol=2e-5, rtol=2e-5
+    )
+
+
+def test_ernie55_cache_merge_extract_filter_and_reset():
+    model = make_ernie55_model(learned=True)
+    caches = []
+    for length in (3, 11):
+        cache = model.make_cache()
+        model(mx.arange(length)[None], cache=cache)
+        caches.append(cache)
+    merged = [CacheList.merge([c[i] for c in caches]) for i in range(2)]
+    inputs = mx.array([[3, 4, 5], [11, 12, 13]])
+    actual = model(inputs, cache=merged).logits
+    expected = mx.concatenate(
+        [model(mx.arange(n + 3)[None]).logits[:, -3:] for n in (3, 11)]
+    )
+    np.testing.assert_allclose(actual, expected, atol=2e-5, rtol=2e-5)
+    extracted = [c.extract(1) for c in merged]
+    for c in merged:
+        c.filter(mx.array([1]))
+    actual = model(mx.array([[14]]), cache=merged).logits
+    np.testing.assert_allclose(
+        actual,
+        model(mx.array([[14]]), cache=extracted).logits,
+        atol=2e-5,
+        rtol=2e-5,
+    )
+    np.testing.assert_allclose(
+        actual, model(mx.arange(15)[None]).logits[:, -1:], atol=2e-5, rtol=2e-5
+    )
+    np.testing.assert_allclose(
+        model(inputs, cache=model.make_cache()).logits,
+        model(inputs).logits,
+        atol=2e-5,
+        rtol=2e-5,
+    )

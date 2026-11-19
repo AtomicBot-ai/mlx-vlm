@@ -34,6 +34,7 @@
     - [Thinking Budget](#thinking-budget)
   - [Speculative Decoding](#speculative-decoding)
     - [DFlash, DFlash2, and DSpark](#dflash-dflash2-and-dspark)
+    - [Bundled native heads](#bundled-native-heads)
     - [Gemma 4 MTP](#gemma-4-mtp)
     - [Gemma 4 EAGLE-3](#gemma-4-eagle-3)
     - [MiniMax M3 EAGLE-3](#minimax-m3-eagle-3)
@@ -60,6 +61,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 
 | Model | Documentation |
 |-------|---------------|
+| Inkling 2 Small | [Docs](mlx_vlm/models/inkling2/README.md) |
 | LFM3 / LFM3-VL | [Docs](mlx_vlm/models/lfm3/README.md) |
 | LFM3-Audio | [Docs](mlx_vlm/models/lfm3_audio/README.md) |
 | LFM3-Omni | [Docs](mlx_vlm/models/lfm3_omni/README.md) |
@@ -68,6 +70,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | Unlimited-OCR | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/unlimited_ocr/README.md) |
 | DOTS-OCR | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/dots_ocr/README.md) |
 | DOTS-MOCR | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/dots_ocr/README.md) |
+| ERNIE 5.5 Flash Base (text) | [Docs](mlx_vlm/models/ernie5_5_moe/README.md) |
 | ERNIE 4.5 VL | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/ernie4_5_moe_vl/README.md) |
 | GLM-OCR | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/glm_ocr/README.md) |
 | Phi-4 Reasoning Vision | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/phi4_siglip/README.md) |
@@ -83,6 +86,8 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | Gemma 4 | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/gemma4/README.md) |
 | Muse Spark Open | [Docs](mlx_vlm/models/muse_spark/README.md) |
 | MiniMax M3 / M3.1 Flash | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/minimax_m3_vl/README.md) |
+| MiniMax-H3-Image | [Docs](mlx_vlm/models/minimax_h3_image/README.md) |
+| Ling 3.1 Flash | [Docs](mlx_vlm/models/bailing_hybrid/README.md) |
 | Falcon-OCR | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/falcon_ocr/README.md) |
 | IndicOCR | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/indic_ocr/README.md) |
 | PP-DocLayoutV3 | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/pp_doclayout_v3/README.md) |
@@ -100,6 +105,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | Spark-X2.5 | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/spark2_5/README.md) |
 | Ternary Bonsai 2 | [Docs](mlx_vlm/models/prism_hadamard_qwen35/README.md) |
 | Flint | [Docs](mlx_vlm/models/flint/README.md) |
+| Ripple | [Docs](mlx_vlm/models/ricursive/README.md) |
 | Nemotron 3.5 Super VL / Bolt / Nano Omni | [Docs](mlx_vlm/models/nemotron_h_nano_omni/README.md) |
 | Idol (image to 3D Gaussian splats) | [Docs](mlx_vlm/models/idol/README.md) |
 
@@ -299,6 +305,22 @@ with `--draft-block-size 10`. The checkpoint's confidence head is loaded for
 parity, and DSpark decoding currently requires greedy sampling
 (`temperature=0`).
 
+Official OpenBMB and Red Hat Speculators checkpoints can also be loaded directly:
+
+```sh
+mlx_vlm.generate --model openbmb/MiniCPM5-2B \
+  --draft-model openbmb/MiniCPM5-2B-DSpark \
+  --prompt "Write a Python function that adds two integers." --temperature 0
+
+mlx_vlm.generate --model Qwen/Qwen3-4B \
+  --draft-model RedHatAI/Qwen3-4B-speculator.dspark \
+  --prompt "Explain speculative decoding." --temperature 0
+```
+
+The loader handles nested Speculators configs, reduced draft vocabularies,
+checkpoint-owned output heads, and each checkpoint's anchor convention.
+See [official checkpoint support](docs/speculative-decoding.md#official-checkpoint-support).
+
 Muse Glimmer's published assistant checkpoint is auto-detected as DFlash:
 
 ```sh
@@ -341,6 +363,20 @@ result = generate(
     draft_kind=draft_kind,
 )
 ```
+
+#### Bundled native heads
+
+Bundled native heads are detected when the same original checkpoint is passed
+as the target and drafter. For example:
+
+```sh
+mlx_vlm.generate --model JetBrains/Mellum2.1-12B-A2.5B-Thinking-MTP \
+  --draft-model JetBrains/Mellum2.1-12B-A2.5B-Thinking-MTP \
+  --prompt "Write a Python function that adds two integers." --temperature 0
+```
+
+This also applies to DeepSeek V4.1's bundled DSpark stages. Use
+`mlx_vlm.convert --mtp` to extract a native head alongside a converted target.
 
 #### Gemma 4 MTP
 
@@ -632,6 +668,10 @@ mlx_vlm.server --api-key <secret-token>
 # Include local models outside the Hugging Face cache
 mlx_vlm.server --model-dir /Volumes/Models --model-dir ~/my-custom-model
 ```
+
+Use `distributed: true` per request to run a model across configured Macs while
+keeping ordinary requests on the local loader. See [distributed serving](docs/distributed-serving.md)
+for worker setup, automatic checkpoint transfer, and current limitations.
 
 #### Server Options
 

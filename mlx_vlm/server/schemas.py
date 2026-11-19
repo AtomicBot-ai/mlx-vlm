@@ -106,12 +106,13 @@ class ImageGenerationRequest(FlexibleBaseModel):
     prompt_expansion_model: Optional[str] = Field(
         None,
         description=(
-            "Model path or Hugging Face repo for prompt expansion. Flux3 uses "
-            "its default upsampler when omitted; Ideogram 4 expansion is optional."
+            "Model path or Hugging Face repo for prompt expansion. Flux3 and MiniMax-H3-Image use "
+            "their default upsamplers when omitted; Ideogram 4 expansion is optional."
         ),
     )
     upsample_prompt: bool | None = Field(
-        None, description="For Flux3, expand prompts automatically; enabled by default."
+        None,
+        description="For Flux3 and MiniMax-H3-Image, expand prompts automatically; enabled by default.",
     )
     boxes: list[dict[str, Any]] | None = Field(
         None,
@@ -194,11 +195,11 @@ class ImageEditRequest(FlexibleBaseModel):
     )
     prompt_expansion_model: str | None = Field(
         None,
-        description="For Flux3, override the default prompt upsampler with a model path or Hub ID.",
+        description="For Flux3 and MiniMax-H3-Image, override the default prompt upsampler with a model path or Hub ID.",
     )
     upsample_prompt: bool | None = Field(
         None,
-        description="For Flux3, expand the instruction using reference images; enabled by default.",
+        description="For Flux3 and MiniMax-H3-Image, expand the instruction using reference images; enabled by default.",
     )
     boxes: list[dict[str, Any]] | None = Field(
         None,
@@ -442,7 +443,18 @@ class ToolResultContext(BaseModel):
     max_bytes: int = Field(8192, ge=512, le=8192)
 
 
-class OpenAIRequest(ImageProcessingRequest, ContinuationOptions):
+class DistributedOptions(FlexibleBaseModel):
+    distributed: bool = Field(
+        False,
+        strict=True,
+        description="Load and execute this model across the configured distributed workers.",
+    )
+    distributed_revision: Optional[str] = Field(
+        None, description="Hub revision to stage for a distributed request."
+    )
+
+
+class OpenAIRequest(ImageProcessingRequest, ContinuationOptions, DistributedOptions):
     """
     OpenAI-compatible request structure.
     Using this structure : https://github.com/openai/openai-python/blob/main/src/openai/resources/responses/responses.py
@@ -809,7 +821,7 @@ StreamEvent = Union[
 # Models for /chat/completion endpoint
 
 
-class VLMRequest(ImageProcessingRequest):
+class VLMRequest(ImageProcessingRequest, DistributedOptions):
     model: str = Field(
         ...,
         description="The path to the local model directory or Hugging Face repo.",

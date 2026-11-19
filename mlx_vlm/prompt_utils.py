@@ -120,6 +120,7 @@ MODEL_CONFIG = {
     "youtu_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "inkling": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "inkling_mm_model": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "inkling2": MessageFormat.LIST_WITH_IMAGE_FIRST,
     # Prompt-only models
     "florence2": MessageFormat.PROMPT_ONLY,
     "plamo2vl": MessageFormat.PROMPT_ONLY,
@@ -132,6 +133,7 @@ MODEL_CONFIG = {
     "nemotron_labs_diffusion": MessageFormat.TEXT_ONLY,
     "deepseek_v4": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "deepseek_v41": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "ernie5_5_moe": MessageFormat.TEXT_ONLY,
     "hrm_text": MessageFormat.TEXT_ONLY,
     "minimax_m3": MessageFormat.TEXT_ONLY,
     "qwen3_5_text": MessageFormat.TEXT_ONLY,

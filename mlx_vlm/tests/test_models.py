@@ -20,7 +20,7 @@ import tempfile
 import textwrap
 import time
 import unittest
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import asdict
 from fnmatch import fnmatchcase
 from operator import attrgetter
@@ -47,6 +47,7 @@ from mlx_vlm.utils import (
     load,
     load_config,
     load_model,
+    sharded_load,
 )
 
 
@@ -1087,6 +1088,33 @@ class ModelChecks:
         assert isinstance(result, InputEmbeddingsFeatures), model_name
         assert result.inputs_embeds is not None
 
+    def deepstack_eval_follows_mode(self, model, config):
+        vc = config.vision_config
+        patch_width = vc.in_channels * vc.temporal_patch_size * vc.patch_size**2
+        grid = (1, 4, 4)
+        count = math.prod(grid) // vc.spatial_merge_size**2
+        ids = mx.array(
+            [
+                [1, config.vision_start_token_id]
+                + [config.image_token_id] * count
+                + [config.vision_end_token_id, 2]
+            ]
+        )
+        media = {
+            "pixel_values": mx.random.normal((math.prod(grid), patch_width)),
+            "image_grid_thw": mx.array([grid]),
+        }
+        real_eval = mx.eval
+        for training in (False, True):
+            model.train(training)
+            with patch.object(mx, "eval", side_effect=real_eval) as spy:
+                features = model.get_input_embeddings(ids, **media)
+            evaluated = any(
+                call.args and call.args[0] is features.deepstack_visual_embeds
+                for call in spy.call_args_list
+            )
+            assert evaluated is not training
+
     def request_positions(self, model):
         language = model.language_model
         positions, deltas = mx.array([[[9, 9, 9]]], mx.int32), mx.array(
@@ -1118,19 +1146,26 @@ class ModelChecks:
         assert actual.shape == (3, 1, 2)
         assert actual.tolist() == positions[:, :, 2:4].tolist()
 
-    def language(self, model, config, *, num_layers=None):
+    def language(self, model, config, *, num_layers=None, logits_dtype=None):
         if num_layers is None:
             num_layers = config.num_hidden_layers
         assert model.model_type == config.model_type
         assert len(model.layers) == num_layers
         for dtype in (mx.float32, mx.float16):
             model.update(tree_map(lambda p: p.astype(dtype), model.parameters()))
+            expected_dtype = getattr(mx, logits_dtype) if logits_dtype else dtype
             logits = model(mx.array([[0, 1]])).logits
-            assert logits.shape == (1, 2, config.vocab_size) and logits.dtype == dtype
+            assert (
+                logits.shape == (1, 2, config.vocab_size)
+                and logits.dtype == expected_dtype
+            )
             logits = model(
                 mx.argmax(logits[0, -1:, :], keepdims=True), cache=None
             ).logits
-            assert logits.shape == (1, 1, config.vocab_size) and logits.dtype == dtype
+            assert (
+                logits.shape == (1, 1, config.vocab_size)
+                and logits.dtype == expected_dtype
+            )
 
     def language_hidden_states(self, model):
         ids = mx.array([[1, 2, 3]])
@@ -1415,6 +1450,8 @@ def check_arguments(kind, case, model, config):
         return (model, name), {}
     if kind == "audio":
         return (model, config, name), case.get("audio", {})
+    if kind == "deepstack_eval_follows_mode":
+        return (model, config), {}
     if kind in {"request_positions", "chunked_positions"}:
         return (model,), {}
     if kind == "language_hidden_states":
@@ -1426,7 +1463,7 @@ def check_arguments(kind, case, model, config):
                 if hasattr(text, "num_hidden_layers")
                 else {"num_layers": text.n_layers}
             )
-            return (model.language_model, text), options
+            return (model.language_model, text), {**options, **case.get("language", {})}
         return (model.language_model, text.hidden_size), {}
     if kind == "projector":
         projector = attrgetter(case.get("projector_path", "multi_modal_projector"))(
@@ -1718,13 +1755,17 @@ def test_mistral_large4_owned_experts_match_masked_reference(training, length):
     )
 
 
+@pytest.mark.parametrize("expert_count", [8, 128])
+@pytest.mark.parametrize("config_filename", ["config.json", "params.json"])
 def test_mistral_large4_shared_loader_native_weights_and_roundtrip(
-    tmp_path, mistral_large4_case
+    tmp_path, mistral_large4_case, expert_count, config_filename
 ):
     from mlx_vlm.quantization.nvfp4 import ScaledQuantizedSwitchLinear
 
     mx.random.seed(31)
     module, args = mistral_large4_case
+    args.text_config.n_routed_experts = expert_count
+    args.text_config.expert_end = expert_count
     reference = module.Model(args)
     native = {}
     direct = {
@@ -1805,9 +1846,12 @@ def test_mistral_large4_shared_loader_native_weights_and_roundtrip(
         "quant_method": "modelopt",
         "quant_algo": "MIXED_PRECISION",
     }
-    (tmp_path / "config.json").write_text(json.dumps(config))
+    (tmp_path / config_filename).write_text(json.dumps(config))
     mx.save_safetensors(str(tmp_path / "model.safetensors"), native)
     model = load_model(tmp_path)
+    if config_filename == "params.json":
+        assert not (tmp_path / "config.json").exists()
+        assert json.loads((tmp_path / "params.json").read_text()) == config
     assert isinstance(
         model.language_model.layers[1].feed_forward.experts.w1,
         ScaledQuantizedSwitchLinear,
@@ -1837,27 +1881,183 @@ def test_mistral_large4_shared_loader_native_weights_and_roundtrip(
     for key in saved:
         assert sanitized[key].dtype == saved[key].dtype, key
         assert mx.array_equal(sanitized[key], saved[key]).item(), key
+
+    def check_partition(rank):
+        group = NS(rank=lambda: rank, size=lambda: 3)
+        start, end = expert_count * rank // 3, expert_count * (rank + 1) // 3
+        partition = load_model(tmp_path, sharding_group=group)
+        assert (
+            partition.language_model.args.expert_start,
+            partition.language_model.args.expert_end,
+        ) == (start, end)
+        before = dict(tree_flatten(partition.parameters()))
+        partition.shard(group)
+        partition.shard(group)
+        after = dict(tree_flatten(partition.parameters()))
+        assert after.keys() == saved.keys()
+        for key, value in after.items():
+            expected = saved[key][start:end] if ".experts." in key else saved[key]
+            assert value is before[key], key
+            assert value.dtype == expected.dtype, key
+            assert mx.array_equal(value, expected).item(), key
+        return before
+
+    # Filter native expert and draft tensors before the shared converter sees them.
+    from mlx_vlm import utils
+
+    convert = utils.transform_quantized_weights
+    for rank in range(3):
+        start, end = expert_count * rank // 3, expert_count * (rank + 1) // 3
+
+        def check_conversion(weights, quantization):
+            assert not any(k.startswith("mtp") for k in weights)
+            assert {
+                int(k.split(".experts.")[1].split(".")[0])
+                for k in weights
+                if ".experts." in k
+            } == set(range(start, end))
+            return convert(weights, quantization)
+
+        with patch.object(utils, "transform_quantized_weights", check_conversion):
+            check_partition(rank)
+
     # Native staging uses global expert IDs, including nonzero starting ranks.
     config["text_config"].update(expert_start=2, expert_end=5)
-    (tmp_path / "config.json").write_text(json.dumps(config))
+    (tmp_path / config_filename).write_text(json.dumps(config))
     partition = load_model(tmp_path)
     for key, value in tree_flatten(partition.parameters()):
         if ".experts." in key:
             assert value.dtype == saved[key].dtype, key
             assert mx.array_equal(value, saved[key][2:5]).item(), key
-    config["text_config"].update(expert_start=0, expert_end=8)
+    config["text_config"].update(expert_start=0, expert_end=expert_count)
     config["quantization_config"] = config["quantization"] = {
         "group_size": 16,
         "bits": 4,
         "mode": "nvfp4",
     }
-    (tmp_path / "config.json").write_text(json.dumps(config))
+    (tmp_path / config_filename).write_text(json.dumps(config))
     mx.save_safetensors(str(tmp_path / "model.safetensors"), saved)
     restored = load_model(tmp_path)
     np.testing.assert_array_equal(
         np.array(restored(ids).logits.astype(mx.float32)),
         np.array(actual.astype(mx.float32)),
     )
+
+    # Stacked weights and native exports share the same exact rank-local values.
+    for rank in range(3):
+        check_partition(rank)
+    full_config = copy.deepcopy(config)
+    for rank in range(3):
+        start, end = expert_count * rank // 3, expert_count * (rank + 1) // 3
+        config["text_config"].update(expert_start=start, expert_end=end)
+        (tmp_path / config_filename).write_text(json.dumps(config))
+        local = {k: v[start:end] if ".experts." in k else v for k, v in saved.items()}
+        mx.save_safetensors(str(tmp_path / "model.safetensors"), local)
+        check_partition(rank)
+        with pytest.raises(
+            ValueError, match="Checkpoint partition.*does not match rank"
+        ):
+            load_model(
+                tmp_path, sharding_group=NS(rank=lambda: (rank + 1) % 3, size=lambda: 3)
+            )
+        # A declared local range must not silently accept full stacked tensors,
+        # even through sharded_load's strict=False path.
+        mx.save_safetensors(str(tmp_path / "model.safetensors"), saved)
+        with pytest.raises(ValueError, match="expected.*experts.*checkpoint"):
+            load_model(
+                tmp_path,
+                strict=False,
+                sharding_group=NS(rank=lambda: rank, size=lambda: 3),
+            )
+        # Native pre-partitions retain global expert IDs.
+        config["quantization_config"] = {
+            "quant_method": "modelopt",
+            "quant_algo": "MIXED_PRECISION",
+        }
+        config.pop("quantization", None)
+        (tmp_path / config_filename).write_text(json.dumps(config))
+        local = {
+            k: v
+            for k, v in native.items()
+            if ".experts." not in k
+            or start <= int(k.split(".experts.")[1].split(".")[0]) < end
+        }
+        mx.save_safetensors(str(tmp_path / "model.safetensors"), local)
+        check_partition(rank)
+        config = copy.deepcopy(full_config)
+
+
+def test_mistral_large4_early_sharding_native_fp8_experts(
+    tmp_path, mistral_large4_case
+):
+    module, args = mistral_large4_case
+    mx.random.seed(45)
+    native = {}
+    for key, value in tree_flatten(module.Model(args).parameters()):
+        if ".experts." not in key:
+            native[key] = value.astype(mx.bfloat16)
+            continue
+        prefix, projection = key.split(".experts.")
+        for i in range(args.text_config.n_routed_experts):
+            name = f"{prefix}.experts.{i}.{projection}"
+            native[name] = mx.to_fp8(value[i])
+            native[name.removesuffix(".weight") + ".weight_scale"] = mx.array(0.5)
+    config = asdict(args)
+    config["quantization_config"] = {
+        "quant_method": "modelopt",
+        "quant_algo": "MIXED_PRECISION",
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), native)
+    expected = dict(tree_flatten(load_model(tmp_path).parameters()))
+    for rank in range(3):
+        group = NS(rank=lambda: rank, size=lambda: 3)
+        model = load_model(tmp_path, sharding_group=group)
+        model.shard(group)
+        for key, value in tree_flatten(model.parameters()):
+            reference = (
+                expected[key][8 * rank // 3 : 8 * (rank + 1) // 3]
+                if ".experts." in key
+                else expected[key]
+            )
+            assert value.dtype == reference.dtype, key
+            assert mx.array_equal(value, reference).item(), key
+
+
+@pytest.mark.skipif(
+    not mx.metal.is_available(), reason="Requires Metal allocation counters"
+)
+@pytest.mark.parametrize("checkpoint", [False, True])
+def test_mistral_large4_sharded_weights_release_full_storage(
+    mistral_large4_case, checkpoint
+):
+    import gc
+
+    module, args = mistral_large4_case
+    model = module.Model(args)
+    mx.eval(model.parameters())
+    mx.synchronize()
+    baseline = mx.get_active_memory()
+    # A regular contiguous slice retains this 32 MiB allocation. A prepared
+    # rank owns only its selected experts once its lazy gather is evaluated.
+    group = NS(rank=lambda: 1, size=lambda: 3)
+    if checkpoint:
+        weights = {"layers.1.experts.w1.weight": mx.ones((8, 1024, 1024))}
+        mx.eval(weights)
+        selected = model.shard(group, weights=weights)
+        mx.eval(selected)
+        value = selected["layers.1.experts.w1.weight"]
+    else:
+        linear = model.language_model.layers[1].feed_forward.experts.w1
+        linear.weight = mx.ones((8, 1024, 1024))
+        mx.eval(model.parameters())
+        model.shard(group)
+        mx.eval(model.parameters())
+        value = linear.weight
+    gc.collect()
+    mx.synchronize()
+    assert value.shape == (3, 1024, 1024)
+    assert mx.get_active_memory() - baseline < value.nbytes + 1024 * 1024
 
 
 def test_nemotron_parse_source_architecture_and_tied_head_mapping():
@@ -2795,9 +2995,48 @@ def test_dense_model(name):
 def tiny_config(family, profile=None, **overrides):
     """Build a fresh tiny config, optionally selecting a named test profile."""
     case = TINY_MODELS[family]
-    fields = TINY_DEFAULTS | case["config"] | case.get("profiles", {}).get(profile, {})
+    fields = dict(TINY_DEFAULTS)
+    if "case" in case:
+        base = model_case(case["case"])["config"]
+        fields.update(base.get("text_config", base))
+    fields.update(case["config"] | case.get("profiles", {}).get(profile, {}))
     module = importlib.import_module("mlx_vlm.models." + case["module"])
     return build_config(module, fields | overrides, case["config_type"])
+
+
+def tiny_language_model(family):
+    """Build a fresh language model from the shared JSON cases."""
+    config = tiny_config(family)
+    name = TINY_MODELS[family]["module"]
+    module = importlib.import_module(f"mlx_vlm.models.{name}.language")
+    model = module.LanguageModel(config)
+    if family == "deepseek_v41":
+        from mlx_vlm.models.deepseek_v41.engram import NgramHashState
+
+        model.engram_hash = NgramHashState(
+            config,
+            model.layout,
+            token_map=[
+                i % config.engram_compressed_vocab_size
+                for i in range(config.vocab_size)
+            ],
+        )
+    model.eval()
+    return model
+
+
+@pytest.mark.parametrize("family", ["mellum", "deepseek_v41"])
+def test_native_speculative_hidden_states(family):
+    ids = mx.array([[1, 2, 3]])
+    model = tiny_language_model(family)
+    if family == "deepseek_v41":
+        # V4.1 taps precede the block; the first tap is the token embedding.
+        hidden = model(ids, capture_layer_ids=[0]).hidden_states[0]
+        expected = model.embed_tokens(ids)
+    else:
+        hidden = model(ids, return_hidden=True).hidden_states[-1]
+        expected = model.model(ids)
+    assert mx.array_equal(hidden, expected).item()
 
 
 def _prepare_minimax_distributed(model, dtype):
@@ -2816,7 +3055,177 @@ def _prepare_minimax_distributed(model, dtype):
             )
 
 
-DISTRIBUTED_MODEL_SETUPS = {"minimax_m3_nvfp4": _prepare_minimax_distributed}
+def _prepare_inkling2_distributed(model, dtype):
+    for path, value in tree_flatten(model.parameters()):
+        if any(name in path for name in (".query", ".rel_proj", "gate_weight")):
+            target_dtype = mx.float32 if path.endswith(".query") else dtype
+            value = (mx.random.normal(value.shape) * 0.1).astype(target_dtype)
+            model.load_weights([(path, value)], strict=False)
+        elif path.endswith("e_score_correction_bias"):
+            value = mx.arange(value.size, dtype=mx.float32) / 129
+            model.load_weights([(path, value)], strict=False)
+
+
+def _prepare_inkling2_mixed_distributed(model, dtype):
+    from mlx_vlm.quantization.nvfp4 import ScaledQuantizedSwitchLinear
+
+    _prepare_inkling2_distributed(model, dtype)
+    for index, layer in enumerate(model.layers):
+        mode, bits, group_size = (
+            ("mxfp8", 8, 32) if index == len(model.layers) - 1 else ("nvfp4", 4, 16)
+        )
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            projection = getattr(layer.mlp.switch_mlp, name).to_quantized(
+                group_size=group_size, bits=bits, mode=mode
+            )
+            if mode == "nvfp4":
+                scale = mx.linspace(0.5, 1.5, projection.num_experts).astype(mx.float32)
+                projection = ScaledQuantizedSwitchLinear(
+                    projection, scale, "weight_scale_2"
+                )
+            setattr(layer.mlp.switch_mlp, name, projection)
+
+
+def _prepare_ernie_distributed(model, dtype):
+    for layer in model.layers:
+        for hc in (layer.attn_hc, layer.ffn_hc):
+            hc.fn = mx.random.normal(hc.fn.shape) * 0.02
+            hc.base = mx.random.normal(hc.base.shape) * 0.1
+        for name in ("U", "V"):
+            layer.attn.vha[name] = (
+                mx.random.normal(layer.attn.vha[name].shape) * 0.1
+            ).astype(dtype)
+        if hasattr(layer.ffn, "gate"):
+            for name in ("weight", "weight_1"):
+                layer.ffn.gate[name] = (
+                    mx.random.normal(layer.ffn.gate[name].shape) * 0.1
+                ).astype(dtype)
+
+
+DISTRIBUTED_MODEL_SETUPS = {
+    "minimax_m3_nvfp4": _prepare_minimax_distributed,
+    "ernie5_5_moe": _prepare_ernie_distributed,
+    "inkling2": _prepare_inkling2_distributed,
+    "inkling2_mixed": _prepare_inkling2_mixed_distributed,
+}
+
+
+@pytest.mark.parametrize("family", ["inkling2", "inkling2_mixed"])
+@pytest.mark.parametrize("rank", [0, 1, 2])
+def test_inkling2_shard_preserves_experts_and_replicated_weights(family, rank):
+    model = _make_distributed_test_model(family, mx.bfloat16)
+    original = dict(tree_flatten(model.parameters()))
+    model.shard(SimpleNamespace(size=lambda: 1, rank=lambda: 0))
+    assert all(p is original[k] for k, p in tree_flatten(model.parameters()))
+    count = model.config.n_routed_experts
+    start, end = count * rank // 3, count * (rank + 1) // 3
+    model.shard(SimpleNamespace(size=lambda: 3, rank=lambda: rank))
+    for key, value in tree_flatten(model.parameters()):
+        old = original[key]
+        assert value.dtype == old.dtype, key
+        if ".switch_mlp." in key:
+            assert mx.array_equal(value, old[start:end]).item(), key
+        else:
+            assert value is old, key
+    for layer in model.layers:
+        assert (layer.mlp.expert_start, layer.mlp.expert_end) == (start, end)
+        assert layer.mlp.switch_mlp.num_experts == count
+
+
+@pytest.mark.parametrize("size,rank", [(0, 0), (33, 0), (2, -1), (2, 2)])
+def test_inkling2_shard_rejects_invalid_group_without_mutation(size, rank):
+    model = _make_distributed_test_model("inkling2", mx.bfloat16)
+    original = dict(tree_flatten(model.parameters()))
+    with pytest.raises(ValueError, match="Each distributed rank"):
+        model.shard(SimpleNamespace(size=lambda: size, rank=lambda: rank))
+    assert all(p is original[k] for k, p in tree_flatten(model.parameters()))
+
+
+def test_inkling2_shard_validates_scales_before_mutation():
+    model = _make_distributed_test_model("inkling2_mixed", mx.bfloat16)
+    model.layers[-1].mlp.switch_mlp.down_proj.scales = mx.ones((3, 64, 2))
+    original = dict(tree_flatten(model.parameters()))
+    with pytest.raises(ValueError, match="Invalid expert partition"):
+        model.shard(SimpleNamespace(size=lambda: 2, rank=lambda: 0))
+    assert all(p is original[k] for k, p in tree_flatten(model.parameters()))
+
+
+def test_inkling2_shard_preserves_scalar_outer_scales():
+    model = _make_distributed_test_model("inkling2_mixed", mx.bfloat16)
+    projection = model.layers[0].mlp.switch_mlp.gate_proj
+    scale = projection.weight_scale_2 = mx.array(0.1234567, mx.float32)
+    model.shard(SimpleNamespace(size=lambda: 2, rank=lambda: 1))
+    assert projection.weight_scale_2 is scale
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Requires Metal")
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("layer_index", [0, 5])
+def test_inkling2_attention_shards_complete_heads_and_keeps_sink(rank, layer_index):
+    from mlx_vlm.models.inkling2.config import TextConfig
+    from mlx_vlm.models.inkling2.language import Attention
+
+    cfg = TextConfig(
+        hidden_size=256,
+        num_attention_heads=16,
+        num_key_value_heads=8,
+        head_dim=32,
+        swa_num_attention_heads=16,
+        swa_num_key_value_heads=8,
+        swa_head_dim=32,
+        d_rel=16,
+    )
+    attention = Attention(cfg, layer_index)
+    original = dict(tree_flatten(attention.parameters()))
+    group = SimpleNamespace(size=lambda: 2, rank=lambda: rank)
+    attention.shard(group)
+    assert attention.n_heads == 8 and attention.n_kv == 4
+    assert attention.sharding_group is group
+    assert attention.head_start == rank * 8
+    for key, value in tree_flatten(attention.parameters()):
+        old = original[key]
+        if key in ("sink_proj.weight", "rel_proj"):
+            assert value is old
+        else:
+            axis = 1 if key.endswith("static_weight") else 0
+            width = old.shape[axis] // 2
+            slices = [slice(None)] * old.ndim
+            slices[axis] = slice(rank * width, (rank + 1) * width)
+            assert mx.array_equal(value, old[tuple(slices)]).item(), key
+    partition = dict(tree_flatten(attention.parameters()))
+    attention.shard(group)
+    assert all(v is partition[k] for k, v in tree_flatten(attention.parameters()))
+
+
+@pytest.mark.parametrize(
+    "reason", ["three_ranks", "quantized_dynamic", "small_projection"]
+)
+def test_inkling2_attention_shard_fallback_preserves_parameters(reason):
+    from mlx_vlm.models.inkling2.config import TextConfig
+    from mlx_vlm.models.inkling2.language import Attention
+
+    attention = Attention(
+        TextConfig(
+            hidden_size=256,
+            num_attention_heads=16,
+            num_key_value_heads=8,
+            head_dim=32,
+            d_rel=16,
+        ),
+        5,
+    )
+    if reason == "quantized_dynamic":
+        attention.k_sconv.weight_proj = attention.k_sconv.weight_proj.to_quantized()
+    if reason == "small_projection":
+        attention.r_proj = nn.Linear(256, 16, bias=False)
+    original = dict(tree_flatten(attention.parameters()))
+    attention.shard(
+        SimpleNamespace(
+            size=lambda: 3 if reason == "three_ranks" else 2, rank=lambda: 0
+        )
+    )
+    assert attention.sharding_group is None
+    assert all(v is original[k] for k, v in tree_flatten(attention.parameters()))
 
 
 @pytest.mark.parametrize(
@@ -2927,10 +3336,75 @@ def test_minimax_multimodal_model_exposes_sharding():
     shard.assert_called_once_with(group)
 
 
+@pytest.mark.parametrize("pipeline", [False, True])
+def test_deepseek_v4_sharded_load(tmp_path, pipeline):
+    from mlx_vlm.models import deepseek_v4
+
+    config = build_config(deepseek_v4, model_case("deepseek_v4")["config"])
+    reference = deepseek_v4.Model(config)
+    reference.eval()
+    weights = dict(tree_flatten(reference.parameters()))
+    (tmp_path / "config.json").write_text(json.dumps(asdict(config)))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+    group = mx.distributed.init()
+    assert group.size() == 1
+    with patch("mlx_vlm.utils.load_processor", return_value=object()):
+        model, _ = sharded_load(
+            tmp_path,
+            tensor_group=group,
+            pipeline_group=group if pipeline else None,
+        )
+    assert model.language_model.layers[0].attn.sharding_group is group
+    assert callable(model.language_model.model.pipeline)
+    for key, value in tree_flatten(model.parameters()):
+        assert mx.array_equal(value, weights[key]).item(), key
+    ids = mx.array([[1, 2, 3]])
+    np.testing.assert_array_equal(
+        np.array(model(ids).logits), np.array(reference(ids).logits)
+    )
+
+
+@pytest.mark.parametrize("world_size", [1, 2, 4, 8])
+def test_deepseek_v4_sharding_allows_replicated_kv(world_size):
+    from mlx_vlm.models import deepseek_v4
+
+    architecture, _ = get_model_and_args({"model_type": "deepseek_v4"})
+    assert callable(architecture.Model.shard)
+    assert architecture.validate_sharding is deepseek_v4.validate_sharding
+    architecture.validate_sharding({"num_key_value_heads": 1}, world_size)
+
+
+@pytest.mark.parametrize(
+    "overrides,world_size,message",
+    [
+        ({}, 0, "worker count"),
+        ({}, 3, "query heads"),
+        ({}, 16, "query heads"),
+        (
+            {"num_attention_heads": 4, "moe_intermediate_size": 7},
+            2,
+            "expert intermediate",
+        ),
+    ],
+)
+def test_deepseek_v4_sharding_rejects_invalid_partitions_before_mutation(
+    overrides, world_size, message
+):
+    from mlx_vlm.models import deepseek_v4
+
+    config = model_case("deepseek_v4")["config"]
+    config.update(overrides)
+    model = deepseek_v4.Model(build_config(deepseek_v4, config))
+    with patch.object(model.language_model, "shard") as shard:
+        with pytest.raises(ValueError, match=message):
+            model.shard(SimpleNamespace(size=lambda: world_size, rank=lambda: 0))
+    shard.assert_not_called()
+
+
 # Distributed language-model contracts
 
 
-def _make_distributed_test_model(family, dtype):
+def _make_distributed_test_model(family, dtype, quant_mode="none"):
     case = TINY_MODELS[family]
     config = tiny_config(family, "distributed")
     module = importlib.import_module("mlx_vlm.models." + case["module"] + ".language")
@@ -2956,12 +3430,82 @@ def _make_distributed_test_model(family, dtype):
 
             quantization["class_predicate"] = predicate
         nn.quantize(model, **quantization)
+    if quant_mode != "none":
+        from mlx_vlm.quant_utils import quantize_model
+
+        # Match the release's already-loaded MXFP8 attention and dense FFN.
+        nn.quantize(
+            model,
+            group_size=32,
+            bits=8,
+            mode="mxfp8",
+            class_predicate=lambda path, module: isinstance(module, nn.Linear)
+            and (
+                path.startswith("model.layers.0.ffn.")
+                or path.rsplit(".", 1)[-1]
+                in (
+                    "wq_a",
+                    "wq_b",
+                    "wkv",
+                    "wo_b",
+                    "o_gate",
+                    "q_a_proj",
+                    "q_b_proj",
+                    "kv_a_proj_with_mqa",
+                )
+                and ".compressor." not in path
+            ),
+        )
+        model, _ = quantize_model(
+            model,
+            {},
+            group_size=None,
+            bits=8 if quant_mode == "mxfp8" else 4,
+            mode=quant_mode,
+            quant_predicate=model.quant_predicate,
+        )
     model.eval()
     return model
 
 
-def _distributed_model_worker(family, dtype_name):
-    # Report a stalled rank when the CI run is cancelled, without a time limit.
+def _distributed_model_outputs(model, stage, barrier=None):
+    outputs = {}
+    config = getattr(model, "args", None) or model.config
+    for batch in (1, 4):
+        cache = make_prompt_cache(model)
+        for step, tokens in enumerate(
+            ([1, 7, 9, 3, 11, 15, 2, 6, 8, 10, 12, 14], [13], [17], [19], [2, 4, 6])
+        ):
+            stage(f"batch={batch} step={step}")
+            ids = mx.array(
+                [
+                    [(t + row) % config.vocab_size for t in tokens]
+                    for row in range(batch)
+                ]
+            )
+            logits = model(ids, cache=cache).logits
+            mx.eval(logits)
+            key = f"batch={batch}-step={step}"
+            outputs[key] = logits
+            if barrier is not None:
+                # Finish this step on every rank before another rank can queue
+                # the next collective on the GPU they share.
+                barrier(key)
+    if getattr(config, "model_type", None) == "ernie5_5_moe":
+        from mlx_vlm.tests.test_speculative import distributed_echo_outputs
+
+        outputs.update(distributed_echo_outputs(model, stage, barrier))
+    # Copy only after every rank has finished all GPU work. Interleaving CPU
+    # transfers with another rank's next GPU collective can deadlock Metal.
+    # FP32 preserves the BF16 values that NumPy cannot represent directly.
+    with mx.stream(mx.cpu):
+        return {
+            key: np.array(value.astype(mx.float32)) for key, value in outputs.items()
+        }
+
+
+def _distributed_model_worker(family, dtype_name, quant_mode="none"):
+    # Dump each rank's stack before the parent kills a stalled process group.
     faulthandler.register(signal.SIGTERM, chain=True)
 
     def stage(name):
@@ -2992,11 +3536,11 @@ def _distributed_model_worker(family, dtype_name):
         if group.rank() == rank:
             stage("building models")
             mx.random.seed(19)
-            reference = _make_distributed_test_model(family, dtype)
+            reference = _make_distributed_test_model(family, dtype, quant_mode)
             stage("evaluating reference weights")
             mx.eval(reference.parameters())
             weights = dict(tree_flatten(reference.parameters()))
-            sharded = _make_distributed_test_model(family, dtype)
+            sharded = _make_distributed_test_model(family, dtype, quant_mode)
             sharded.load_weights(list(weights.items()), strict=True)
             sharded.shard(group)
             if error := options.get("reshard_error"):
@@ -3004,6 +3548,14 @@ def _distributed_model_worker(family, dtype_name):
                     sharded.shard(group)
             stage("evaluating sharded weights")
             mx.eval(sharded.parameters())
+            # Metal kernels are initialized per process. Warm each rank with
+            # the reference while its peers are idle, before any rank can
+            # enqueue a collective that waits on a still-compiling peer.
+            stage("reference outputs")
+            expected = _distributed_model_outputs(reference, stage)
+            if rank == 0:
+                np.savez(barrier_dir / "reference.npz", **expected)
+            del expected
             stage("models ready")
         host_barrier(f"models-ready-{rank}")
     local_weights = dict(tree_flatten(sharded.parameters()))
@@ -3013,64 +3565,65 @@ def _distributed_model_worker(family, dtype_name):
         for name in names:
             assert local_weights[name].size * group.size() == weights[name].size, name
 
-    records = []
-    # Keep model-specific reference tolerances in the fixture. Every rank must
-    # return identical logits; MiniMax also requires exact BF16 reference parity.
-    tolerance = options["tolerances"][dtype_name]
-    vocab_size = reference.args.vocab_size
-    for batch in (1, 4):
-        actual_cache = make_prompt_cache(sharded)
-        expected_cache = make_prompt_cache(reference)
-        for step, tokens in enumerate(
-            ([1, 7, 9, 3, 11, 15, 2, 6, 8, 10, 12, 14], [13], [17], [19], [2, 4, 6])
-        ):
-            stage(f"batch={batch} step={step} reference")
-            ids = mx.array(
-                [[(t + row) % vocab_size for t in tokens] for row in range(batch)]
-            )
-            expected = reference(ids, cache=expected_cache).logits
-            mx.eval(expected)
-            stage(f"batch={batch} step={step} barrier")
-            host_barrier(f"reference-{batch}-{step}")
-            stage(f"batch={batch} step={step} sharded")
-            actual = sharded(ids, cache=actual_cache).logits
-            mx.eval(actual)
-            host_barrier(f"actual-{batch}-{step}")
-            stage(f"batch={batch} step={step} gather")
-            gathered = mx.distributed.all_gather(actual, group=group, stream=mx.cpu)
-            mx.eval(gathered)
-            ranks_agree = all(
-                mx.array_equal(
-                    gathered[:batch], gathered[rank * batch : (rank + 1) * batch]
-                ).item()
-                for rank in range(1, group.size())
-            )
-            records.append(
-                dict(
-                    batch=batch,
-                    step=step,
-                    max_error=mx.max(mx.abs(actual - expected)).item(),
-                    ranks_agree=ranks_agree,
-                    passed=mx.allclose(
-                        actual, expected, atol=tolerance, rtol=tolerance
-                    ).item(),
-                )
-            )
-    host_barrier("checks")
-    passed = mx.distributed.all_sum(
-        mx.array(int(all(r["passed"] and r["ranks_agree"] for r in records))),
-        group=group,
-        stream=mx.cpu,
-    ).item()
-    print(
-        json.dumps(dict(rank=group.rank(), passed_ranks=passed, checks=records)),
-        flush=True,
+    del reference, weights, local_weights
+    host_barrier("reference-ready")
+    stage("sharded outputs")
+    np.savez(
+        barrier_dir / f"rank-{group.rank()}.npz",
+        **_distributed_model_outputs(sharded, stage, host_barrier),
     )
-    assert passed == group.size(), records
+    host_barrier("outputs-ready")
     stage("completed")
 
 
-def _run_distributed_model_test(family, dtype, world_size):
+def _check_distributed_model_outputs(expected, ranks, tolerance):
+    # Keep the fixture tolerances and exact rank agreement. In particular,
+    # MiniMax BF16 must still match the unsharded reference exactly.
+    for rank, actual in enumerate(ranks):
+        assert set(actual) == set(expected), f"rank={rank}: missing or extra outputs"
+        for step, reference in expected.items():
+            message = f"rank={rank} {step}"
+            assert actual[step].shape == reference.shape, message
+            np.testing.assert_allclose(
+                actual[step],
+                reference,
+                atol=tolerance,
+                rtol=tolerance,
+                equal_nan=False,
+                err_msg=message,
+            )
+            np.testing.assert_array_equal(actual[step], ranks[0][step], err_msg=message)
+
+
+def _run_distributed_command(command, *, cwd, env, timeout=120):
+    with subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    ) as process:
+        try:
+            output, _ = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                output, _ = process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                output, _ = process.communicate()
+            pytest.fail(f"Distributed workers timed out after {timeout}s:\n{output}")
+        finally:
+            # Also clean up peers on assertion failures or interrupted pytest.
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+        assert process.returncode == 0, output
+        return output
+
+
+def _run_distributed_model_test(family, dtype, world_size, quant_mode="none"):
     repo = Path(__file__).resolve().parents[2]
     # Select a whole block outside the ephemeral range. Binding only the first
     # port to zero leaves the allocator free to hand the remaining ports to a
@@ -3106,9 +3659,10 @@ def _run_distributed_model_test(family, dtype, world_size):
         "_distributed_model_worker(*sys.argv[1:])",
         family,
         dtype,
+        quant_mode,
     ]
     with tempfile.TemporaryDirectory(prefix="mlx-vlm-distributed-") as barrier_dir:
-        process = subprocess.Popen(
+        output = _run_distributed_command(
             command,
             cwd=repo,
             env=dict(
@@ -3116,16 +3670,101 @@ def _run_distributed_model_test(family, dtype, world_size):
                 PYTHONPATH=str(repo),
                 MLX_TEST_BARRIER_DIR=barrier_dir,
             ),
-            stdout=subprocess.PIPE,
-            text=True,
         )
-        output, _ = process.communicate()
-    assert process.returncode == 0, output
-    records = [json.loads(line) for line in output.splitlines() if line.startswith("{")]
-    assert len(records) == world_size, output
-    assert {r["rank"] for r in records if r["passed_ranks"] == world_size} == set(
-        range(world_size)
-    ), output
+        # The MLX launcher can return zero after a worker exits unsuccessfully.
+        # Require every result and retain its diagnostics instead of hiding the
+        # original worker failure behind a NumPy FileNotFoundError.
+        paths = [Path(barrier_dir) / "reference.npz"] + [
+            Path(barrier_dir) / f"rank-{rank}.npz" for rank in range(world_size)
+        ]
+        missing = [path.name for path in paths if not path.is_file()]
+        assert not missing, f"Distributed workers did not produce {missing}:\n{output}"
+        with ExitStack() as stack:
+            expected, *ranks = [stack.enter_context(np.load(path)) for path in paths]
+            _check_distributed_model_outputs(
+                expected, ranks, TINY_MODELS[family]["distributed"]["tolerances"][dtype]
+            )
+
+
+@pytest.mark.parametrize("error", ["reference", "rank", "missing", "shape", "nan"])
+def test_distributed_output_validation_rejects_errors(error):
+    expected = {"batch=1-step=0": np.ones((1, 2), dtype=np.float32)}
+    ranks = [copy.deepcopy(expected) for _ in range(2)]
+    if error == "reference":
+        for actual in ranks:
+            actual["batch=1-step=0"] += 1
+    elif error == "rank":
+        # Within reference tolerance, but ranks must agree exactly.
+        ranks[1]["batch=1-step=0"] += 1e-5
+    elif error == "missing":
+        ranks[1].clear()
+    elif error == "shape":
+        ranks[1]["batch=1-step=0"] = np.ones((1, 1), dtype=np.float32)
+    else:
+        ranks[1]["batch=1-step=0"][0, 0] = np.nan
+    with pytest.raises(AssertionError):
+        _check_distributed_model_outputs(expected, ranks, 1e-4)
+
+
+def test_distributed_output_validation_preserves_tolerances():
+    expected = {"batch=1-step=0": np.ones((1, 2), dtype=np.float32)}
+    ranks = [{key: value + 1e-5 for key, value in expected.items()} for _ in range(2)]
+    _check_distributed_model_outputs(expected, ranks, 1e-4)
+    with pytest.raises(AssertionError):
+        _check_distributed_model_outputs(expected, ranks, 0)
+
+
+def test_distributed_outputs_finish_gpu_steps_before_cpu_transfers():
+    barriers = []
+    model = MagicMock(args=NS(vocab_size=32))
+    model.make_cache.return_value = []
+    model.side_effect = lambda ids, cache: NS(logits=ids.astype(mx.bfloat16))
+    to_numpy = np.array
+
+    def copy_output(value):
+        assert len(barriers) == 10, "CPU transfer overlaps a peer's next GPU step"
+        return to_numpy(value)
+
+    with patch.object(np, "array", side_effect=copy_output):
+        outputs = _distributed_model_outputs(model, lambda _: None, barriers.append)
+    assert list(outputs) == barriers
+    assert outputs["batch=4-step=4"].shape == (4, 3)
+
+
+def test_distributed_worker_missing_output_preserves_diagnostics():
+    def failed_worker(command, *, cwd, env):
+        np.savez(Path(env["MLX_TEST_BARRIER_DIR"]) / "reference.npz", logits=[1])
+        return "rank 0: synthetic worker failure"
+
+    with patch(__name__ + "._run_distributed_command", side_effect=failed_worker):
+        with pytest.raises(AssertionError, match="rank 0: synthetic worker failure"):
+            _run_distributed_model_test("minimax_m3", "float32", 2)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups required")
+def test_distributed_worker_timeout_cleans_up_ranks(tmp_path):
+    command = [
+        sys.executable,
+        "-c",
+        textwrap.dedent("""
+            import os, signal, subprocess, sys, time
+            from pathlib import Path
+
+            child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+            def terminate(signum, frame):
+                child.wait()
+                sys.exit(0)
+            signal.signal(signal.SIGTERM, terminate)
+            Path('pids').write_text(f'{os.getpid()} {child.pid}')
+            print('rank is stalled', flush=True)
+            time.sleep(60)
+            """),
+    ]
+    with pytest.raises(pytest.fail.Exception, match="timed out.*2s:\nrank is stalled"):
+        _run_distributed_command(command, cwd=tmp_path, env=os.environ, timeout=2)
+    for pid in (tmp_path / "pids").read_text().split():
+        with pytest.raises(ProcessLookupError):
+            os.kill(int(pid), 0)
 
 
 @pytest.mark.skipif(not mx.distributed.is_available("ring"), reason="ring required")
@@ -3136,6 +3775,47 @@ def _run_distributed_model_test(family, dtype, world_size):
 )
 def test_distributed_model(family, dtype, world_size):
     _run_distributed_model_test(family, dtype, world_size)
+
+
+@pytest.mark.skipif(not mx.distributed.is_available("ring"), reason="ring required")
+@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+@pytest.mark.parametrize("mode", ["affine", "mxfp8", "nvfp4"])
+def test_distributed_model_ernie55_quantized(mode, dtype, world_size):
+    _run_distributed_model_test("ernie5_5_moe", dtype, world_size, mode)
+
+
+@pytest.mark.parametrize("invalid", ["heads", "quantization-groups"])
+def test_ernie55_shard_validates_before_mutating(invalid):
+    model = _make_distributed_test_model("ernie5_5_moe", mx.bfloat16)
+    size = 3 if invalid == "heads" else 4
+    if invalid == "quantization-groups":
+        mlp = model.layers[-1].ffn.switch_mlp
+        mlp.down_proj = mlp.down_proj.to_quantized(group_size=128, bits=4)
+    before = dict(tree_flatten(model.parameters()))
+    with pytest.raises(ValueError, match="heads|Cannot shard"):
+        model.shard(NS(size=lambda: size, rank=lambda: 0))
+    assert model.sharding_group is None
+    assert all(
+        value is before[name] for name, value in tree_flatten(model.parameters())
+    )
+
+
+def test_ernie55_wrapper_shards_shared_echo_decoder_once():
+    from mlx_vlm.models.ernie5_5_moe import Model
+    from mlx_vlm.speculative.drafters.ernie5_5_mtp import Model as Draft
+    from mlx_vlm.speculative.drafters.ernie5_5_mtp import ModelConfig
+
+    target = Model(tiny_config("ernie5_5_moe"))
+    draft = Draft(ModelConfig(text_config=target.config)).bind(target)
+    target.shard(NS(size=lambda: 1, rank=lambda: 0))
+    assert target.language_model.sharding_group is None
+    group = NS(size=lambda: 2, rank=lambda: 0)
+    target.shard(group)
+    assert draft._target.layers[-1] is target.layers[-1]
+    assert draft._target.layers[-1].ffn.sharding_group is group
+    with pytest.raises(ValueError, match="already sharded"):
+        target.shard(group)
 
 
 def test_gemma4_modelopt_awq_strict_load_and_forward(tmp_path):
@@ -3562,7 +4242,36 @@ class TestPPDocLayoutV3(unittest.TestCase):
 # Loading and utility contracts
 
 
-def test_load_config_applies_generation_config_sampling_defaults(tmp_path):
+@pytest.mark.parametrize("params", [{"dim": 8}, {"dim": 8, "dsa": {"topk": 4}}])
+def test_load_config_preserves_params_schema(tmp_path, params):
+    (tmp_path / "params.json").write_text(json.dumps(params))
+    assert load_config(tmp_path) == params
+    assert not (tmp_path / "config.json").exists()
+    assert json.loads((tmp_path / "params.json").read_text()) == params
+
+
+def test_load_config_accepts_standard_schema_params(tmp_path):
+    config = {"model_type": "deepseek_v4", "hidden_size": 8}
+    (tmp_path / "params.json").write_text(json.dumps(config))
+    assert load_config(tmp_path) == config
+
+
+@pytest.mark.parametrize("valid", [False, True])
+def test_load_config_prefers_config_json(tmp_path, valid):
+    (tmp_path / "params.json").write_text(json.dumps({"model_type": "fallback"}))
+    config = {"model_type": "primary"}
+    (tmp_path / "config.json").write_text(json.dumps(config) if valid else "invalid")
+    if valid:
+        assert load_config(tmp_path) == config
+    else:
+        with pytest.raises(json.JSONDecodeError):
+            load_config(tmp_path)
+
+
+@pytest.mark.parametrize("config_filename", ["config.json", "params.json"])
+def test_load_config_applies_generation_config_sampling_defaults(
+    tmp_path, config_filename
+):
     generation_config = {
         "eos_token_id": [2, 3],
         "do_sample": True,
@@ -3571,7 +4280,7 @@ def test_load_config_applies_generation_config_sampling_defaults(tmp_path):
         "top_k": 64,
         "max_new_tokens": 4096,
     }
-    (tmp_path / "config.json").write_text(
+    (tmp_path / config_filename).write_text(
         json.dumps({"model_type": "demo", "eos_token_id": 1}), encoding="utf-8"
     )
     (tmp_path / "generation_config.json").write_text(
@@ -3891,6 +4600,157 @@ def test_missing_model_file_raises_clearly(tmp_path):
 
     with pytest.raises(FileNotFoundError, match="model_file"):
         load_model(tmp_path)
+
+
+@pytest.mark.parametrize("mode", ["tensor", "auto", "pipeline"])
+@pytest.mark.parametrize("checkpoint_sharding", [False, True])
+def test_sharded_load_resolves_checkpoint_model_file(
+    tmp_path, monkeypatch, mode, checkpoint_sharding
+):
+    from mlx_vlm import utils
+
+    _write_checkpoint(tmp_path)
+    with (tmp_path / "model.py").open("a") as source:
+        source.write("\nModelConfig.to_dict = lambda self: {}\n")
+        source.write("Model.language_model = property(lambda self: self)\n")
+        if checkpoint_sharding:
+            source.write(textwrap.dedent("""
+                def shard(self, group, *, weights=None):
+                    if weights is not None:
+                        self.prepared_rank = group.rank()
+                        return weights
+                    self.rank = group.rank()
+                Model.shard = shard
+                """))
+        else:
+            source.write(
+                "Model.shard = lambda self, group: setattr(self, 'rank', group.rank())\n"
+            )
+        source.write(
+            "Model.pipeline = lambda self, group: setattr(self, 'pipeline_rank', group.rank())\n"
+        )
+    processor = object()
+    group = NS(rank=lambda: 1, size=lambda: 3)
+    monkeypatch.setattr(utils, "load_processor", lambda *a, **k: processor)
+    monkeypatch.setattr(utils, "load_image_processor", lambda *a, **k: None)
+    monkeypatch.setattr(mx.distributed, "all_sum", lambda value, **k: value)
+    with patch.object(mx.distributed, "init", return_value=group) as initialize:
+        options = {} if mode == "auto" else {mode + "_group": group}
+        model, actual_processor = utils.sharded_load(str(tmp_path), **options)
+    assert model.loaded_via_model_file
+    assert actual_processor is processor
+    assert initialize.call_count == (mode == "auto")
+    if mode == "pipeline":
+        assert model.pipeline_rank == 1
+        assert not hasattr(model, "prepared_rank")
+        assert not hasattr(model, "rank")
+    else:
+        assert model.rank == 1
+        if checkpoint_sharding:
+            assert model.prepared_rank == 1
+        else:
+            assert not hasattr(model, "prepared_rank")
+
+
+@pytest.mark.parametrize("lazy", [False, True])
+def test_load_keeps_loader_options_out_of_processor_kwargs(tmp_path, lazy):
+    from mlx_vlm import utils
+
+    _write_checkpoint(tmp_path)
+    group = NS(rank=lambda: 0, size=lambda: 1)
+    with (
+        patch.object(utils, "load_model", wraps=utils.load_model) as loader,
+        patch.object(utils, "load_processor", return_value=object()) as processor,
+        patch.object(
+            utils, "load_image_processor", return_value=None
+        ) as image_processor,
+    ):
+        events = []
+        model, _ = utils.load(
+            str(tmp_path),
+            sharding_group=group,
+            trust_remote_code=False,
+            lazy=lazy,
+            progress_callback=events.append,
+        )
+    assert loader.call_args.kwargs["sharding_group"] is group
+    for call in (processor.call_args, image_processor.call_args):
+        assert "sharding_group" not in call.kwargs
+        assert "progress_callback" not in call.kwargs
+        assert call.kwargs["trust_remote_code"] is False
+
+    assert events[0]["stage"] == "resolving_model"
+    assert events[-1]["stage"] == "loaded" and events[-1]["lazy"] is lazy
+    assert any(e.get("completed_files") == e.get("total_files") == 1 for e in events)
+    file_progress = [e for e in events if "completed_files" in e]
+    assert [e["stage_percent"] for e in file_progress] == [0.0, 100.0]
+    assert events[-1]["stage_percent"] is None
+    assert all(e["stage_percent"] is None for e in events if e.get("total_layers") == 0)
+    assert any(e["stage"] == "evaluating_remaining_parameters" for e in events) != lazy
+    assert all(e["model"] == str(tmp_path) for e in events)
+    elapsed = [e["elapsed_seconds"] for e in events]
+    assert elapsed == sorted(elapsed)
+    assert mx.array_equal(model.proj.weight, mx.zeros((4, 4)))
+    with patch.object(utils, "load_model", side_effect=ValueError("bad weights")):
+        with pytest.raises(ValueError, match="bad weights"):
+            utils.load(str(tmp_path), progress_callback=events.append)
+    assert events[-1]["stage"] == "failed"
+
+
+def test_layer_loading_progress_follows_evaluation(monkeypatch):
+    from mlx_vlm.load_progress import LoadingProgress, evaluate_model
+
+    model = nn.Module()
+    model.layers = [nn.Linear(4, 4), nn.Linear(4, 4)]
+    model.vision = nn.Linear(4, 4)
+    expected = {k: mx.array(v) for k, v in tree_flatten(model.parameters())}
+    events, before_eval = [], []
+    original_eval = mx.eval
+
+    def evaluate(*args):
+        before_eval.append(events[-1].copy())
+        original_eval(*args)
+
+    monkeypatch.setattr(mx, "eval", evaluate)
+    evaluate_model(model, LoadingProgress("demo", events.append).update)
+    assert [e.get("completed_layers") for e in before_eval] == [0, 1, None]
+    assert [e["stage_percent"] for e in events] == [0.0, 50.0, 100.0, None]
+    assert events[-2]["completed_layers"] == events[-2]["total_layers"] == 2
+    assert events[-1]["stage"] == "evaluating_remaining_parameters"
+    for key, value in tree_flatten(model.parameters()):
+        assert value.dtype == expected[key].dtype
+        assert mx.array_equal(value, expected[key])
+
+
+@pytest.mark.parametrize("stage", ["loading_checkpoint", "loaded"])
+def test_loading_cancellation_skips_remaining_files_and_layers(tmp_path, stage):
+    from mlx_vlm import utils
+    from mlx_vlm.load_progress import ModelLoadCancelled, evaluate_model
+
+    _write_checkpoint(tmp_path)
+    events = []
+
+    def cancel(event):
+        events.append(event)
+        if event["stage"] == stage or event.get("completed_layers") == 1:
+            raise ModelLoadCancelled("shutdown")
+
+    with (
+        patch.object(utils, "_load_safetensors", wraps=utils._load_safetensors) as read,
+        patch.object(utils, "load_processor", return_value=object()),
+        patch.object(utils, "load_image_processor", return_value=None),
+    ):
+        with pytest.raises(ModelLoadCancelled):
+            utils.load(str(tmp_path), progress_callback=cancel)
+    assert read.call_count == (stage == "loaded")
+    assert events[-1]["stage"] == "cancelled"
+
+    model = nn.Module()
+    model.layers = [nn.Linear(4, 4), nn.Linear(4, 4)]
+    with patch.object(mx, "eval", wraps=mx.eval) as evaluate:
+        with pytest.raises(ModelLoadCancelled):
+            evaluate_model(model, cancel)
+    assert evaluate.call_count == 1
 
 
 def test_qwen3_omni_audio_batch_matches_repeated_input():
@@ -6277,6 +7137,15 @@ def test_lfm3_omni_quantized_checkpoint_roundtrip(tmp_path, lfm3_omni):
     np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
 
 
+class TestSkipMultimodalModule:
+    def test_gemma4_projectors(self):
+        from mlx_vlm.utils import skip_multimodal_module
+
+        assert skip_multimodal_module("embed_vision.embedding_projection")
+        assert skip_multimodal_module("embed_audio.embedding_projection")
+        assert not skip_multimodal_module("language_model.model.layers.0.mlp.gate_proj")
+
+
 class TestEncoderActivations:
     """Checkpoint activation names select the matching values and gradients."""
 
@@ -6474,3 +7343,526 @@ def test_qwen3_5_attention_forwards_rope_parameters(omit_original_max):
         QWEN3_5_YARN_HF_ATTENTION_FACTOR, rel=1e-6
     )
     assert not rotary.fused_apply
+
+
+class TestGemma4PerLayerConfig:
+    """transformers 5.15+ saves Gemma 4's full-attention shapes as `per_layer_config`."""
+
+    @staticmethod
+    def _text(**extra):
+        params = {
+            "num_hidden_layers": 12,
+            "sliding_window_pattern": 6,
+            "num_key_value_heads": 16,
+            "head_dim": 256,
+            "attention_k_eq_v": True,
+        }
+        params.update(extra)
+        return params
+
+    def test_reads_full_attention_shapes(self):
+        from mlx_vlm.models.gemma4.config import TextConfig
+        from mlx_vlm.models.gemma4.language import Attention
+
+        per_layer = {"05": {"head_dim": 512, "num_key_value_heads": 4}}
+        per_layer["11"] = dict(per_layer["05"])
+        cfg = TextConfig.from_dict(self._text(per_layer_config=per_layer))
+        assert cfg.layer_types[5] == cfg.layer_types[11] == "full_attention"
+        assert (cfg.global_head_dim, cfg.num_global_key_value_heads) == (512, 4)
+        assert Attention(cfg, 5).n_kv_heads == 4
+
+    def test_text_and_unified_configs(self):
+        from mlx_vlm.models.gemma4_text.config import ModelConfig as TextOnlyConfig
+        from mlx_vlm.models.gemma4_unified.config import TextConfig as UnifiedConfig
+
+        per_layer = {"05": {"head_dim": 384, "num_key_value_heads": 2}}
+        for cls in (TextOnlyConfig, UnifiedConfig):
+            cfg = cls.from_dict(
+                self._text(num_hidden_layers=6, per_layer_config=per_layer)
+            )
+            assert (cfg.global_head_dim, cfg.num_global_key_value_heads) == (384, 2)
+
+    def test_old_keys_without_per_layer_config(self):
+        from mlx_vlm.models.gemma4.config import TextConfig
+
+        cfg = TextConfig.from_dict(
+            self._text(global_head_dim=384, num_global_key_value_heads=2)
+        )
+        assert (cfg.global_head_dim, cfg.num_global_key_value_heads) == (384, 2)
+
+    def test_head_dim_only_inherits_kv_heads(self):
+        from mlx_vlm.models.gemma4.config import TextConfig
+
+        cfg = TextConfig.from_dict(
+            self._text(
+                num_hidden_layers=6,
+                attention_k_eq_v=False,
+                per_layer_config={"05": {"head_dim": 512}},
+            )
+        )
+        assert (cfg.global_head_dim, cfg.num_global_key_value_heads) == (512, 16)
+
+    def test_rejects_shapes_it_cannot_represent(self):
+        from mlx_vlm.models.gemma4.config import TextConfig
+
+        differing = {
+            "05": {"head_dim": 512, "num_key_value_heads": 4},
+            "11": {"head_dim": 512, "num_key_value_heads": 2},
+        }
+        with pytest.raises(ValueError, match="different shapes"):
+            TextConfig.from_dict(self._text(per_layer_config=differing))
+        for overrides in ({"head_dim": 512}, {"num_key_value_heads": 4}):
+            with pytest.raises(ValueError, match="different shapes"):
+                TextConfig.from_dict(self._text(per_layer_config={"05": overrides}))
+        with pytest.raises(ValueError, match="not a full-attention layer"):
+            TextConfig.from_dict(self._text(per_layer_config={"00": {"head_dim": 512}}))
+
+    @pytest.mark.parametrize(
+        "per_layer, expected_kv_heads",
+        [({}, 4), ({"05": {"num_key_value_heads": 2}}, 2)],
+    )
+    def test_inherits_omitted_shapes(self, per_layer, expected_kv_heads):
+        from mlx_vlm.models.gemma4.config import TextConfig
+
+        cfg = TextConfig.from_dict(
+            self._text(
+                num_hidden_layers=6,
+                head_dim=64,
+                num_key_value_heads=4,
+                per_layer_config=per_layer,
+            )
+        )
+        assert (cfg.global_head_dim, cfg.num_global_key_value_heads) == (
+            64,
+            expected_kv_heads,
+        )
+
+    @pytest.mark.parametrize("model_type", ["gemma4", "gemma4_text", "gemma4_unified"])
+    @pytest.mark.parametrize("use_per_layer_config", [False, True])
+    def test_kv_heads_without_k_eq_v(self, model_type, use_per_layer_config):
+        config_module = importlib.import_module(f"mlx_vlm.models.{model_type}.config")
+        config_cls = (
+            config_module.ModelConfig
+            if model_type == "gemma4_text"
+            else config_module.TextConfig
+        )
+        language_type = "gemma4" if model_type == "gemma4_unified" else model_type
+        attention_cls = importlib.import_module(
+            f"mlx_vlm.models.{language_type}.language"
+        ).Attention
+        cfg = config_cls.from_dict(
+            self._text(
+                num_hidden_layers=6,
+                num_kv_shared_layers=0,
+                hidden_size=32,
+                num_attention_heads=4,
+                head_dim=8,
+                global_head_dim=16,
+                num_key_value_heads=4,
+                num_global_key_value_heads=2,
+                attention_k_eq_v=False,
+                per_layer_config=(
+                    {"05": {"head_dim": 16, "num_key_value_heads": 2}}
+                    if use_per_layer_config
+                    else None
+                ),
+            )
+        )
+        full = attention_cls(cfg, 5)
+        expected_kv_heads = 2 if use_per_layer_config else 4
+        assert not full.use_k_eq_v
+        assert full.n_kv_heads == expected_kv_heads
+        assert full.k_proj.weight.shape == (expected_kv_heads * 16, 32)
+        assert full.v_proj.weight.shape == full.k_proj.weight.shape
+        sliding = attention_cls(cfg, 0)
+        assert (sliding.head_dim, sliding.n_kv_heads) == (8, 4)
+
+
+@pytest.fixture
+def inkling2_model():
+    from mlx_vlm.models.inkling2 import Model, ModelConfig
+
+    mx.random.seed(194)
+    model = Model(ModelConfig.from_dict(model_case("inkling2")["config"]))
+    for path, value in tree_flatten(model.parameters()):
+        if any(name in path for name in (".query", ".rel_proj", "gate_weight")):
+            model.load_weights(
+                [(path, mx.random.normal(value.shape) * 0.1)], strict=False
+            )
+    model.eval()
+    return model
+
+
+def _inkling2_native_weights(model):
+    """Original release names and interleaved expert rows, including full attention."""
+    weights = {}
+    for key, value in tree_flatten(model.parameters()):
+        if ".switch_mlp." in key:
+            continue
+        if key.startswith("language_model.model.layers."):
+            layer, sub = key[len("language_model.model.layers.") :].split(".", 1)
+            if sub == "attention_input.query":
+                key = f"model.llm.attn_res.attn_queries.{int(layer) - 1}"
+            elif sub == "mlp_input.query":
+                key = f"model.llm.attn_res.mlp_queries.{layer}"
+            else:
+                for src, dst in (
+                    ("self_attn.q_proj", "attn.wq_du"),
+                    ("self_attn.k_proj", "attn.wk_dv"),
+                    ("self_attn.v_proj", "attn.wv_dv"),
+                    ("self_attn.r_proj", "attn.wr_du"),
+                    ("self_attn.o_proj", "attn.wo_ud"),
+                    ("self_attn.gate_proj", "attn.gate_attn"),
+                    ("self_attn.sink_proj", "attn.attn_sink_proj"),
+                    ("self_attn.q_scale", "attn.q_l2_clip.scale"),
+                    ("self_attn.rel_scale", "attn.rel_l2_clip.scale"),
+                    ("self_attn.rel_proj", "attn.rel_logits_proj.proj"),
+                    ("self_attn.", "attn."),
+                    (".static_weight", ".static_w"),
+                    (".weight_proj.weight", ".weight_proj"),
+                    ("input_layernorm", "attn_norm"),
+                    ("post_attention_layernorm", "mlp_norm"),
+                    ("q_attn_norm", "q_input_norm"),
+                    ("k_attn_norm", "k_input_norm"),
+                    ("v_attn_norm", "v_input_norm"),
+                    ("mlp.gate_weight", "mlp.gate.weight"),
+                    ("mlp.e_score_correction_bias", "mlp.gate.bias"),
+                ):
+                    sub = sub.replace(src, dst)
+                if ".conv.weight" in sub:
+                    sub = sub.replace(".conv.weight", ".weight")
+                    value = value.transpose(0, 2, 1)
+                key = f"model.llm.layers.{layer}.{sub}"
+        elif key.startswith("language_model.model."):
+            sub = key[len("language_model.model.") :]
+            sub = sub.replace("embed_tokens.weight", "embed.weight")
+            sub = sub.replace("final_input.query", "attn_res.output_query")
+            key = "model.llm." + sub
+        elif key == "language_model.lm_head.weight":
+            key = "model.llm.unembed.weight"
+        elif key.startswith("vision_tower."):
+            sub = key[len("vision_tower.") :]
+            sub = sub.replace("pre_layernorm.", "ln_pre.")
+            sub = sub.replace(".layernorm_before.", ".ln_1.").replace(
+                ".layernorm_after.", ".ln_2."
+            )
+            sub = sub.replace(".lambda_1", ".ls_1.gamma").replace(
+                ".lambda_2", ".ls_2.gamma"
+            )
+            sub = sub.replace(".mlp.fc1.", ".mlp.c_fc.").replace(
+                ".mlp.fc2.", ".mlp.c_proj."
+            )
+            key = (
+                "model.visual." + ("" if sub.startswith("proj_") else "backbone.") + sub
+            )
+        weights[key] = value
+    for i, layer in enumerate(model.layers):
+        sm = layer.mlp.switch_mlp
+        weights[f"model.llm.layers.{i}.mlp.experts.w13_weight"] = mx.stack(
+            [sm.gate_proj.weight, sm.up_proj.weight], axis=-2
+        ).reshape(
+            sm.gate_proj.num_experts,
+            -1,
+            sm.gate_proj.input_dims,
+        )
+        weights[f"model.llm.layers.{i}.mlp.experts.w2_weight"] = sm.down_proj.weight
+    return weights
+
+
+def test_inkling2_native_checkpoint_and_mixed_quantization(inkling2_model, tmp_path):
+    from mlx_vlm.convert import convert
+
+    model = inkling2_model
+    raw = _inkling2_native_weights(model)
+    expected = dict(tree_flatten(model.parameters()))
+    sanitized = model.sanitize(raw)
+    assert sanitized.keys() == expected.keys()
+    for key in expected:
+        np.testing.assert_array_equal(np.array(sanitized[key]), np.array(expected[key]))
+    twice = model.sanitize(sanitized)
+    for key in sanitized:
+        np.testing.assert_array_equal(np.array(twice[key]), np.array(sanitized[key]))
+
+    # Match the release's cast groups: queries and router bias stay FP32,
+    # while dense weights (including router/conv weights) are stored in BF16.
+    for key, value in raw.items():
+        if not (".attn_res." in key or key.endswith(".mlp.gate.bias")):
+            raw[key] = value.astype(mx.bfloat16)
+        elif key.endswith(".mlp.gate.bias"):
+            raw[key] = mx.arange(value.size, dtype=mx.float32) / 129
+
+    # The real release combines NVFP4 with per-expert amax and rowwise MXFP8.
+    groups = [
+        {
+            "weight_transform": "cast",
+            "compute_dtype": name,
+            "output_dtype": name,
+            "tensors": [
+                key
+                for key, value in raw.items()
+                if value.dtype == dtype
+                and ".experts." not in key
+                and key != "model.llm.unembed.weight"
+            ],
+        }
+        for name, dtype in (("float32", mx.float32), ("bfloat16", mx.bfloat16))
+    ]
+    groups.append(
+        {
+            "weight_transform": "cast",
+            "compute_dtype": "bfloat16",
+            "output_dtype": "bfloat16",
+            "fwd_output_dtype": "float32",
+            "tensors": ["model.llm.unembed.weight"],
+        }
+    )
+    for layer, mode, bits, group_size in ((0, "nvfp4", 4, 16), (1, "mxfp8", 8, 32)):
+        names = [
+            f"model.llm.layers.{layer}.mlp.experts.{name}"
+            for name in ("w13_weight", "w2_weight")
+        ]
+        groups.append({"weight_transform": mode + "_nearest", "tensors": names})
+        for name in names:
+            weight = raw[name]
+            scale = mx.array([0.5, 0.75, 1.25, 1.5]) if bits == 4 else mx.ones((4,))
+            packed, scales = mx.quantize(
+                weight / scale[:, None, None],
+                group_size=group_size,
+                bits=bits,
+                mode=mode,
+            )
+            raw[name] = packed.view(mx.uint8)
+            raw[name + "_scale"] = scales
+            if bits == 4:
+                raw[name + "_amax"] = scale * 2688
+                raw[name + "_outer_scale_denominator"] = mx.array([2688.0])
+    metadata = {"quant_method": "inkling2", "model": {"parameter_groups": groups}}
+    (tmp_path / "config.json").write_text(json.dumps(asdict(model.config)))
+    (tmp_path / "hf_quant_config.json").write_text(json.dumps(metadata))
+    # Omit null declarations, as in the native checkpoint.
+    config = json.loads((tmp_path / "config.json").read_text())
+    config.pop("quantization")
+    config.pop("quantization_config")
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), raw)
+    loaded = load_model(tmp_path, strict=True)
+    sm = loaded.layers[0].mlp.switch_mlp
+    assert sm.gate_proj.mode == "nvfp4"
+    np.testing.assert_array_equal(
+        np.array(sm.gate_proj.weight_scale_2), [0.5, 0.75, 1.25, 1.5]
+    )
+    assert loaded.layers[1].mlp.switch_mlp.gate_proj.mode == "mxfp8"
+    assert not hasattr(loaded.layers[2].mlp.switch_mlp.gate_proj, "mode")
+    expected = dict(tree_flatten(loaded.parameters()))
+    for key, value in model.sanitize(raw).items():
+        assert expected[key].dtype == value.dtype
+        np.testing.assert_array_equal(
+            np.array(expected[key].astype(mx.float32)),
+            np.array(value.astype(mx.float32)),
+        )
+    fp32_weights = {
+        key: np.array(value)
+        for key, value in expected.items()
+        if value.dtype == mx.float32
+    }
+    assert any(
+        not np.array_equal(
+            value, np.array(mx.array(value).astype(mx.bfloat16).astype(mx.float32))
+        )
+        for value in fp32_weights.values()
+    )
+    ids = mx.array([[1, 2, 3, 4]])
+    logits = loaded(ids).logits
+    assert bool(mx.all(mx.isfinite(logits)))
+    # Use the same public entry point as distributed generation. A fake group
+    # isolates weight loading/partitioning; real collectives are tested below.
+    group = SimpleNamespace(size=lambda: 2, rank=lambda: 1)
+    processor = SimpleNamespace()
+    with (
+        patch("mlx_vlm.utils.load_processor", return_value=processor),
+        patch("mlx_vlm.utils.load_image_processor", return_value=None),
+        patch("mlx.core.distributed.all_sum", side_effect=lambda x, **kw: x),
+    ):
+        sharded, returned_processor = sharded_load(str(tmp_path), tensor_group=group)
+    assert returned_processor is processor
+    assert sharded.language_model.sharding_group is group
+    for key, value in tree_flatten(sharded.parameters()):
+        old = expected[key]
+        assert value.dtype == old.dtype
+        target = old[2:] if ".switch_mlp." in key else old
+        assert mx.array_equal(value, target).item(), key
+    converted = tmp_path / "converted"
+    config["quantization"] = model.quantization_from_metadata(metadata)
+    expected_dtypes = {key: value.dtype for key, value in expected.items()}
+    with patch("mlx_vlm.convert.fetch_from_hub", return_value=(loaded, config, None)):
+        convert(str(tmp_path), str(converted), dtype="bfloat16")
+    reloaded = load_model(converted, strict=True)
+    for key, value in tree_flatten(reloaded.parameters()):
+        assert value.dtype == expected_dtypes[key]
+        if key in fp32_weights:
+            np.testing.assert_array_equal(np.array(value), fp32_weights[key])
+    np.testing.assert_allclose(
+        np.array(reloaded(ids).logits), np.array(logits), atol=1e-6
+    )
+
+
+@pytest.mark.parametrize("softcap", [0.0, 30.0])
+def test_inkling2_bf16_head_keeps_fp32_projection_scores(inkling2_model, softcap):
+    lm = inkling2_model.language_model
+    lm.config.final_logit_softcapping = softcap
+    lm.model.embed_norm.weight = lm.model.embed_norm.weight.astype(mx.bfloat16)
+    lm.lm_head.weight = mx.ones(lm.lm_head.weight.shape, mx.bfloat16)
+    h = mx.zeros((1, 2, lm.config.hidden_size), mx.bfloat16)
+    h[..., 0] = 1
+    h[..., 1] = 1 / 256
+    expected = (
+        np.asarray(h.astype(mx.float32), dtype=np.float64)
+        @ np.asarray(lm.lm_head.weight.astype(mx.float32), dtype=np.float64).T
+    )
+    if softcap:
+        expected = np.tanh(expected / softcap) * softcap
+    actual = lm._logits_from_norm(h)
+    assert actual.dtype == mx.float32
+    assert lm.lm_head.weight.dtype == mx.bfloat16
+    np.testing.assert_allclose(
+        np.array(actual),
+        expected[..., : lm.config.unpadded_vocab_size],
+        atol=2e-7,
+        rtol=0,
+    )
+
+
+@pytest.mark.parametrize(
+    "dtype,tolerance", [(mx.float32, 2e-5), (mx.float16, 1e-2), (mx.bfloat16, 8e-2)]
+)
+def test_inkling2_cached_chunks_and_speculative_rollback(
+    inkling2_model, dtype, tolerance
+):
+    model = inkling2_model
+    # Keep routing away from top-k ties when testing low-precision cache numerics.
+    for layer in model.layers:
+        layer.mlp.e_score_correction_bias = mx.arange(4, dtype=mx.float32)
+    model.update(tree_map(lambda a: a.astype(dtype), model.parameters()))
+    ids = mx.array([[1, 2, 3, 5, 8, 13, 7, 4, 9, 2, 3]])
+    reference = model(ids).logits
+    for chunk in (1, 3, 5):
+        cache = model.make_cache()
+        outputs = [
+            model(ids[:, i : i + chunk], cache=cache).logits
+            for i in range(0, ids.shape[1], chunk)
+        ]
+        np.testing.assert_allclose(
+            np.array(mx.concatenate(outputs, axis=1)),
+            np.array(reference),
+            atol=tolerance,
+            rtol=tolerance,
+        )
+    language = model.language_model
+    cache = language.make_cache()
+    language(ids[:, :3], cache=cache)
+    _, _, state = language.speculative_verify_hidden(ids[:, 3:7], cache)
+    language.rollback_speculative_cache(cache, state, accepted=1, block_size=4)
+    actual = language(ids[:, 5:6], cache=cache).logits
+    np.testing.assert_allclose(
+        np.array(actual), np.array(reference[:, 5:6]), atol=tolerance, rtol=tolerance
+    )
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+def test_inkling2_multiple_images_and_embedding_slots(inkling2_model, dtype):
+    model = inkling2_model
+    model.update(tree_map(lambda a: a.astype(dtype), model.parameters()))
+    pixels = mx.random.normal((3, 4, 4, 3))
+    grid = mx.array([[1, 1, 2], [1, 1, 1]])
+    combined = model.vision_tower(pixels, grid)
+    assert combined.dtype == dtype
+    separate = mx.concatenate(
+        [
+            model.vision_tower(pixels[:2], grid[:1]),
+            model.vision_tower(pixels[2:], grid[1:]),
+        ]
+    )
+    np.testing.assert_allclose(
+        np.array(combined.astype(mx.float32)),
+        np.array(separate.astype(mx.float32)),
+        atol=1e-6,
+    )
+    ids = mx.array([[1, 60, 60, 2, 60]])
+    embeds = model.get_input_embeddings(ids, pixels, image_grid_thw=grid).inputs_embeds
+    np.testing.assert_allclose(
+        np.array(embeds[0, mx.array([1, 2, 4])].astype(mx.float32)),
+        np.array(combined.astype(mx.float32)),
+        atol=1e-6,
+    )
+    with pytest.raises(ValueError, match="Image tokens"):
+        model.get_input_embeddings(mx.array([[60]]), pixels, image_grid_thw=grid)
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+def test_inkling2_convolution_rounds_after_residual_and_scaling(dtype):
+    from mlx_vlm.models.inkling2.language import ShortConvolution
+
+    mx.random.seed(194)
+    conv = ShortConvolution(16, 4, 0)
+    conv.conv.weight = mx.random.normal((16, 4, 1)).astype(dtype)
+    inputs = mx.random.normal((1, 17, 16)).astype(dtype)
+    x = np.array(inputs.astype(mx.float32))
+    taps = np.array(conv.conv.weight.astype(mx.float32))[:, :, 0].T
+    padded = np.pad(x, ((0, 0), (3, 0), (0, 0)))
+    expected = x.copy()
+    convolution = np.zeros_like(x)
+    for tap in range(4):
+        convolution += padded[:, tap : tap + 17] * taps[tap]
+    expected = mx.array((expected + convolution) / np.float32(np.sqrt(5))).astype(dtype)
+    cache = [None]
+    cached = mx.concatenate(
+        [
+            conv(inputs[:, :11], cache),
+            *[conv(inputs[:, i : i + 1], cache) for i in range(11, 17)],
+        ],
+        axis=1,
+    )
+    for actual in (conv(inputs), cached):
+        np.testing.assert_allclose(
+            np.array(actual.astype(mx.float32)),
+            np.array(expected.astype(mx.float32)),
+            atol=2e-6,
+            rtol=2e-6,
+        )
+
+
+def make_ernie55_model(*, learned=False):
+    from mlx_vlm.models.ernie5_5_moe import Model, ModelConfig
+
+    mx.random.seed(55)
+    model = Model(ModelConfig.from_dict(model_case("ernie5_5_moe")["config"]))
+    model.eval()
+    if learned:
+        # Exercise learned mixers/routers instead of their zero initialization.
+        for layer in model.layers:
+            for hc in (layer.attn_hc, layer.ffn_hc):
+                hc.fn = mx.random.normal(hc.fn.shape) * 0.02
+                hc.base = mx.random.normal(hc.base.shape) * 0.1
+            layer.attn.vha.U = mx.random.normal(layer.attn.vha.U.shape) * 0.1
+            layer.attn.vha.V = mx.random.normal(layer.attn.vha.V.shape) * 0.1
+            if hasattr(layer.ffn, "gate"):
+                for name in ("weight", "weight_1"):
+                    layer.ffn.gate[name] = (
+                        mx.random.normal(layer.ffn.gate[name].shape) * 0.1
+                    )
+    return model
+
+
+def test_ernie55_fp8_tail_blocks_use_shared_decoder():
+    model = make_ernie55_model()
+    key = "model.layers.0.self_attn.linear_q_down_proj.weight"
+    codes = mx.full((129, 131), 0x38, dtype=mx.uint8)  # E4M3 1.0
+    scales = mx.array([[1.0, 2.0], [4.0, 8.0]])
+    out = model.sanitize({key: codes, key + "_scale_inv": scales})
+    expected = np.repeat(np.repeat([[1, 2], [4, 8]], 128, axis=0), 128, axis=1)[
+        :129, :131
+    ]
+    np.testing.assert_array_equal(
+        out["language_model.model.layers.0.attn.wq_a.weight"].astype(mx.float32),
+        expected,
+    )

@@ -47,6 +47,7 @@ class ThinkingStreamState:
     _DEFAULT_OPEN_CLOSE_MARKERS = (
         ("<|channel>thought", "<channel|>"),
         ("<think>", "</think>"),
+        ("<mm:think>", "</mm:think>"),
         ("<|START_THINKING|>", "<|END_THINKING|>"),
     )
 
@@ -79,7 +80,7 @@ class ThinkingStreamState:
                 idx, marker = self._find_first(self.buffer, self.close_markers)
                 if idx < 0:
                     emit, self.buffer = self._split_partial(
-                        self.buffer, self.close_markers
+                        self.buffer, self.close_markers + self.open_markers
                     )
                     emit = self._strip_open_marker(emit)
                     if emit:

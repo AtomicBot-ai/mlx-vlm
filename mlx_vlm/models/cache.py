@@ -1075,6 +1075,12 @@ class ArraysCache(_BaseCache):
                 return final
             return intermediate[:, keep - 1]
 
+        from ..speculative.cache_kernels import select_temporal_states
+
+        selected = select_temporal_states(intermediate, final, initial, lengths, total)
+        if selected is not None:
+            return selected
+
         keep = mx.array(lengths, dtype=mx.int32)
         batch = len(lengths)
         if intermediate is None:

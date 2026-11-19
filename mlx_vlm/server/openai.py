@@ -37,6 +37,7 @@ from ..tools import (
 from ..tools.streaming import ToolCallDeltaState
 from ..utils import prepare_inputs
 from . import compaction, continuation
+from .cluster_types import GenerationProgress, PromptProgress
 from .generation import (
     GenerationMetrics,
     PromptTooLongError,
@@ -764,8 +765,11 @@ async def responses_input_tokens_endpoint(request: Request):
         )
         _ensure_effective_input(chat_messages, images=images)
 
-        model, processor, config = get_cached_model(
-            openai_request.model, _adapter_path_or_inherit(openai_request)
+        # Keep health/progress polling responsive; MLX loads on its owner thread.
+        model, processor, config = await asyncio.to_thread(
+            get_cached_model,
+            openai_request.model,
+            _adapter_path_or_inherit(openai_request),
         )
         del model
         chat_tools, _ = _response_tool_registry(openai_request.tools)
@@ -815,8 +819,8 @@ async def responses_compact_endpoint(http_request: Request, request: CompactRequ
         model=request.model,
         tenant=tenant,
     )
-    model, processor, config = get_cached_model(
-        request.model, _adapter_path_or_inherit(request)
+    model, processor, config = await asyncio.to_thread(
+        get_cached_model, request.model, _adapter_path_or_inherit(request)
     )
     result = await compaction.compact_response_context(
         request,
@@ -881,8 +885,8 @@ def _response_stream_error(exc, response):
 
 async def _responses_compaction_trigger(request, items, tenant, covered=frozenset()):
     """Return a single opaque item, with progress while a summary is running."""
-    model, processor, config = get_cached_model(
-        request.model, _adapter_path_or_inherit(request)
+    model, processor, config = await asyncio.to_thread(
+        get_cached_model, request.model, _adapter_path_or_inherit(request)
     )
     compact_request = CompactRequest(
         **{**request.model_dump(), "stream": False, "max_output_tokens": 1024}
@@ -1088,8 +1092,10 @@ async def responses_endpoint(request: Request):
         )
         compaction_args = None
         if openai_request.context_management:
-            model, processor, config = get_cached_model(
-                openai_request.model, _adapter_path_or_inherit(openai_request)
+            model, processor, config = await asyncio.to_thread(
+                get_cached_model,
+                openai_request.model,
+                _adapter_path_or_inherit(openai_request),
             )
             compaction_args = (
                 openai_request,
@@ -1139,8 +1145,10 @@ async def responses_endpoint(request: Request):
         _ensure_effective_input(chat_messages, images=images)
 
         # Get model, processor, config - loading if necessary
-        model, processor, config = get_cached_model(
-            openai_request.model, _adapter_path_or_inherit(openai_request)
+        model, processor, config = await asyncio.to_thread(
+            get_cached_model,
+            openai_request.model,
+            _adapter_path_or_inherit(openai_request),
         )
 
         chat_tools, tool_registry = _response_tool_registry(openai_request.tools)
@@ -1223,6 +1231,7 @@ async def responses_endpoint(request: Request):
         message_id = f"msg_{uuid.uuid4().hex}"
 
         if openai_request.stream:
+            gen_args.emit_prompt_progress = True
             # Streaming response
             runtime.metrics.begin_request(
                 endpoint="/responses",
@@ -1476,10 +1485,32 @@ async def responses_endpoint(request: Request):
                             token = await asyncio.to_thread(_next_token_resp_stream)
                             if token is None:
                                 break
+                            progress = getattr(token, "prompt_progress", None)
+                            if progress is not None:
+                                event = PromptProgress(
+                                    response_id=response_id, **progress
+                                )
+                                yield _response_sse_event(
+                                    event.type, event.model_dump()
+                                )
+                                continue
                             raw_delta = token.text
                             full_text += raw_delta
                             chunk_rate = metrics.record_chunk(token)
                             output_tokens = metrics.generated_tokens
+                            timings = (
+                                {"predicted_per_second": metrics.rate}
+                                if metrics.rate is not None
+                                else None
+                            )
+                            event = GenerationProgress(
+                                response_id=response_id,
+                                output_tokens=output_tokens,
+                                timings=timings,
+                            )
+                            yield _response_sse_event(
+                                event.type, event.model_dump(exclude_none=True)
+                            )
                             thinking_delta = thinking_state.feed(
                                 raw_delta, last=bool(token.finish_reason)
                             )
@@ -1513,7 +1544,8 @@ async def responses_endpoint(request: Request):
                                 finish_reason = token.finish_reason
                                 break
                     else:
-                        # Fallback to stream_generate
+                        # Fallback to stream_generate. Prefill measurements come
+                        # from ResponseGenerator in normal local/worker serving.
                         token_iterator = continuation.stream_generation(
                             stream_generate,
                             model=model,
@@ -1533,6 +1565,18 @@ async def responses_endpoint(request: Request):
                             raw_delta = chunk.text
                             full_text += raw_delta
                             chunk_rate = metrics.record_chunk(chunk)
+                            event = GenerationProgress(
+                                response_id=response_id,
+                                output_tokens=metrics.generated_tokens,
+                                timings=(
+                                    {"predicted_per_second": metrics.rate}
+                                    if metrics.rate is not None
+                                    else None
+                                ),
+                            )
+                            yield _response_sse_event(
+                                event.type, event.model_dump(exclude_none=True)
+                            )
                             chunk_finish = getattr(chunk, "finish_reason", None)
                             thinking_delta = thinking_state.feed(
                                 raw_delta, last=bool(chunk_finish)
@@ -1994,7 +2038,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
         compacted_context = None
         if request.context_management != []:
             _prepare_chat_tool_choice([], request.tools, request.tool_choice)
-            model, processor, config = get_cached_model(request.model, adapter_path)
+            model, processor, config = await asyncio.to_thread(
+                get_cached_model, request.model, adapter_path
+            )
             if request.context_management or (
                 compaction._context_limit(config, required=False) is not None
                 and all(
@@ -2073,7 +2119,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             request.tool_choice,
         )
 
-        model, processor, config = get_cached_model(request.model, adapter_path)
+        model, processor, config = await asyncio.to_thread(
+            get_cached_model, request.model, adapter_path
+        )
 
         video_resolution = resolve_video_inputs(
             processor,
@@ -2254,6 +2302,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             token = await asyncio.to_thread(_next_token)
                             if token is None:
                                 break
+                            if getattr(token, "prompt_progress", None) is not None:
+                                continue
                             full_output += token.text
                             chunk_rate = metrics.record_chunk(token)
                             output_tokens = metrics.generated_tokens

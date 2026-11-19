@@ -191,7 +191,11 @@ class Attention(nn.Module):
         self.use_k_eq_v = (
             getattr(config, "attention_k_eq_v", False) and not self.is_sliding
         )
-        if self.use_k_eq_v and config.num_global_key_value_heads is not None:
+        if (
+            not self.is_sliding
+            and config.num_global_key_value_heads is not None
+            and (self.use_k_eq_v or config.per_layer_config is not None)
+        ):
             self.n_kv_heads = config.num_global_key_value_heads
         else:
             self.n_kv_heads = config.num_key_value_heads

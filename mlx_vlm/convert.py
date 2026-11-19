@@ -2,7 +2,10 @@ import argparse
 import glob
 import json
 import shutil
+import sys
+from functools import wraps
 from pathlib import Path
+from types import ModuleType
 from typing import Callable, Optional, Union
 
 import mlx.core as mx
@@ -318,13 +321,15 @@ def convert(
 
     model_quant_predicate = getattr(model, "quant_predicate", None)
 
-    def base_quant_predicate(path, module):
+    def base_quant_predicate(path, module, **kwargs):
         if skip_multimodal_module(path):
             return False
         if model_quant_predicate is not None:
-            return model_quant_predicate(path, module)
+            return model_quant_predicate(path, module, **kwargs)
         return True
 
+    if model_quant_predicate is not None:
+        base_quant_predicate = wraps(model_quant_predicate)(base_quant_predicate)
     target = model
 
     if isinstance(quant_predicate, str):
@@ -614,6 +619,20 @@ def main():
     parser = configure_parser()
     args = parser.parse_args()
     convert(**vars(args))
+
+
+class _CallableConversionModule(ModuleType):
+    """Keep the package-level conversion call without hiding this module."""
+
+    @property
+    def __wrapped__(self):
+        return self.convert
+
+    def __call__(self, *args, **kwargs):
+        return self.convert(*args, **kwargs)
+
+
+sys.modules[__name__].__class__ = _CallableConversionModule
 
 
 if __name__ == "__main__":

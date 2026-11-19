@@ -19,8 +19,35 @@ class Model(Mistral3Model):
         self.language_model = LanguageModel(config.text_config)
         self.vision_feature_layer = config.vision_feature_layer
 
-    def shard(self, group=None):
+    def shard(self, group=None, *, weights=None):
+        """Shard parameters and optionally select checkpoint weights before conversion."""
+        args = self.language_model.args
+        original = (args.expert_start, args.expert_end)
         self.language_model.shard(group)
+        if weights is None:
+            return
+        start, end = args.expert_start, args.expert_end
+        for key in list(weights):
+            if key.startswith("mtp"):
+                del weights[key]
+                continue
+            expert = re.search(r"(?:^|\.)experts\.(\d+)\.", key)
+            if expert:
+                if not start <= int(expert[1]) < end:
+                    del weights[key]
+            elif re.search(r"(?:^|\.)experts\.w[123]\.", key):
+                value = weights[key]
+                count = original[1] - original[0]
+                if not value.ndim or value.shape[0] != count:
+                    raise ValueError(
+                        f"{key}: expected {count} experts for checkpoint "
+                        f"partition {original}, got shape {value.shape}"
+                    )
+                if original != (start, end):
+                    # Gather owns its storage; even a contiguous slice can keep
+                    # all experts' backing allocation alive after evaluation.
+                    weights[key] = mx.take(value, mx.arange(start, end), axis=0)
+        return weights
 
     def sanitize(self, weights):
         """Map native Mistral names and stack experts after shared conversion."""
@@ -116,9 +143,11 @@ class Model(Mistral3Model):
                 source = f"{prefix}.{args.expert_start}.{projection}"
                 if f"{source}.weight" not in sanitized:
                     continue  # Already stacked MLX weights are left unchanged.
-                suffixes = ["weight"]
-                if args.nvfp4:
-                    suffixes.extend(("scales", "weight_scale_2"))
+                suffixes = ["weight"] + [
+                    suffix
+                    for suffix in ("scales", "biases", "weight_scale_2")
+                    if f"{source}.{suffix}" in sanitized
+                ]
                 for suffix in suffixes:
                     sanitized[f"{prefix}.{projection}.{suffix}"] = mx.stack(
                         [

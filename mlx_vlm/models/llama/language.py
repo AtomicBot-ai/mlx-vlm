@@ -137,6 +137,8 @@ class LlamaModel(nn.Module):
         inputs: mx.array,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
+        capture_layer_ids=None,
+        hidden_sink=None,
     ):
         if input_embeddings is not None:
             h = input_embeddings
@@ -152,9 +154,12 @@ class LlamaModel(nn.Module):
                 h, cache[self.swa_idx], window_size=self.sliding_window
             )
 
-        for layer, c in zip(self.layers, cache):
+        capture = set(capture_layer_ids or [])
+        for index, (layer, c) in enumerate(zip(self.layers, cache)):
             mask = swa_mask if layer.use_sliding else fa_mask
             h = layer(h, mask, cache=c)
+            if index in capture:
+                hidden_sink.append(h)
 
         return self.norm(h)
 
@@ -256,12 +261,26 @@ class LanguageModel(nn.Module):
         if inputs_embeds is None:
             inputs_embeds = input_embeddings
 
-        out = self.model(inputs, cache, inputs_embeds)
+        if kwargs.pop("speculative_verify", False):
+            from ...speculative.common import verify_forward
+
+            output, output_state = verify_forward(self, inputs, cache, **kwargs)
+            output.gdn_states = output_state
+            return output
+
+        capture_layer_ids = kwargs.get("capture_layer_ids")
+        hidden = [] if capture_layer_ids is not None else None
+        out = self.model(inputs, cache, inputs_embeds, capture_layer_ids, hidden)
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
             out = self.lm_head(out)
-        return LanguageModelOutput(logits=out)
+        return LanguageModelOutput(logits=out, hidden_states=hidden)
+
+    def rollback_speculative_cache(self, caches, state, accepted, block_size):
+        from ...speculative.cache_state import rollback_speculative_cache
+
+        return rollback_speculative_cache(caches, state, accepted, block_size)
 
     def sanitize(self, weights):
         return Model.sanitize(self, weights)

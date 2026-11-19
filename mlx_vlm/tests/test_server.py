@@ -52,6 +52,7 @@ from mlx_vlm import apc, sample_utils
 from mlx_vlm.apc import hash_image_payload
 from mlx_vlm.generate import GenerationResult
 from mlx_vlm.generate.image import ImageGenerationResult
+from mlx_vlm.load_progress import ModelLoadCancelled
 from mlx_vlm.models.cache import KVCache
 from mlx_vlm.models.gpt_oss.processing_gpt_oss import (
     HARMONY_RESPONSE_TEMPLATE,
@@ -1619,6 +1620,9 @@ def _reset_runtime(monkeypatch, **overrides):
     state = dict(
         model_cache=server.ModelCacheRegistry(),
         response_generator=None,
+        model_load_progress=None,
+        preload_in_progress=False,
+        preload_failures={},
         apc_manager=None,
     )
     for name, value in (state | overrides).items():
@@ -1676,6 +1680,24 @@ class TestEmbeddingEncoding:
                 assert np.signbit(decoded[1]) == np.signbit(vector[1])
             else:
                 assert item["embedding"] == vector
+
+    @pytest.mark.parametrize("fails", [False, True])
+    def test_clears_mlx_cache(self, client, fails):
+        kwargs = (
+            dict(side_effect=ValueError("boom"))
+            if fails
+            else dict(return_value=([[1.0]], 1))
+        )
+        with (
+            patch.object(server, "get_cached_model", return_value=(None, None)),
+            patch.object(embeddings, "_embed", **kwargs),
+            patch.object(embeddings.mx, "clear_cache") as clear_cache,
+        ):
+            response = client.post(
+                "/v1/embeddings", json=dict(input="text", model="embedding")
+            )
+        assert response.status_code == (400 if fails else 200)
+        clear_cache.assert_called_once_with()
 
     @pytest.mark.parametrize("encoding", ["binary", ""])
     def test_invalid_encoding(self, client, encoding):
@@ -2024,21 +2046,67 @@ def _generator(**overrides):
     return gen
 
 
+@pytest.mark.parametrize("distributed", [False, True])
+def test_model_resources_forward_loading_observer(monkeypatch, distributed):
+    events = []
+    model, processor = NS(config=NS()), NS()
+
+    def load(*args, progress_callback, **kwargs):
+        progress_callback({"stage": "loading_checkpoint"})
+        return model, processor
+
+    monkeypatch.setattr(generation, "load", load)
+    monkeypatch.setattr(
+        server.runtime, "distributed_worker", NS(load=load) if distributed else None
+    )
+    assert generation.load_model_resources(
+        "demo", None, progress_callback=events.append
+    ) == (model, processor, model.config)
+    assert events == [{"stage": "loading_checkpoint"}]
+
+
+def test_cancelled_loader_releases_partial_weights(monkeypatch, caplog):
+    owners = []
+
+    class Weights:
+        pass
+
+    def load(*args, progress_callback, **kwargs):
+        weights = Weights()
+        owners.append(weakref.ref(weights))
+        progress_callback({"stage": "evaluating_layers"})
+
+    def cancel(event):
+        raise ModelLoadCancelled("shutdown")
+
+    monkeypatch.setattr(generation, "load", load)
+    monkeypatch.setattr(server.runtime, "distributed_worker", None)
+    gen = _generator(load_progress_callback=cancel)
+    worker = Thread(target=gen._run)
+    worker.start()
+    worker.join(5)
+    assert not worker.is_alive()
+    assert gen._ready.is_set()
+    assert isinstance(gen._load_error, ModelLoadCancelled)
+    assert gen._load_error.__traceback__ is None
+    gc.collect()
+    assert owners[0]() is None
+    assert not any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
 def test_server_caches_apc_mode_when_model_initializes(monkeypatch):
     config = NS(eos_token_id=[])
     language_model = NS()
     model = NS(language_model=language_model)
     processor = NS(tokenizer=NS())
-    gen = _generator()
+    events = []
+    gen = _generator(load_progress_callback=events.append)
     gen.apc_manager = object()
 
     monkeypatch.delenv("MLX_VLM_DRAFT_MODEL", raising=False)
     monkeypatch.delenv("MLX_VLM_DRAFT_KIND", raising=False)
-    monkeypatch.setattr(
-        generation,
-        "load_model_resources",
-        lambda *_args, **_kwargs: (model, processor, config),
-    )
+    loader = Mock(return_value=(model, processor, config))
+    monkeypatch.setattr(generation, "load_model_resources", loader)
     apc_mode = MagicMock(return_value="exact")
     monkeypatch.setattr(apc, "model_apc_mode", apc_mode)
 
@@ -2046,6 +2114,9 @@ def test_server_caches_apc_mode_when_model_initializes(monkeypatch):
 
     assert gen.apc_mode == "exact"
     apc_mode.assert_called_once_with(language_model)
+
+    assert loader.call_args.kwargs["progress_callback"] == events.append
+    assert events == [{"stage": "initializing_generator"}]
 
 
 def test_server_serves_ar_requests_after_drafter_mismatch(monkeypatch):
@@ -5077,6 +5148,18 @@ class TestCompaction:
         assert mocked.generate.call_count == 1
         assert "Conversation handoff" not in mocked.generate.call_args.kwargs["prompt"]
 
+    def test_distributed_chat_never_restores_rank_local_compaction_cache(
+        self, mocked, client, monkeypatch
+    ):
+        monkeypatch.setattr(server.runtime, "distributed_worker", object())
+        restore = Mock(side_effect=AssertionError("Rank-local compaction cache used"))
+        monkeypatch.setattr(compaction.chat_cache, "restore", restore)
+        monkeypatch.setitem(client.headers, "X-MLX-Distributed-Request", "a" * 32)
+        response = _post(client, distributed=True, max_tokens=64)
+        assert response.status_code == 200, response.text
+        assert mocked.generate.call_count == 1
+        restore.assert_not_called()
+
     @pytest.mark.parametrize("stream", [False, True])
     @pytest.mark.parametrize(
         "outcome", ["recover", "disabled", "summary-fails", "protected-too-large"]
@@ -6363,7 +6446,8 @@ class TestResponseGenerator:
                 for field in ("token_number=", "token_id=", "text=")
             )
 
-    def test_prefill_progress_logging(self, caplog):
+    @pytest.mark.parametrize("emit_progress", [False, True])
+    def test_prefill_progress_logging_and_events(self, caplog, emit_progress):
         caplog.set_level(logging.INFO, logger="mlx_vlm.server")
         gen = Generator.__new__(Generator)
         prompt_batch = NS(
@@ -6375,11 +6459,38 @@ class TestResponseGenerator:
             _left_padding_per_row=[0],
             _right_pad_per_row=None,
         )
-        active = {1: {"request_id": "req-1", "prefill_processed": -1}}
+        updates = Queue()
+        active = {
+            1: {
+                "request_id": "req-1",
+                "prefill_processed": -1,
+                "emit_prompt_progress": emit_progress,
+                "rqueue": updates,
+            }
+        }
 
         gen._log_prefill_progress(NS(_prompt_batch=prompt_batch), active)
 
         assert "Prefill progress: request=req-1 tokens=2/6 (33.3%)" in caplog.text
+
+        # Re-polling a chunk must not duplicate events or regress the count.
+        gen._log_prefill_progress(NS(_prompt_batch=prompt_batch), active)
+        prompt_batch._processed_prompt_columns = 4
+        prompt_batch._inputs_embeds = mx.zeros((1, 2, 8))
+        gen._log_prefill_progress(NS(_prompt_batch=prompt_batch), active)
+        gen._log_prefill_completed(1, active[1], NS(prompt_tokens=6))
+        if emit_progress:
+            tokens = [updates.get_nowait() for _ in range(3)]
+            assert [t.prompt_progress for t in tokens] == [
+                {"status": status, "processed_tokens": count, "total_tokens": 6}
+                for status, count in (
+                    ("in_progress", 2),
+                    ("in_progress", 4),
+                    ("completed", 6),
+                )
+            ]
+            assert all(t.token_count == 0 and t.text == "" for t in tokens)
+        assert updates.empty()
 
     @pytest.mark.parametrize(
         "delayed", [False, True], ids=["timeout-cancels", "delayed-token"]
@@ -6915,7 +7026,10 @@ class TestResponseGenerator:
             monkeypatch.setenv("MLX_VLM_PRELOAD_" + key, kind)
         calls = []
 
-        def load(model_path, adapter_path=None, *, model_kind="auto"):
+        def load(
+            model_path, adapter_path=None, *, model_kind="auto", cancel_event=None
+        ):
+            assert (cancel_event is not None) == (model_kind == "text_generation")
             calls.append(model_kind)
             if model_kind == "audio_stt":
                 raise server.HTTPException(
@@ -6929,7 +7043,12 @@ class TestResponseGenerator:
 
         async def run():
             async with server._app_module.lifespan(server.app):
-                pass
+
+                async def wait_for_preloads():
+                    while server.runtime.preload_in_progress:
+                        await asyncio.sleep(0.001)
+
+                await asyncio.wait_for(wait_for_preloads(), 5)
 
         asyncio.run(run())
         assert calls == list(kinds.values())
@@ -7684,6 +7803,7 @@ def settings_client(monkeypatch, tmp_path):
             self.processor = NS()
             self.config = NS(model_type="test")
             self.apc_manager = kwargs["apc_manager"]
+            self.load_progress_callback = kwargs["load_progress_callback"]
             self.stopped = False
             generators.append(self)
 
@@ -7702,6 +7822,286 @@ def settings_client(monkeypatch, tmp_path):
         if not generator.stopped:
             generator.stop_and_join()
     client.close()
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_startup_preload_serves_progress_and_recovers(
+    settings_client, monkeypatch, fail
+):
+    _, generators = settings_client
+    for key in list(os.environ):
+        if key.startswith("MLX_VLM_PRELOAD_"):
+            monkeypatch.delenv(key)
+    monkeypatch.setenv("MLX_VLM_PRELOAD_MODEL", "demo")
+    monkeypatch.setenv("MLX_VLM_SERVER_API_KEY", "test-key")
+    entered, release = Event(), Event()
+    generator_class = server._app_module.ResponseGenerator
+    ready = generator_class.wait_until_ready
+
+    def loading(self):
+        self.load_progress_callback(
+            {"stage": "evaluating_layers", "completed_layers": 1, "total_layers": 2}
+        )
+        entered.set()
+        assert release.wait(5)
+        if fail and len(generators) == 1:
+            raise ValueError("broken checkpoint")
+        return ready(self)
+
+    monkeypatch.setattr(generator_class, "wait_until_ready", loading)
+    monkeypatch.setattr(
+        generator_class,
+        "_cpu_preprocess",
+        lambda *a, **k: {"input_ids": np.array([[1, 2, 3]])},
+        raising=False,
+    )
+    monkeypatch.setattr(openai, "apply_chat_template", lambda *a, **k: "prompt")
+    monkeypatch.setattr(
+        openai,
+        "_build_gen_args",
+        lambda *a, **k: NS(
+            to_template_kwargs=lambda: {}, preprocessing_kwargs=lambda: {}
+        ),
+    )
+
+    async def check():
+        async with server._app_module.lifespan(server.app):
+            # Lifespan startup has returned while the loader is still blocked.
+            try:
+                assert await asyncio.to_thread(entered.wait, 2)
+                async with httpx2.AsyncClient(
+                    transport=httpx2.ASGITransport(app=server.app),
+                    base_url="http://test",
+                    headers={"Authorization": "Bearer test-key"},
+                ) as client:
+                    denied = await client.get(
+                        "/health", headers={"Authorization": "wrong"}
+                    )
+                    assert denied.status_code == 401
+                    health = await asyncio.wait_for(client.get("/health"), 1)
+                    body = health.json()
+                    assert body["status"] == "healthy" and not body["model_ready"]
+                    assert body["preload_in_progress"] and body["loaded_model"] is None
+                    assert body["model_load_progress"]["stage_percent"] == 50.0
+                    metrics = (await client.get("/metrics")).json()["server"]
+                    assert metrics["model_load_progress"] == body["model_load_progress"]
+                    for route in (
+                        "/v1/responses",
+                        "/v1/chat/completions",
+                        "/v1/messages",
+                        "/v1/responses/input_tokens",
+                    ):
+                        pending = await client.post(
+                            route,
+                            json={
+                                "model": "demo",
+                                "input": "Hello",
+                                "messages": [{"role": "user", "content": "Hello"}],
+                                "max_tokens": 8,
+                            },
+                        )
+                        assert pending.status_code == 503
+                        assert pending.json()["detail"]["code"] == "model_loading"
+                        assert pending.headers["Retry-After"] == "1"
+                    assert (await client.post("/unload")).status_code == 409
+                    assert (
+                        await client.patch("/v1/settings", json={})
+                    ).status_code == 409
+                    assert len(generators) == 1
+                    release.set()
+
+                    async def finished():
+                        while server.runtime.preload_in_progress:
+                            await asyncio.sleep(0.001)
+
+                    await asyncio.wait_for(finished(), 2)
+                    body = (await client.get("/health")).json()
+                    assert body["model_ready"] is not fail
+                    assert body["model_load_progress"]["stage"] == (
+                        "failed" if fail else "ready"
+                    )
+                    if fail:
+                        assert generators[0].stopped
+                        assert (
+                            body["preload_failures"]["text_generation"]["error"]
+                            == "broken checkpoint"
+                        )
+                    # Successful preloads are reused; failed ones can be retried normally.
+                    retry = await client.post(
+                        "/v1/responses/input_tokens",
+                        json={"model": "demo", "input": "Hello"},
+                    )
+                    assert retry.status_code == 200
+                    assert len(generators) == (2 if fail else 1)
+                    assert (await client.get("/health")).json()["model_ready"]
+            finally:
+                release.set()
+        assert all(g.stopped for g in generators)
+        assert (
+            not server.runtime.model_cache and server.runtime.response_generator is None
+        )
+
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("cancel_shutdown", [False, True])
+def test_shutdown_cancels_preload_at_next_boundary(
+    settings_client, monkeypatch, cancel_shutdown
+):
+    _, generators = settings_client
+    monkeypatch.setenv("MLX_VLM_PRELOAD_MODEL", "demo")
+    monkeypatch.setenv("MLX_VLM_PRELOAD_MESH_MODEL", "must-not-start")
+    entered, release = Event(), Event()
+    generator_class = server._app_module.ResponseGenerator
+    ready = Mock(wraps=generator_class.wait_until_ready)
+
+    def loading(self):
+        self.load_progress_callback(
+            {"stage": "evaluating_layers", "completed_layers": 0, "total_layers": 2}
+        )
+        entered.set()
+        # Stand in for one indivisible native evaluation already in progress.
+        assert release.wait(5)
+        self.load_progress_callback(
+            {"stage": "evaluating_layers", "completed_layers": 1, "total_layers": 2}
+        )
+        return ready(self)
+
+    monkeypatch.setattr(generator_class, "wait_until_ready", loading)
+    mesh = Mock(side_effect=AssertionError("Shutdown must skip the next preload"))
+    monkeypatch.setattr(server._app_module, "load_3d_model", mesh)
+
+    async def check():
+        context = server._app_module.lifespan(server.app)
+        await context.__aenter__()
+        assert await asyncio.to_thread(entered.wait, 2)
+        closing = asyncio.create_task(context.__aexit__(None, None, None))
+        try:
+            await asyncio.sleep(0.05)
+            if cancel_shutdown:
+                closing.cancel()
+                await asyncio.sleep(0)
+            assert not closing.done() and not generators[0].stopped
+        finally:
+            release.set()
+            if cancel_shutdown:
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(closing, 2)
+            else:
+                await asyncio.wait_for(closing, 2)
+        assert generators[0].stopped and not server.runtime.model_cache
+        assert not server.runtime.preload_in_progress
+        assert not server.runtime.preload_failures
+        ready.assert_not_called()
+        mesh.assert_not_called()
+
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("when", ["before_start", "after_initialize"])
+def test_preload_cancellation_does_not_publish_model(settings_client, when):
+    _, generators = settings_client
+    stopping = Event()
+    if when == "before_start":
+        stopping.set()
+
+    original = server._app_module.ResponseGenerator.wait_until_ready
+
+    def ready(self):
+        result = original(self)
+        stopping.set()
+        return result
+
+    with patch.object(server._app_module.ResponseGenerator, "wait_until_ready", ready):
+        with pytest.raises(ModelLoadCancelled):
+            server._app_module.get_cached_model("demo", cancel_event=stopping)
+    assert len(generators) == (when == "after_initialize")
+    assert all(g.stopped for g in generators)
+    assert not server.runtime.model_cache
+    assert server.runtime.response_generator is None
+    assert server.runtime.apc_manager is None
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_local_loading_progress_is_observable_during_warmup(
+    settings_client, monkeypatch, fail
+):
+    _, generators = settings_client
+    entered, release = Event(), Event()
+    generator_class = server._app_module.ResponseGenerator
+    ready = generator_class.wait_until_ready
+
+    def loading(self):
+        self.load_progress_callback(
+            {
+                "stage": "evaluating_layers",
+                "completed_layers": 1,
+                "total_layers": 2,
+            }
+        )
+        entered.set()
+        assert release.wait(5)
+        if fail:
+            raise ValueError("broken checkpoint")
+        return ready(self)
+
+    monkeypatch.setattr(generator_class, "wait_until_ready", loading)
+    monkeypatch.setattr(
+        generator_class,
+        "_cpu_preprocess",
+        lambda *a, **k: {"input_ids": np.array([[1, 2, 3]])},
+        raising=False,
+    )
+    monkeypatch.setattr(openai, "apply_chat_template", lambda *a, **k: "prompt")
+    monkeypatch.setattr(
+        openai,
+        "_build_gen_args",
+        lambda *a, **k: NS(
+            to_template_kwargs=lambda: {}, preprocessing_kwargs=lambda: {}
+        ),
+    )
+
+    async def check():
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=server.app), base_url="http://test"
+        ) as client:
+            payload = {"model": "demo", "input": "Hello"}
+            pending = [
+                asyncio.create_task(
+                    client.post("/v1/responses/input_tokens", json=payload)
+                )
+                for _ in range(1 if fail else 2)
+            ]
+            try:
+                assert await asyncio.to_thread(entered.wait, 2)
+                health = await asyncio.wait_for(client.get("/health"), 1)
+                progress = health.json()["model_load_progress"]
+                assert progress["stage"] == "evaluating_layers"
+                assert progress["stage_percent"] == 50.0
+                assert (
+                    progress["completed_layers"] == 1 and progress["total_layers"] == 2
+                )
+                assert progress["model"] == "demo" and progress["elapsed_seconds"] >= 0
+                busy = await client.post("/unload")
+                assert busy.status_code == 409
+                assert busy.json()["detail"]["code"] == "model_loading"
+            finally:
+                release.set()
+                responses = await asyncio.gather(*pending)
+            assert all(r.status_code == (400 if fail else 200) for r in responses)
+            assert len(generators) == 1
+            progress = (await client.get("/health")).json()["model_load_progress"]
+            assert progress["stage"] == ("failed" if fail else "ready")
+            assert progress["stage_percent"] is None
+            if fail:
+                assert generators[0].stopped
+            else:
+                assert (await client.post("/unload")).status_code == 200
+                assert (await client.get("/health")).json()[
+                    "model_load_progress"
+                ] is None
+
+    asyncio.run(check())
 
 
 def test_apc_patch_reaches_next_model_request(settings_client, tmp_path):
@@ -8519,7 +8919,82 @@ def test_audio_transcription_request(
     else:
         assert response.json() == {"text": text}
     assert {key: fake.calls[0][key] for key in forwarded} == forwarded
+    assert fake.calls[0]["max_tokens"] == 1024
     loader.assert_called_once_with("fake-stt", model_kind="audio_stt")
+
+
+@pytest.mark.parametrize(
+    "generate, options, expected",
+    [
+        (lambda audio, *, max_tokens=16384: max_tokens, {}, None),
+        (lambda audio, *, max_tokens=None: max_tokens, {}, None),
+        (lambda audio, *, max_tokens=16384: max_tokens, {"max_tokens": 0}, 0),
+        (lambda audio, *, max_tokens: max_tokens, {}, 1024),
+        (lambda audio: None, {"max_tokens": 3}, None),
+    ],
+    ids=["model-default", "none-default", "explicit-cap", "required", "unsupported"],
+)
+def test_audio_transcription_budget(generate, options, expected):
+    request = server_audio.AudioTranscriptionRequest(model="test", **options)
+    kwargs = server_audio._build_stt_generate_kwargs(
+        NS(generate=generate), request, translate=False
+    )
+    assert kwargs.get("max_tokens") == expected
+
+
+def test_transcription_token_count_does_not_imply_truncation(audio_client, monkeypatch):
+    fake, _ = _audio_backend(
+        monkeypatch, {"text": "Transcript", "generation_tokens": 64}
+    )
+    monkeypatch.setattr(
+        server_audio, "audio_read", lambda *a, **kw: (np.zeros(160), 16000)
+    )
+    response = _upload(audio_client, max_tokens="64")
+    assert response.status_code == 200
+    assert fake.calls[0]["max_tokens"] == 64
+    assert response.json() == {"text": "Transcript"}
+    assert "x-mlx-finish-reason" not in response.headers
+    assert audio_client.get("/metrics").json()["latest"]["finish_reason"] is None
+
+
+@pytest.mark.parametrize("response_format", ["json", "text", "ndjson"])
+def test_transcription_reports_backend_finish_reason(
+    audio_client, monkeypatch, response_format
+):
+    fake, _ = _audio_backend(monkeypatch)
+    monkeypatch.setattr(
+        server_audio, "audio_read", lambda *a, **kw: (np.zeros(160), 16000)
+    )
+
+    def generate(audio, *, stream=False, **kwargs):
+        if stream:
+            return iter(
+                [
+                    {"text": "Partial"},
+                    {"text": "", "is_final": True, "finish_reason": "length"},
+                ]
+            )
+        return NS(text="Partial", finish_reason="length")
+
+    monkeypatch.setattr(fake, "generate", generate)
+    response = _upload(
+        audio_client,
+        response_format=response_format,
+        stream=str(response_format == "ndjson").lower(),
+    )
+    assert response.status_code == 200
+    if response_format == "ndjson":
+        first, final = map(json.loads, response.text.splitlines())
+        assert first["text"] == "Partial"
+        assert "finish_reason" not in first
+        assert final["is_final"]
+        assert final["finish_reason"] == "length"
+    elif response_format == "text":
+        assert response.text == "Partial"
+        assert response.headers["x-mlx-finish-reason"] == "length"
+    else:
+        assert response.json() == {"text": "Partial", "finish_reason": "length"}
+    assert audio_client.get("/metrics").json()["latest"]["finish_reason"] == "length"
 
 
 @pytest.mark.parametrize(
@@ -10720,3 +11195,75 @@ def test_diffusion_http_checkpoint_replays_without_regeneration(
         assert resumed.status_code == 200
         assert text(original)[: checkpoint["content"]] + text(resumed) == text(original)
         worker.generate.assert_not_called()
+
+
+@pytest.mark.parametrize("started", [False, True])
+def test_minimax_thinking_delimiters_at_every_chunk_boundary(started):
+    from mlx_vlm.server.responses_state import ThinkingStreamState
+
+    text = ("" if started else "<mm:think>") + "reasoning" + "</mm:think>\nanswer"
+    for split in range(len(text) + 1):
+        parser = ThinkingStreamState(started)
+        deltas = [parser.feed(text[:split]), parser.feed(text[split:], last=True)]
+        assert "".join(d.reasoning or "" for d in deltas) == "reasoning"
+        assert "".join(d.content or "" for d in deltas) == "answer"
+    parser = ThinkingStreamState(started)
+    deltas = [parser.feed(ch) for ch in text] + [parser.feed("", last=True)]
+    assert "".join(d.reasoning or "" for d in deltas) == "reasoning"
+    assert "".join(d.content or "" for d in deltas) == "answer"
+
+
+@pytest.mark.parametrize("continuous", [False, True])
+def test_responses_generation_progress_uses_native_timing_field(client, continuous):
+    chunks = [
+        NS(
+            text=text,
+            emitted_at=when,
+            generation_tokens=count,
+            prompt_tokens=3,
+            finish_reason=finish,
+        )
+        for text, when, count, finish in (
+            ("hello", 10.0, 1, None),
+            (" there", 10.5, 2, "stop"),
+        )
+    ]
+    with _endpoint(chunks=chunks, generator=_streaming(chunks) if continuous else None):
+        wire = _post(client, "responses", stream=True)
+    assert wire.status_code == 200, wire.text
+    events = _data(wire)
+    progress = [e for e in events if e["type"] == "response.generation_progress"]
+    assert [e["output_tokens"] for e in progress] == [1, 2]
+    assert "timings" not in progress[0]  # No measured interval yet.
+    assert progress[1]["timings"] == {"predicted_per_second": 2.0}
+    text = [e for e in events if e["type"] == "response.output_text.delta"]
+    assert text[-1]["timings"] == progress[-1]["timings"]
+    assert events[-1]["type"] == "response.completed"
+
+
+def test_responses_emit_real_prefill_progress_before_first_token(client):
+    tokens = [
+        _token(
+            token_count=0,
+            prompt_progress={
+                "status": status,
+                "processed_tokens": count,
+                "total_tokens": 16,
+            },
+        )
+        for status, count in (("started", 0), ("in_progress", 8), ("completed", 16))
+    ]
+    tokens.append(_token("answer", finish_reason="stop"))
+    with _endpoint(generator=_streaming(tokens, prompt_tokens=16)):
+        response = _post(client, "responses", stream=True)
+    events = _data(response)
+    prompt = [e for e in events if e.get("type") == "response.prompt_progress"]
+    assert [e["processed_tokens"] for e in prompt] == [0, 8, 16]
+    assert all(e["response_id"].startswith("resp_") for e in prompt)
+    first_text = next(
+        i for i, e in enumerate(events) if e.get("type") == "response.output_text.delta"
+    )
+    assert all(events.index(e) < first_text for e in prompt)
+    progress = [e for e in events if e.get("type") == "response.generation_progress"]
+    assert progress[-1]["output_tokens"] == 1
+    assert events[-1]["response"]["usage"]["output_tokens"] == 1
