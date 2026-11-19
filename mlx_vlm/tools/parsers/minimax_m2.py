@@ -128,7 +128,7 @@ def _convert_param_value_with_types(value: str, param_types: list[str]) -> Any:
             try:
                 val = float(value)
                 return val if val != int(val) else int(val)
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, OverflowError):
                 continue
         elif param_type in ["boolean", "bool"]:
             lower_val = value.lower().strip()
