@@ -1897,10 +1897,9 @@ def test_layer_major_threshold(managers, monkeypatch):
 
 def test_disk_block_lifecycle(managers, monkeypatch):
     monkeypatch.setenv("APC_DISK_SHARD_MAX_BLOCKS", "1")
-    # Disk writes are gated on free host RAM; pin the gate so runner pressure
-    # cannot turn a lifecycle assertion into a skip.
+    # Disk restores check both free RAM and the manager's memory headroom.
     monkeypatch.setenv("APC_DISK_MIN_FREE_RAM_GB", "0")
-    manager = managers("disk", blocks=1)
+    manager = managers("disk", blocks=1, budget=1 << 20)
     first, second = list(range(48)), list(range(100, 148))
     manager.release(store_blocks(manager, first))
     manager.disk.flush()
@@ -1912,7 +1911,7 @@ def test_disk_block_lifecycle(managers, monkeypatch):
     size = manager.disk.disk_bytes
     assert size > 0 and manager.disk.dir.exists()
     manager.close()
-    reader = managers("disk")
+    reader = managers("disk", budget=1 << 20)
     warm, count = reader.lookup_prefix_disk_cache(second)
     assert count == 48 and all(c.offset == 48 for c in warm)
     assert reader.stats_snapshot()["pool_used"] == 0
@@ -1924,10 +1923,9 @@ def test_disk_block_lifecycle(managers, monkeypatch):
 
 @parametrize("evicted", [1, 2])
 def test_disk_prefix_with_evicted_leading_blocks(managers, evicted, monkeypatch):
-    # Same free-RAM gate as test_disk_block_lifecycle: pin it so a busy runner
-    # cannot silently skip disk persistence.
+    # Keep prefix restoration independent of the runner's available memory.
     monkeypatch.setenv("APC_DISK_MIN_FREE_RAM_GB", "0")
-    manager = managers("disk", blocks=3)
+    manager = managers("disk", blocks=3, budget=1 << 20)
     tokens = list(range(48))
     source = [filled(C.KVCache(), 48, heads=1, dim=4)]
     stored = manager.store_kv_blocks(
