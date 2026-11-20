@@ -2944,6 +2944,12 @@ WIRE_CALLS = {
     '<atem:parameter name="days">3</atem:parameter></atem:invoke></atem:function_calls>',
     "cohere2_moe": '<|START_ACTION|>{"tool_name":"get_weather",'
     '"parameters":{"city":"Paris","days":3}}<|END_ACTION|>',
+    "deepseek_v4": "<｜DSML｜tool_calls>\n"
+    '<｜DSML｜invoke name="get_weather">\n'
+    '<｜DSML｜parameter name="city" string="true">Paris</｜DSML｜parameter>\n'
+    '<｜DSML｜parameter name="days" string="false">3</｜DSML｜parameter>\n'
+    "</｜DSML｜invoke>\n"
+    "</｜DSML｜tool_calls>",
     "gemma4": '<|tool_call>call:get_weather{city:<|"|>Paris<|"|>,days:3}<tool_call|>',
     "glm47": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>"
     "<arg_key>days</arg_key><arg_value>3</arg_value></tool_call>",
@@ -3050,6 +3056,101 @@ def test_parser_selection(name):
     processor = SimpleNamespace(tokenizer=SimpleNamespace(chat_template=template))
     assert _infer_tool_parser_from_processor(processor) == name
     assert _infer_tool_parser("anything", override=name) == name
+
+
+@pytest.mark.parametrize("thinking", [False, True])
+@pytest.mark.parametrize("with_system", [False, True])
+def test_deepseek_vision_tools_round_trip(thinking, with_system):
+    processor = c.deepseek(fast_tokenizer())
+    messages = [
+        dict(
+            role="user",
+            content=[
+                dict(type="text", text="Use get_weather for this city:"),
+                dict(type="image_url", image_url=dict(url="city.png")),
+            ],
+        )
+    ]
+    if with_system:
+        messages.insert(0, dict(role="system", content="Use the provided tools."))
+    original = deepcopy(messages)
+
+    def render():
+        return apply_chat_template(
+            processor,
+            dict(model_type="deepseek_v4"),
+            messages,
+            tools=WEATHER_TOOLS,
+            enable_thinking=thinking,
+            reasoning_effort="high",
+            num_images=1,
+        )
+
+    prompt = render()
+    assert '"name": "get_weather"' in prompt
+    assert "<｜DSML｜tool_calls>" in prompt
+    assert prompt.count("<｜deepseek_image｜>") == 1
+    suffix = "<｜Assistant｜>" + ("<think>" if thinking else "</think>")
+    assert prompt.endswith(suffix)
+    assert ("Reasoning Effort:" in prompt) == thinking
+    assert messages == original
+
+    calls = process_tool_calls(
+        WIRE_CALLS["deepseek_v4"], load_tool_module("deepseek_v4"), WEATHER_TOOLS
+    ).calls
+    messages.extend(
+        [
+            dict(role="assistant", content=None, tool_calls=calls),
+            dict(role="tool", tool_call_id=calls[0]["id"], content="Sunny, 18 C"),
+        ]
+    )
+    continued = render()
+    assert '<｜DSML｜invoke name="get_weather">' in continued
+    assert "<tool_result>Sunny, 18 C</tool_result>" in continued
+    assert continued.count("<｜deepseek_image｜>") == 1
+    assert continued.endswith(suffix)
+
+
+@pytest.mark.parametrize(
+    "template,expected",
+    [
+        (None, "deepseek_v4"),
+        ("[TOOL_CALLS]", "mistral"),
+        ("<arg_key>", "glm47"),
+        ("{{ messages[0]['content'] }}", None),
+    ],
+)
+def test_deepseek_parser_follows_active_encoder(template, expected):
+    processor = c.deepseek(fast_tokenizer())
+    if template is not None:
+        processor.chat_template = template
+        assert processor.apply_chat_template(
+            [dict(role="user", content="Hello")], tokenize=False
+        ) == ("Hello" if expected is None else template)
+    assert _infer_tool_parser_from_processor(processor) == expected
+    assert (
+        _infer_tool_parser_from_processor(processor, override="json_tools")
+        == "json_tools"
+    )
+
+
+@pytest.mark.parametrize("chunk_size", [1, 17])
+def test_deepseek_streamed_tool_calls(chunk_size):
+    from mlx_vlm.tools.streaming import ToolCallDeltaState
+
+    parser = load_tool_module("deepseek_v4")
+    state = ToolCallDeltaState(parser, WEATHER_TOOLS)
+    wire = WIRE_CALLS["deepseek_v4"]
+    deltas = [
+        delta
+        for start in range(0, len(wire), chunk_size)
+        for delta in state.feed(wire[start : start + chunk_size])
+    ]
+    calls = process_tool_calls(wire, parser, WEATHER_TOOLS).calls
+    deltas.extend(state.finish(calls))
+    arguments = "".join(delta["function"].get("arguments", "") for delta in deltas)
+    assert json.loads(arguments) == WEATHER_ARGS
+    assert next(delta["id"] for delta in deltas if "id" in delta) == calls[0]["id"]
 
 
 @pytest.mark.parametrize(
