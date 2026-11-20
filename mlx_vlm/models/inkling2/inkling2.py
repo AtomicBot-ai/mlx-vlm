@@ -83,6 +83,7 @@ class Model(nn.Module):
             s in path
             for s in (
                 ".query",
+                "message_queries",
                 "gate_weight",
                 "e_score_correction_bias",
                 "weight_scale_2",
@@ -205,4 +206,16 @@ class Model(nn.Module):
                     )
                     for projection, part in zip(projections, parts):
                         out[base + projection + "." + suffix] = part
+        base = "language_model.model."
+        if base + "middle_cycle_cross_pass_queries" in out:
+            width = self.config.text_config.hidden_size
+            attn_mlp = out.pop(base + "middle_cycle_cross_pass_queries").reshape(
+                -1, 2, width
+            )
+            kv = out.pop(base + "middle_cycle_cross_pass_kv_queries").reshape(
+                -1, 2, width
+            )
+            out[base + "message_queries"] = mx.concatenate(
+                [attn_mlp[:, :1], kv, attn_mlp[:, 1:]], axis=1
+            )
         return out

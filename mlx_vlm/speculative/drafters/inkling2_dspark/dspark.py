@@ -211,10 +211,16 @@ class Model(nn.Module):
         args = getattr(target, "config", None)
         if (
             args is None
-            or args.model_type != "inkling2_text"
+            or args.model_type not in ("inkling2_text", "inkling2_loop_text")
+            or args.model_type != self.config.text_config.model_type
             or any(
                 getattr(args, name) != getattr(self.config.text_config, name)
-                for name in ("hidden_size", "vocab_size", "num_hidden_layers")
+                for name in (
+                    "hidden_size",
+                    "vocab_size",
+                    "num_hidden_layers",
+                    "loop_config",
+                )
             )
         ):
             raise ValueError("The DSpark head requires its matching Inkling 2 target")

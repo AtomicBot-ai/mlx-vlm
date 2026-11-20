@@ -7696,13 +7696,39 @@ class TestGemma4PerLayerConfig:
 
 
 @pytest.fixture
-def inkling2_model():
+def inkling2_model(request):
     from mlx_vlm.models.inkling2 import Model, ModelConfig
 
     mx.random.seed(194)
-    model = Model(ModelConfig.from_dict(model_case("inkling2")["config"]))
+    config = model_case("inkling2")["config"]
+    if getattr(request, "param", "small") == "mini":
+        config.update(
+            model_type="inkling2_loop",
+            quantization_config={"quant_method": "modelopt", "quant_algo": "NVFP4"},
+        )
+        config["text_config"].update(
+            model_type="inkling2_loop_text",
+            num_hidden_layers=4,
+            n_layers_per_attn_res_block=1,
+            loop_config={
+                "core_start": 1,
+                "core_end": 3,
+                "num_passes": 3,
+                "gate_rank": 8,
+            },
+        )
+    model = Model(ModelConfig.from_dict(config))
     for path, value in tree_flatten(model.parameters()):
-        if any(name in path for name in (".query", ".rel_proj", "gate_weight")):
+        if any(
+            name in path
+            for name in (
+                ".query",
+                ".rel_proj",
+                "gate_weight",
+                "message_queries",
+                ".controllers.",
+            )
+        ):
             model.load_weights(
                 [(path, mx.random.normal(value.shape) * 0.1)], strict=False
             )
@@ -7750,6 +7776,15 @@ def _inkling2_native_weights(model):
                     sub = sub.replace(".conv.weight", ".weight")
                     value = value.transpose(0, 2, 1)
                 key = f"model.llm.layers.{layer}.{sub}"
+        elif key == "language_model.model.message_queries":
+            width = value.shape[-1]
+            weights["model.llm.middle_cycle_cross_pass_queries"] = value[
+                :, [0, 3]
+            ].reshape(-1, width)
+            weights["model.llm.middle_cycle_cross_pass_kv_queries"] = value[
+                :, 1:3
+            ].reshape(-1, width)
+            continue
         elif key.startswith("language_model.model."):
             sub = key[len("language_model.model.") :]
             sub = sub.replace("embed_tokens.weight", "embed.weight")
@@ -7786,6 +7821,7 @@ def _inkling2_native_weights(model):
     return weights
 
 
+@pytest.mark.parametrize("inkling2_model", ["small", "mini"], indirect=True)
 def test_inkling2_native_checkpoint_and_mixed_quantization(inkling2_model, tmp_path):
     from mlx_vlm.convert import convert
 
@@ -7803,7 +7839,9 @@ def test_inkling2_native_checkpoint_and_mixed_quantization(inkling2_model, tmp_p
     # Match the release's cast groups: queries and router bias stay FP32,
     # while dense weights (including router/conv weights) are stored in BF16.
     for key, value in raw.items():
-        if not (".attn_res." in key or key.endswith(".mlp.gate.bias")):
+        if not (
+            ".attn_res." in key or "cross_pass" in key or key.endswith(".mlp.gate.bias")
+        ):
             raw[key] = value.astype(mx.bfloat16)
         elif key.endswith(".mlp.gate.bias"):
             raw[key] = mx.arange(value.size, dtype=mx.float32) / 129
@@ -7859,7 +7897,8 @@ def test_inkling2_native_checkpoint_and_mixed_quantization(inkling2_model, tmp_p
     # Omit null declarations, as in the native checkpoint.
     config = json.loads((tmp_path / "config.json").read_text())
     config.pop("quantization")
-    config.pop("quantization_config")
+    if config["quantization_config"] is None:
+        config.pop("quantization_config")
     (tmp_path / "config.json").write_text(json.dumps(config))
     mx.save_safetensors(str(tmp_path / "model.safetensors"), raw)
     loaded = load_model(tmp_path, strict=True)
@@ -7909,9 +7948,8 @@ def test_inkling2_native_checkpoint_and_mixed_quantization(inkling2_model, tmp_p
         target = old[2:] if ".switch_mlp." in key else old
         assert mx.array_equal(value, target).item(), key
     converted = tmp_path / "converted"
-    config["quantization"] = model.quantization_from_metadata(metadata)
     expected_dtypes = {key: value.dtype for key, value in expected.items()}
-    with patch("mlx_vlm.convert.fetch_from_hub", return_value=(loaded, config, None)):
+    with patch("mlx_vlm.utils.load_processor", return_value=None):
         convert(str(tmp_path), str(converted), dtype="bfloat16")
     reloaded = load_model(converted, strict=True)
     for key, value in tree_flatten(reloaded.parameters()):
@@ -7952,6 +7990,7 @@ def test_inkling2_bf16_head_keeps_fp32_projection_scores(inkling2_model, softcap
 @pytest.mark.parametrize(
     "dtype,tolerance", [(mx.float32, 2e-5), (mx.float16, 1e-2), (mx.bfloat16, 8e-2)]
 )
+@pytest.mark.parametrize("inkling2_model", ["small", "mini"], indirect=True)
 def test_inkling2_cached_chunks_and_speculative_rollback(
     inkling2_model, dtype, tolerance
 ):
@@ -7982,6 +8021,25 @@ def test_inkling2_cached_chunks_and_speculative_rollback(
     actual = language(ids[:, 5:6], cache=cache).logits
     np.testing.assert_allclose(
         np.array(actual), np.array(reference[:, 5:6]), atol=tolerance, rtol=tolerance
+    )
+
+
+@pytest.mark.parametrize("inkling2_model", ["mini"], indirect=True)
+def test_inkling2_loop_restarts_and_captures(inkling2_model):
+    lm = inkling2_model.language_model
+    assert lm.model.layer_indices == (0, 1, 2, 1, 2, 1, 2, 3)
+    cache = lm.make_cache()
+    assert len({id(c[0]) for c in cache}) == len({id(c[1]) for c in cache}) == 8
+    ids = mx.array([[1, 2, 3]])
+    states = lm(ids, capture_layer_ids=list(range(9))).hidden_states
+    # Every pass restarts from the prelude. Its learned messages change the
+    # output of the first core layer on the second and third visits.
+    for visit in (3, 5):
+        assert mx.array_equal(states[1], states[visit]).item()
+        assert not mx.allclose(states[visit - 1], states[visit + 1]).item()
+    # DSpark's last tap is the normalized output after the coda.
+    np.testing.assert_allclose(
+        np.array(lm._logits_from_norm(states[8])), np.array(lm(ids).logits)
     )
 
 

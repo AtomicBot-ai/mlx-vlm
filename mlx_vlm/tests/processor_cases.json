@@ -114,6 +114,7 @@
   },
   "routes": [
     ["inkling2", "inkling2", "Inkling2Processor"],
+    ["inkling2_loop", "inkling2", "Inkling2Processor"],
     ["mistral_large4", "mistral_large4", "Mistral3Processor"],
     ["ricursive", "ricursive", "PreTrainedTokenizerFast"],
     ["flint", "flint.processing_flint", "FlintProcessor"],

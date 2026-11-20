@@ -206,4 +206,4 @@ class Inkling2Processor(ProcessorMixin):
         return ["input_ids", "attention_mask", "pixel_values", "image_grid_thw"]
 
 
-install_auto_processor_patch(["inkling2"], Inkling2Processor)
+install_auto_processor_patch(["inkling2", "inkling2_loop"], Inkling2Processor)

@@ -79,6 +79,7 @@ MODEL_REMAPPING = {
     "iquestcoder": "llama",
     "nemotron-nas": "nemotron_nas",
     "inkling_mm_model": "inkling",
+    "inkling2_loop": "inkling2",
     "lille-130m": "lille_130m",
 }
 
@@ -547,25 +548,42 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             if quantization_config is not None:
                 config["quantization_config"] = quantization_config
 
-        if quantization_config is None:
+        # Inkling 2 Mini declares ModelOpt NVFP4 at the root, but its native
+        # sidecar specifies the actual format for each expert projection.
+        native_quantization_fn = getattr(model, "quantization_from_metadata", None)
+        read_native_metadata = (
+            native_quantization_fn is not None
+            and (quantization_config or {}).get("quant_method") == "modelopt"
+        )
+        if quantization_config is None or read_native_metadata:
             hf_quant_path = model_path / "hf_quant_config.json"
             if hf_quant_path.exists():
                 with open(hf_quant_path) as f:
                     hf_metadata = json.load(f)
                 hf_quant = hf_metadata.get("quantization", {})
-                if hf_quant.get("quant_algo") == "NVFP4":
+                native_quantization = (
+                    native_quantization_fn(hf_metadata)
+                    if native_quantization_fn is not None
+                    else None
+                )
+                if native_quantization is not None:
+                    quantization_config = native_quantization
+                    model_config.quantization = model_config.quantization_config = (
+                        native_quantization
+                    )
+                    config["quantization"] = config["quantization_config"] = (
+                        native_quantization
+                    )
+                elif (
+                    quantization_config is None
+                    and hf_quant.get("quant_algo") == "NVFP4"
+                ):
                     # nvfp4 implies group_size=16
                     config["quantization"] = config["quantization_config"] = {
                         "group_size": 16,
                         "bits": 4,
                         "mode": "nvfp4",
                     }
-                elif hasattr(model, "quantization_from_metadata"):
-                    native_quantization = model.quantization_from_metadata(hf_metadata)
-                    if native_quantization is not None:
-                        config["quantization"] = config["quantization_config"] = (
-                            native_quantization
-                        )
 
         if quantization_config is not None:
             quant_method = quantization_config.get("quant_method")
@@ -1137,6 +1155,12 @@ def fetch_from_hub(
 ) -> Tuple[nn.Module, dict, ProcessorMixin]:
     model = load_model(model_path, lazy, **kwargs)
     config = load_config(model_path, **kwargs)
+    if (
+        "quantization" not in config
+        and hasattr(model, "quantization_from_metadata")
+        and (native_quantization := getattr(model.config, "quantization", None))
+    ):
+        config["quantization"] = config["quantization_config"] = native_quantization
     processor = load_processor(
         model_path,
         add_detokenizer=False,

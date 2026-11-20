@@ -64,6 +64,6 @@ class ModelConfig(BaseModelConfig):
             len(ids) < 2
             or ids != sorted(set(ids))
             or ids[0] < 0
-            or ids[-1] != text["num_hidden_layers"]
+            or ids[-1] != len(self.text_config.layer_indices)
         ):
             raise ValueError("Invalid Inkling 2 DSpark target_layer_ids")

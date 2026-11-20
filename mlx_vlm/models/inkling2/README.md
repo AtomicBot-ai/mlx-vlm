@@ -1,14 +1,32 @@
-# Inkling 2 Small
+# Inkling 2 Mini and Small
 
 Text and image inference for
+[`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini)
+and
 [`thinkingmachines/Inkling-2-Small`](https://huggingface.co/thinkingmachines/Inkling-2-Small).
 Load the native checkpoint directly; no conversion is required. The loader
 preserves mixed BF16/FP32 parameters and packed NVFP4/MXFP8 experts. Keep
 `hf_quant_config.json` with the checkpoint.
 
-## Generate
+## Generate with Mini
 
-The download is approximately 394 GB, including the bundled draft. Target weights
+Mini's checkpoint is about 20 GB including its DSpark drafter. The decoder
+visits 24 distinct layers, running the middle 12 three times for a total of
+48 layer applications per token. Each visit has its own attention and
+convolution cache.
+
+```sh
+mlx_vlm.generate --model thinkingmachines/Inkling-2-Mini \
+  --image /path/to/image.jpg --prompt "What animal is in this image?" \
+  --reasoning-effort none --temperature 0 --max-tokens 256
+```
+
+For text-only generation, omit `--image`. To use Mini's bundled drafter,
+add `--draft-model thinkingmachines/Inkling-2-Mini`.
+
+## Generate with Small
+
+Small's download is approximately 394 GB, including the bundled draft. Target weights
 require about 390 GB of memory. On a 512 GB Mac, disable the allocation cache and
 load layers sequentially to bound temporary memory:
 
@@ -87,3 +105,6 @@ path and the [cluster API's draft option](../../../docs/cluster-api.md#speculati
 - Prefill chunk size and speculative verification shape can change greedy outputs.
   DSpark speedups depend on the workload.
 - Audio input and pipeline parallelism are not supported.
+- Mini's weights and the reference loop implementation are licensed under
+  [Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0).
+  [Transformers implementation](https://github.com/huggingface/transformers/pull/51050)

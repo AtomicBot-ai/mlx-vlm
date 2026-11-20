@@ -60,13 +60,14 @@ DATA = json.loads(Path(__file__).with_name("model_cases.json").read_text())[
 ]
 
 
-def inkling2_dspark_case(dtype=mx.float32):
+def inkling2_dspark_case(dtype=mx.float32, config=None):
     from mlx_vlm.models.inkling2 import Model, ModelConfig
     from mlx_vlm.speculative.drafters.inkling2_dspark import Model as Draft
     from mlx_vlm.speculative.drafters.inkling2_dspark import ModelConfig as DraftConfig
 
-    config = deepcopy(model_case("inkling2")["config"])
-    config["mtp_config"] = deepcopy(DATA["inkling2_dspark"])
+    if config is None:
+        config = deepcopy(model_case("inkling2")["config"])
+        config["mtp_config"] = deepcopy(DATA["inkling2_dspark"])
     target = Model(ModelConfig.from_dict(config))
     draft = Draft(
         DraftConfig(
@@ -83,11 +84,24 @@ def inkling2_dspark_case(dtype=mx.float32):
     return target, draft
 
 
-@parametrize("location", ["root", "text"])
+@parametrize("location", ["root", "text", "loop"])
 def test_inkling2_dspark_native_and_standalone_loading(tmp_path, location):
-    target, draft = inkling2_dspark_case(mx.bfloat16)
     config = deepcopy(model_case("inkling2")["config"])
     config.update(model_type="inkling2", mtp_config=deepcopy(DATA["inkling2_dspark"]))
+    if location == "loop":
+        config["model_type"] = "inkling2_loop"
+        config["text_config"].update(
+            model_type="inkling2_loop_text",
+            n_layers_per_attn_res_block=1,
+            loop_config={
+                "core_start": 1,
+                "core_end": 2,
+                "num_passes": 3,
+                "gate_rank": 8,
+            },
+        )
+        config["mtp_config"]["target_layer_ids"] = [1, 3, 5]
+    target, draft = inkling2_dspark_case(mx.bfloat16, config)
     if location == "text":
         config["text_config"]["mtp_config"] = config.pop("mtp_config")
     # Target quantization must not quantize the BF16 sidecar.
