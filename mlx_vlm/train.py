@@ -3,13 +3,15 @@
 import argparse
 import json
 import math
+import sys
+import time
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import asdict, fields
 from pathlib import Path
 from typing import get_args
 
-from .trainer.api import Trainer, task_spec
+from .trainer.api import TASKS, Trainer, task_spec
 from .trainer.common.schedule import (
     build_schedule,
     resolve_schedule_config,
@@ -39,16 +41,56 @@ def _parse_schedule(value):
     return json.loads(value) if value.startswith("{") else value
 
 
+def registered_tasks():
+    """Map each task to its algorithms, straight from the trainer registry."""
+    tasks = {}
+    for task, algorithm in TASKS:
+        tasks.setdefault(task, []).append(algorithm)
+    return tasks
+
+
 def build_parser(task="vlm", algorithm=None):
     """Generate training flags from the same dataclasses notebooks use."""
     algorithm, (_, config_type) = task_spec(task, algorithm)
+    tasks = registered_tasks()
     parser = argparse.ArgumentParser(description=f"MLX {task}/{algorithm} training")
-    parser.add_argument("--task", choices=("vlm",), default=task)
+    parser.add_argument("--task", choices=tuple(tasks), default=task)
     parser.add_argument(
         "--algorithm",
         "--train-mode",
-        choices=("sft", "uft", "orpo", "dpo", "grpo"),
+        choices=tuple(
+            dict.fromkeys(name for names in tasks.values() for name in names)
+        ),
         default=algorithm,
+    )
+    parser.add_argument(
+        "--describe",
+        action="store_true",
+        help="Print every task, algorithm and option as JSON, then exit.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate the options, print the result as JSON, then exit.",
+    )
+    parser.add_argument(
+        "--progress-file",
+        help="Append training events to this file as JSON lines.",
+    )
+    parser.add_argument(
+        "--max-iters",
+        type=int,
+        help="Usage cap: refuse runs longer than this many iterations.",
+    )
+    parser.add_argument(
+        "--max-minutes",
+        type=float,
+        help="Usage cap: save and stop after this many minutes of wall time.",
+    )
+    parser.add_argument(
+        "--max-memory-gb",
+        type=float,
+        help="Usage cap: save and stop when MLX memory use passes this size.",
     )
     parser.add_argument("-c", "--config")
     parser.add_argument("--model", "--model-path", help="Model path or Hub identifier.")
@@ -57,10 +99,14 @@ def build_parser(task="vlm", algorithm=None):
         help="Matching floating-point Qwen3.5 native checkpoint or split MTP head.",
     )
     parser.add_argument(
-        "--data", default="data", help="JSONL split folder, file, or Hub dataset."
+        "--data",
+        default="data",
+        help="Local folder of <split>.jsonl files or one .jsonl file (also a Hub "
+        "repo of JSONL files). Used when --dataset is not set.",
     )
     parser.add_argument(
-        "--dataset", help="Dataset loaded with Hugging Face datasets; overrides --data."
+        "--dataset",
+        help="Hugging Face dataset ID, such as user/name; overrides --data.",
     )
     parser.add_argument(
         "--hf-dataset-config", help="Optional Hugging Face dataset configuration name."
@@ -186,14 +232,18 @@ def build_parser(task="vlm", algorithm=None):
         default={},
         help="Preprocessing/column options as a JSON object.",
     )
+    # Value types of the generated flags, kept for --describe.
+    parser.training_options = {}
     for item in fields(config_type):
         kwargs = {"default": item.default, "help": item.metadata.get("help")}
+        parser.training_options[item.name] = getattr(item.type, "__name__", "str")
         if item.type is bool:
             kwargs["action"] = argparse.BooleanOptionalAction
         else:
             types = get_args(item.type)
             if type(None) in types:
                 converter = next(t for t in types if t is not type(None))
+                parser.training_options[item.name] = converter.__name__
                 kwargs["type"] = lambda value, converter=converter: (
                     None if value.lower() == "none" else converter(value)
                 )
@@ -237,6 +287,10 @@ def parse_args(argv=None, *, task="vlm"):
         )
     if not isinstance(args.dataset_config, dict):
         parser.error("--dataset-config must be a JSON object.")
+    for name in ("max_iters", "max_minutes", "max_memory_gb"):
+        value = getattr(args, name)
+        if value is not None and not (math.isfinite(value) and value > 0):
+            parser.error(f"{name} must be positive.")
     if args.reference_model and args.algorithm not in {"dpo", "grpo"}:
         parser.error("--reference-model is only used by DPO or GRPO.")
     if args.optimizer not in {"adam", "adamw", "sgd", "muon"}:
@@ -271,7 +325,7 @@ def parse_args(argv=None, *, task="vlm"):
             "beta1, beta2, optimizer_eps and bias_correction need adam or adamw."
         )
     try:
-        config = resolve_schedule_config(
+        schedule = resolve_schedule_config(
             args.lr_schedule,
             learning_rate=args.learning_rate,
             total_updates=10**9,
@@ -279,8 +333,8 @@ def parse_args(argv=None, *, task="vlm"):
             warmup_init=args.warmup_init,
             min_learning_rate=args.min_learning_rate,
         )
-        if config is not None:
-            build_schedule(config)
+        if schedule is not None:
+            build_schedule(schedule)
     except (ValueError, TypeError) as error:
         parser.error(str(error))
     _, (_, config_type) = task_spec(args.task, args.algorithm)
@@ -294,7 +348,152 @@ def parse_args(argv=None, *, task="vlm"):
         config_type(**settings).validate()
     except (ValueError, TypeError) as error:
         parser.error(str(error))
+    if args.epochs is None and args.max_iters and settings["iters"] > args.max_iters:
+        parser.error(f"iters {settings['iters']} is over the cap of {args.max_iters}.")
     return args, config_type(**settings)
+
+
+# Set by a run manager or the operator rather than chosen per run.
+MANAGED_OPTIONS = {"progress_file", "max_iters", "max_minutes", "max_memory_gb"}
+# Options only some optimizers read. ``describe`` reports them as ``requires``
+# so a host can hide an option the chosen optimizer ignores.
+OPTIMIZER_OPTIONS = {
+    "beta1": ("adam", "adamw"),
+    "beta2": ("adam", "adamw"),
+    "optimizer_eps": ("adam", "adamw"),
+    "bias_correction": ("adam", "adamw"),
+    "weight_decay": ("adamw", "muon"),
+}
+
+
+def _option_type(action, parser):
+    if action.dest in parser.training_options:
+        return parser.training_options[action.dest]
+    if action.nargs == 0:
+        return "bool"
+    if action.type in (int, float):
+        return action.type.__name__
+    if action.type is json.loads:
+        return "json"
+    return "list" if action.nargs == "+" else "str"
+
+
+def _reward_functions(task, algorithm):
+    """Names of built-in reward callbacks, when the algorithm ships any."""
+    from importlib import import_module
+
+    try:
+        module = import_module(f"mlx_vlm.trainer.{task}.{algorithm}.rewards")
+    except ImportError:
+        return []
+    return sorted(
+        name
+        for name, value in vars(module).items()
+        if name.endswith("_reward") and callable(value)
+    )
+
+
+def describe():
+    """Describe every registered task/algorithm and its options.
+
+    Everything is read from the trainer registry and the config dataclasses,
+    so a new algorithm or modality appears here without editing this file.
+    """
+    from .version import __version__
+
+    internal = {"help", "describe", "dry_run", "task", "algorithm", "config"}
+    tasks = {}
+    for (task, algorithm), (_, config_type) in TASKS.items():
+        parser = build_parser(task, algorithm)
+        options = []
+        for action in parser._actions:
+            if action.dest in internal or action.const == "full":
+                continue
+            default = action.default
+            options.append(
+                {
+                    "name": action.dest,
+                    "flag": action.option_strings[0],
+                    "type": _option_type(action, parser),
+                    "default": default if default is not argparse.SUPPRESS else None,
+                    "choices": list(action.choices) if action.choices else None,
+                    "help": action.help,
+                    "requires": (
+                        {"optimizer": list(OPTIMIZER_OPTIONS[action.dest])}
+                        if action.dest in OPTIMIZER_OPTIONS
+                        else None
+                    ),
+                    "group": (
+                        "training"
+                        if action.dest in parser.training_options
+                        else "managed" if action.dest in MANAGED_OPTIONS else "general"
+                    ),
+                }
+            )
+        doc = (config_type.__doc__ or "").strip().split("\n")[0]
+        entry = {
+            # Dataclasses without a docstring get a generated signature; skip it.
+            "description": "" if doc.startswith(config_type.__name__ + "(") else doc,
+            "config": config_type.__name__,
+            "options": options,
+        }
+        rewards = _reward_functions(task, algorithm)
+        if rewards:
+            entry["reward_functions"] = rewards
+        tasks.setdefault(task, {"algorithms": {}})["algorithms"][algorithm] = entry
+    for task, entry in tasks.items():
+        try:
+            # What the CLI trains when no algorithm is named.
+            entry["default_algorithm"] = task_spec(task)[0]
+        except ValueError:
+            entry["default_algorithm"] = next(iter(entry["algorithms"]))
+    return {"version": __version__, "tasks": tasks}
+
+
+class UsageCapReached(Exception):
+    """Raised from the progress callback to end training at a usage cap."""
+
+
+class ProgressCallback:
+    """Write JSON-lines progress and enforce the wall-time and memory caps.
+
+    Caps are checked at each training report, so a run ends within
+    ``steps_per_report`` iterations of passing one.
+    """
+
+    def __init__(self, path=None, wrapped=None, max_minutes=None, max_memory_gb=None):
+        self.path, self.wrapped = path, wrapped
+        self.max_minutes, self.max_memory_gb = max_minutes, max_memory_gb
+        self.started = time.monotonic()
+        if path:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+
+    def write(self, event, **info):
+        if not self.path:
+            return
+        record = {"event": event, "time": time.time(), **info}
+        with open(self.path, "a", encoding="utf-8") as file:
+            file.write(json.dumps(record, default=float) + "\n")
+
+    def on_train_loss_report(self, train_info):
+        import mlx.core as mx
+
+        memory = mx.get_active_memory() / 1e9
+        self.write("train", **train_info, active_memory_gb=round(memory, 3))
+        if self.wrapped is not None:
+            self.wrapped.on_train_loss_report(train_info)
+        minutes = (time.monotonic() - self.started) / 60
+        if self.max_minutes and minutes >= self.max_minutes:
+            raise UsageCapReached(f"max_minutes ({self.max_minutes:g}) reached")
+        if self.max_memory_gb and memory > self.max_memory_gb:
+            raise UsageCapReached(
+                f"max_memory_gb ({self.max_memory_gb:g}) passed: {memory:.2f} GB in use"
+            )
+
+    def on_val_loss_report(self, val_info):
+        self.write("validation", **val_info)
+        if self.wrapped is not None:
+            self.wrapped.on_val_loss_report(val_info)
 
 
 def _load_model(task, path):
@@ -370,13 +569,13 @@ def build_optimizer(args, iters, accumulation_steps=1):
         "muon": optim.Muon,
     }[args.optimizer]
     options = {}
-    if args.optimizer in {"adam", "adamw"}:
+    if args.optimizer in OPTIMIZER_OPTIONS["beta1"]:
         options.update(
             betas=[args.beta1, args.beta2],
             eps=args.optimizer_eps,
             bias_correction=args.bias_correction,
         )
-    if args.optimizer in {"adamw", "muon"}:
+    if args.optimizer in OPTIMIZER_OPTIONS["weight_decay"]:
         options["weight_decay"] = args.weight_decay
     learning_rate = args.learning_rate
     config = resolve_schedule_config(
@@ -399,6 +598,19 @@ def run(args, settings, training_callback=None):
     from mlx_vlm.trainer.common.callbacks import WandBCallback
 
     mx.random.seed(args.seed)
+    max_iters = getattr(args, "max_iters", None)
+    max_minutes = getattr(args, "max_minutes", None)
+    max_memory_gb = getattr(args, "max_memory_gb", None)
+    progress = None
+    if getattr(args, "progress_file", None) or max_minutes or max_memory_gb:
+        progress = training_callback = ProgressCallback(
+            getattr(args, "progress_file", None),
+            training_callback,
+            max_minutes,
+            max_memory_gb,
+        )
+    if max_memory_gb:
+        mx.set_memory_limit(int(max_memory_gb * 1e9))
     model, processor = _load_model(args.task, args.model)
     reference = None
     if args.algorithm == "dpo" or (args.algorithm == "grpo" and settings.beta):
@@ -484,6 +696,16 @@ def run(args, settings, training_callback=None):
         trainer.optimizer = build_optimizer(
             args, trainer.args.iters, settings.gradient_accumulation_steps
         )
+    if max_iters and trainer.args.iters > max_iters:
+        raise ValueError(f"iters {trainer.args.iters} is over the cap of {max_iters}.")
+    if progress is not None:
+        progress.write(
+            "start",
+            task=args.task,
+            algorithm=args.algorithm,
+            iters=trainer.args.iters,
+            adapter_file=settings.adapter_file,
+        )
     callback = None
     try:
         if args.wandb and mx.distributed.init().rank() == 0:
@@ -494,7 +716,17 @@ def run(args, settings, training_callback=None):
                 training_callback,
             )
             trainer.training_callback = callback
-        metrics = trainer.train()
+        try:
+            metrics = trainer.train()
+        except UsageCapReached as reached:
+            # Keep the work done so far; the cap is not a failure.
+            trainer.save_adapter()
+            print(f"Stopped at usage cap: {reached}. Weights saved.", file=sys.stderr)
+            metrics = dict(trainer.log_history[-1]) if trainer.log_history else {}
+            progress.write("capped", reason=str(reached), **metrics)
+        else:
+            if progress is not None:
+                progress.write("end", **metrics)
         if getattr(args, "export_qat_path", None):
             from .export import export_model
 
@@ -512,7 +744,20 @@ def run(args, settings, training_callback=None):
 
 
 def main(argv=None, *, task="vlm"):
+    if "--describe" in (sys.argv[1:] if argv is None else argv):
+        print(json.dumps(describe(), indent=2, default=str))
+        return
     args, settings = parse_args(argv, task=task)
+    if args.dry_run:
+        report = {
+            "valid": True,
+            "task": args.task,
+            "algorithm": args.algorithm,
+            "iters": None if args.epochs is not None else settings.iters,
+            "epochs": args.epochs,
+        }
+        print(json.dumps(report))
+        return
     run(args, settings)
 
 

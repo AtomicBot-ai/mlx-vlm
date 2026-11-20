@@ -21,6 +21,8 @@ python -m mlx_vlm generate --help
 - `mlx_vlm.chat_ui` – start an interactive Gradio UI.
 - `mlx_vlm.server` – run the FastAPI server.
 - `mlx_vlm.moe_offload` – repack a MoE checkpoint for expert offloading.
+- `mlx_vlm.train` – train or fine-tune a model; `--describe` lists every algorithm and option as JSON.
+- `mlx_vlm.train_runs` – start, follow and stop background training runs with usage caps; see [training](training.md#self-describing-cli-and-run-manager).
 
 Each command accepts `--help` for full usage information.
 

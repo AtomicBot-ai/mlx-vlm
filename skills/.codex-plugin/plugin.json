@@ -1,7 +1,7 @@
 {
   "name": "mlx-vlm-skills",
   "version": "0.1.0",
-  "description": "Skills for MLX-VLM: command-line and server inference, convert/quantize, adding new models, benchmarking, contributing, cached-model listing, and reproducible GitHub issues.",
+  "description": "Skills for MLX-VLM: command-line and server inference, convert/quantize, training runs, adding new models, benchmarking, contributing, cached-model listing, and reproducible GitHub issues.",
   "author": {
     "name": "MLX-VLM contributors"
   },
@@ -15,8 +15,8 @@
   "interface": {
     "displayName": "MLX-VLM skills",
     "shortDescription": "Run/convert/benchmark and contribute to MLX-VLM",
-    "longDescription": "Skills for MLX-VLM workflows: command-line and local server/API inference, converting and quantizing Hugging Face models to MLX, adding new model architectures, benchmarking changes for PRs, contributing (test placement, pre-commit), listing cached models, and creating reproducible GitHub issues.",
-    "defaultPrompt": "Use the MLX-VLM skills to run CLI or server inference, convert/quantize a model, add a new model, benchmark a change for a PR, contribute, list cached models, or file a reproducible issue.",
+    "longDescription": "Skills for MLX-VLM workflows: command-line and local server/API inference, converting and quantizing Hugging Face models to MLX, starting and following training runs within usage caps, adding new model architectures, benchmarking changes for PRs, contributing (test placement, pre-commit), listing cached models, and creating reproducible GitHub issues.",
+    "defaultPrompt": "Use the MLX-VLM skills to run CLI or server inference, convert/quantize a model, train or fine-tune a model, add a new model, benchmark a change for a PR, contribute, list cached models, or file a reproducible issue.",
     "developerName": "MLX-VLM contributors",
     "category": "Coding",
     "capabilities": [

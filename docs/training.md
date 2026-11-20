@@ -326,6 +326,80 @@ over the updates left after warmup. Schedule steps count optimizer updates,
 not microsteps (`iters / gradient_accumulation_steps`, rounded up), including
 `--epochs`-derived `iters`. Reported `learning_rate` follows the schedule.
 
+## Self-describing CLI and run manager
+
+The CLI reads its tasks, algorithms and options from the trainer registry and
+the config dataclasses. Registering a new algorithm or modality is enough for
+it to appear in every command below; nothing here lists them by hand.
+
+```sh
+python -m mlx_vlm.train --describe          # JSON: tasks, algorithms, options
+python -m mlx_vlm.train --model <model> --iters 200 --dry-run   # validate only
+python -m mlx_vlm.train --model <model> --progress-file progress.jsonl
+```
+
+`--describe` reports each option's flag, type, default, choices and help, and
+takes an algorithm's description from the first docstring line of its config
+class. `--progress-file` appends one JSON object per report (`start`, `train`,
+`validation`, then `end` or `capped`).
+
+Usage caps keep a run within a budget:
+
+| Flag | Effect |
+|---|---|
+| `--max-iters N` | Refuse a run longer than `N` iterations, including `--epochs`-derived ones. |
+| `--max-minutes M` | Save the weights and stop after `M` minutes of wall time. |
+| `--max-memory-gb G` | Set MLX's memory limit to `G` and save and stop once active memory passes it. |
+
+Time and memory are checked at each training report, so a run ends within
+`steps_per_report` iterations of passing a cap. A capped run exits with status
+0 and keeps its weights.
+
+`mlx_vlm.train_runs` runs training in the background for a host application
+(for example a Nativ extension). Every command prints one JSON document:
+
+```sh
+python -m mlx_vlm.train_runs describe
+python -m mlx_vlm.train_runs validate-model <model>
+python -m mlx_vlm.train_runs inspect-dataset --options '{"data": "data"}'
+python -m mlx_vlm.train_runs check --options '{"model": "<model>", "algorithm": "sft"}'
+python -m mlx_vlm.train_runs start --options-file options.json --name my-run
+python -m mlx_vlm.train_runs status          # newest run; or pass a run id or name
+python -m mlx_vlm.train_runs log --lines 50
+python -m mlx_vlm.train_runs history       # every metric as [iteration, value] points
+python -m mlx_vlm.train_runs list
+python -m mlx_vlm.train_runs stop
+python -m mlx_vlm.train_runs limits
+```
+
+Options are a JSON object keyed by the option names from `describe`, and are
+validated by the training parser itself. Each run is a detached
+`mlx_vlm.train` process with its own folder under `~/.mlx-vlm/runs/<run_id>/`
+(`--runs-dir` or `MLX_VLM_RUNS_DIR`) holding `config.json`, `run.json`,
+`train.log`, `progress.jsonl` and `adapters/`. State is on disk, so runs
+survive a restart of the host. A run ends as `completed`, `capped`, `stopped`
+or `failed`. Set `export_qat_path` in the options to also save a merged,
+standalone model when the run ends; `status` reports it as `export_path`.
+
+Caps are set by whoever launches the manager, as flags before the command or
+as environment variables, and are passed on to every run:
+
+| Flag | Environment variable | Default |
+|---|---|---|
+| `--max-concurrent-runs` | `MLX_VLM_TRAIN_MAX_CONCURRENT_RUNS` | 1 |
+| `--max-iters` | `MLX_VLM_TRAIN_MAX_ITERS` | unlimited |
+| `--max-minutes` | `MLX_VLM_TRAIN_MAX_MINUTES` | unlimited |
+| `--max-memory-gb` | `MLX_VLM_TRAIN_MAX_MEMORY_GB` | unlimited |
+| `--max-runs-per-day` | `MLX_VLM_TRAIN_MAX_RUNS_PER_DAY` | unlimited |
+
+A `limits.json` file in the runs folder sets the same caps for every client
+of that folder, for example `{"max_iters": 2000, "max_minutes": 60}`; `null`
+means unlimited. A flag or environment variable can tighten a cap from the
+file but cannot loosen it.
+
+`MLX_VLM_TRAIN_PYTHON` selects the Python that runs training when it differs
+from the one running the manager.
+
 ## Row formats
 
 SFT rows contain chat messages and optional images:
