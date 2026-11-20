@@ -110,6 +110,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | Ripple | [Docs](mlx_vlm/models/ricursive/README.md) |
 | Nemotron 3.5 Super VL / Bolt / Nano Omni | [Docs](mlx_vlm/models/nemotron_h_nano_omni/README.md) |
 | Idol (image to 3D Gaussian splats) | [Docs](mlx_vlm/models/idol/README.md) |
+| Depth Pro 2 (image and video depth) | [Docs](mlx_vlm/models/depth_pro_2/README.md) · [S](https://huggingface.co/nativ-community/DepthPro2-S) · [B](https://huggingface.co/nativ-community/DepthPro2-B) · [L](https://huggingface.co/nativ-community/DepthPro2-L) · [H+](https://huggingface.co/nativ-community/DepthPro2-H) |
 
 ## Installation
 

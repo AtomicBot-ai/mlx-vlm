@@ -2117,6 +2117,74 @@ def test_video_depth_anything_conv_checkpoint():
     )
 
 
+def test_depth_pro_2_conv_checkpoint():
+    _check_conv_checkpoint(
+        _extraction_model("depth_pro_2"),
+        ("encoder.reassemble.0.1.", "encoder.reassemble.1.1.", "head.1.")
+        + tuple(f"decoder.fusions.{i}.deconv." for i in range(4)),
+    )
+
+
+def test_depth_pro_2_converted_checkpoint_config(tmp_path):
+    from mlx_vlm.models.depth_pro_2 import DepthPro2Processor
+    from mlx_vlm.utils import load_processor
+
+    config = {**_extraction_config("depth_pro_2"), "model_type": "depth_pro_2"}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    _, model_type = get_model_and_args(load_config(tmp_path))
+    assert model_type == "depth_pro_2"
+    processor = load_processor(tmp_path)
+    assert isinstance(processor, DepthPro2Processor)
+    pixels = processor(np.full((3, 5, 3), 255, dtype=np.uint8))["pixel_values"]
+    np.testing.assert_allclose(
+        np.array(pixels[0, 0]),
+        (1 - np.array([0.485, 0.456, 0.406])) / np.array([0.229, 0.224, 0.225]),
+        atol=1e-6,
+    )
+
+
+def test_depth_pro_2_video_blends_overlaps_and_returns_tail():
+    from mlx_vlm.models.depth_pro_2.generate import DepthPro2Predictor
+
+    class ClipModel:
+        def __call__(self, frames, *, cache):
+            return frames[..., 0] + frames[0, 0, 0, 0] + 1
+
+    predictor = DepthPro2Predictor(
+        ClipModel(), lambda frame: {"pixel_values": frame}, focal_checkpoint=None
+    )
+    frames = (mx.full((2, 3, 3), i, dtype=mx.float32) for i in range(7))
+    results = list(predictor.infer_video(frames, window=4, overlap=2, f_px=6))
+    expected = np.array([1, 2, 11 / 3, 16 / 3, 22 / 3, 26 / 3, 10])
+    assert len(results) == len(expected)
+    np.testing.assert_allclose(
+        [float(result["inverse_depth"][0, 0]) for result in results], expected
+    )
+    np.testing.assert_allclose(
+        [float(result["depth"][0, 0]) for result in results], 2 / expected
+    )
+
+
+def test_depth_pro_2_single_frame_cache_matches_independent_predictions():
+    from mlx_vlm.models.depth_pro_2.generate import DepthPro2Predictor
+
+    model = _extraction_model("depth_pro_2")
+    predictor = DepthPro2Predictor(model, focal_checkpoint=None)
+    stream = predictor.stream(window=1, mode="unbuffered")
+    for value in (80, 190):
+        frame = mx.full((35, 47, 3), value, dtype=mx.uint8)
+        (actual,) = stream.step(frame)
+        expected = predictor.infer(frame)
+        np.testing.assert_allclose(
+            np.array(actual["inverse_depth"]),
+            np.array(expected["inverse_depth"]),
+            rtol=1e-5,
+            atol=1e-6,
+        )
+        assert actual["depth"] is None and actual["focallength_px"] is None
+    assert stream.flush() == []
+
+
 def test_video_depth_anything_rejects_unknown_encoder():
     from mlx_vlm.models.video_depth_anything import ModelConfig
 
