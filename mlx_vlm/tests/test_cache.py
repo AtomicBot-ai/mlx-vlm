@@ -1557,6 +1557,15 @@ class TestVisionFeatureCache:
         assert square != wide
         assert square == processed_image_key(mx.zeros((16, 3)), mx.array([[1, 4, 4]]))
 
+    def test_processed_key_separates_granite_docling_routes(self):
+        pixels = mx.zeros((1, 2, 3, 8, 8))
+        coarse = processed_image_key(pixels)
+        fine = processed_image_key(pixels, tile_fine_mask=mx.array([True]))
+        assert coarse != fine
+        assert fine == processed_image_key(
+            mx.zeros((1, 2, 3, 8, 8)), tile_fine_mask=mx.array([True]), max_tokens=8
+        )
+
     def test_processed_key_handles_ragged_image_batches(self):
         images = [mx.zeros((4, 3)), mx.ones((16, 3))]
         key = processed_image_key(images)

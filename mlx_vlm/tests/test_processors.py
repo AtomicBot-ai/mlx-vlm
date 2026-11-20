@@ -3595,6 +3595,110 @@ def test_prepare_inputs_text_options_do_not_forward_media_or_generation_options(
     assert unrelated.keys().isdisjoint(spy.call_args.kwargs)
 
 
+@pytest.fixture
+def granite_docling_processor():
+    from mlx_vlm.models.granite_docling.processing_granite_docling import (
+        GraniteDoclingImageProcessor,
+        GraniteDoclingProcessor,
+    )
+
+    tokenizer = fast_tokenizer()
+    tokenizer.add_tokens(
+        [
+            "<image>",
+            "<fake_token_around_image>",
+            "<row_1_col_1>",
+            "<row_1_col_2>",
+            "<global-img>",
+        ],
+        special_tokens=True,
+    )
+    return GraniteDoclingProcessor(
+        GraniteDoclingImageProcessor(size={"height": 32, "width": 32}),
+        tokenizer,
+        image_seq_len=4,
+        chat_template="{{ messages[0]['content'] }}",
+    )
+
+
+def test_granite_docling_processor_load_and_route(tmp_path, granite_docling_processor):
+    processor = granite_docling_processor
+    processor.save_pretrained(tmp_path)
+    (tmp_path / "config.json").write_text('{"model_type": "granite_docling"}')
+    loaded = load_processor(tmp_path, add_detokenizer=False)
+    assert type(loaded) is type(processor)
+    assert loaded.chat_template == processor.chat_template
+    assert loaded.image_seq_len == 4
+
+    loaded.image_processor.fine_route = True
+    for options, tokens in [
+        ({}, 48),
+        ({"fine_route": False}, 12),
+        ({"fine_route": True}, 48),
+    ]:
+        outputs = prepare_inputs(
+            loaded, images=[Image.new("RGB", (64, 32))], prompts="<image>", **options
+        )
+        assert int((outputs["input_ids"] == loaded.image_token_id).sum()) == tokens
+        assert outputs["pixel_values"].shape == (1, 3, 3, 32, 32)
+        assert outputs["pixel_attention_mask"].tolist() == [[True, True, True]]
+        assert ("tile_fine_mask" in outputs) == (tokens == 48)
+
+
+def test_granite_docling_tile_limits_and_transparency(granite_docling_processor):
+    processor = granite_docling_processor.image_processor
+    assert processor.get_tile_grid(19, 800) == (1, 16)
+    assert processor.get_tile_grid(256, 512, {"max_patches": 4}) == (1, 2)
+    assert processor.get_tile_grid(
+        256,
+        512,
+        {
+            "max_patches": 4,
+            "dense_max_patches": 12,
+            "dense_min_aspect": 1.1,
+            "dense_max_aspect": 2.5,
+            "dense_max_scale": 0.75,
+        },
+    ) == (2, 4)
+
+    transparent = Image.new("RGBA", (32, 32), (0, 0, 0, 0))
+    white = Image.new("RGB", transparent.size, "white")
+    np.testing.assert_array_equal(
+        processor(transparent)["pixel_values"], processor(white)["pixel_values"]
+    )
+
+
+@pytest.mark.parametrize("fine_route", [False, True])
+def test_granite_docling_matches_transformers_pil(
+    granite_docling_processor, fine_route
+):
+    reference = pytest.importorskip(
+        "transformers.models.granite_docling.processing_granite_docling"
+    )
+    from transformers import GraniteDoclingImageProcessorPil
+
+    local = granite_docling_processor
+    oracle = reference.GraniteDoclingProcessor(
+        GraniteDoclingImageProcessorPil(size={"height": 32, "width": 32}),
+        local.tokenizer,
+        image_seq_len=4,
+    )
+    rng = np.random.default_rng(41)
+    square = Image.fromarray(rng.integers(0, 256, (28, 31, 3), dtype=np.uint8))
+    wide = Image.fromarray(rng.integers(0, 256, (60, 128, 4), dtype=np.uint8))
+    options = dict(
+        images=[[square, wide], [], [square]],
+        text=["first <image> then <image>", "text only", "<image>"],
+        fine_route=fine_route,
+        padding=True,
+        return_tensors="np",
+    )
+    actual, expected = local(**options), oracle(**options)
+    assert actual.keys() == expected.keys()
+    for key in expected:
+        np.testing.assert_array_equal(actual[key], expected[key])
+
+
 @pytest.mark.parametrize("wrapped", [False, True])
 @pytest.mark.parametrize(
     "call,expected,error",

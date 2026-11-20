@@ -8083,3 +8083,223 @@ def test_ernie55_fp8_tail_blocks_use_shared_decoder():
         out["language_model.model.layers.0.attn.wq_a.weight"].astype(mx.float32),
         expected,
     )
+
+
+class TestGraniteDocling:
+    """Granite for Docling: DeepStack, coarse and fine connector paths, router."""
+
+    IMAGE_TOKEN = 31
+
+    @staticmethod
+    def _config(*, use_fine_route=False, router=False):
+        from mlx_vlm.models import granite_docling
+
+        return granite_docling.ModelConfig(
+            text_config=granite_docling.TextConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=3,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                vocab_size=40,
+                max_position_embeddings=512,
+                logits_scaling=8.0,
+                residual_multiplier=0.22,
+                attention_multiplier=0.125,
+                rope_parameters={"rope_theta": 10000.0, "rope_type": "default"},
+            ),
+            vision_config=granite_docling.VisionConfig(
+                hidden_size=16,
+                intermediate_size=32,
+                num_hidden_layers=3,
+                num_attention_heads=2,
+                image_size=16,
+                patch_size=2,
+                out_hidden_size=32,
+                scale_factor=4,
+                deepstack_visual_indexes=[0, 1, 2],
+                use_fine_route=use_fine_route,
+            ),
+            image_token_id=TestGraniteDocling.IMAGE_TOKEN,
+            density_router_hidden_size=8 if router else None,
+        )
+
+    @classmethod
+    def _model(cls, **kwargs):
+        from mlx_vlm.models import granite_docling
+
+        mx.random.seed(3)
+        model = granite_docling.Model(cls._config(**kwargs))
+        model.eval()
+        mx.eval(model.parameters())
+        return model
+
+    @classmethod
+    def _prompt(cls, tokens_per_tile, num_tiles):
+        # Text around and between the tiles, so chunks cut across image spans.
+        ids = [1, 2, 3]
+        for _ in range(num_tiles):
+            ids += [4] + [cls.IMAGE_TOKEN] * tokens_per_tile + [5]
+        return mx.array([ids + [6, 7, 8]])
+
+    def test_chunked_prefill_matches_full_forward_with_deepstack(self):
+        # 16 px tiles, 2 px patches and scale 4 give 4 tokens per tile.
+        model = self._model(use_fine_route=True)
+        media = {"pixel_values": mx.random.normal((1, 2, 3, 16, 16))}
+        ModelChecks().prefill_parity(
+            model, self._prompt(4, 2), media, chunk_sizes=(3, 5, 7)
+        )
+
+    def test_batch_rows_match_single_rows(self):
+        # Two rows with their own images: batch, single-row and chunked prefill agree.
+        model = self._model()
+        ids = mx.concatenate([self._prompt(4, 2)] * 2)
+        media = {"pixel_values": mx.random.normal((2, 2, 3, 16, 16))}
+        ModelChecks().prefill_parity(model, ids, media, chunk_sizes=(3, 5))
+
+    def test_deepstack_features_change_the_output(self):
+        model = self._model()
+        ids = self._prompt(4, 1)
+        features = model.get_input_embeddings(
+            ids, pixel_values=mx.random.normal((1, 1, 3, 16, 16))
+        )
+        language = model.language_model
+        with_deepstack = language(
+            ids,
+            inputs_embeds=features.inputs_embeds,
+            deepstack_visual_embeds=features.deepstack_visual_embeds,
+        ).logits
+        without = language(ids, inputs_embeds=features.inputs_embeds).logits
+        assert features.deepstack_visual_embeds.shape == (*ids.shape, 3, 32)
+        assert not mx.allclose(with_deepstack, without)
+
+    def test_fine_route_gives_four_times_the_image_tokens(self):
+        model = self._model(use_fine_route=True)
+        pixel_values = mx.random.normal((1, 1, 3, 16, 16))
+        fine_ids = self._prompt(16, 1)
+        features = model.get_input_embeddings(
+            fine_ids, pixel_values=pixel_values, tile_fine_mask=mx.array([True])
+        )
+        image_rows = mx.any(features.deepstack_visual_embeds != 0, axis=(2, 3))
+        assert int(image_rows.sum()) == 16
+        with pytest.raises(ValueError, match="do not match"):
+            model.get_input_embeddings(fine_ids, pixel_values=pixel_values)
+
+    def test_cached_vision_features_match_and_follow_the_route(self):
+        model = self._model(use_fine_route=True)
+        pixel_values = mx.random.normal((1, 1, 3, 16, 16))
+        ids = self._prompt(4, 1)
+        coarse = model.encode_images(pixel_values)
+        mx.eval(coarse)
+        fresh = model.get_input_embeddings(ids, pixel_values=pixel_values)
+        vision_call = type(model.vision_model).__call__
+        with patch.object(
+            type(model.vision_model), "__call__", side_effect=AssertionError
+        ):
+            cached = model.get_input_embeddings(
+                ids, pixel_values=pixel_values, cached_image_features=coarse
+            )
+        for key in ("inputs_embeds", "deepstack_visual_embeds"):
+            assert mx.array_equal(getattr(fresh, key), getattr(cached, key))
+
+        # A cached coarse entry must not serve a fine request.
+        with patch.object(
+            type(model.vision_model),
+            "__call__",
+            autospec=True,
+            side_effect=vision_call,
+        ) as spy:
+            fine = model.get_input_embeddings(
+                self._prompt(16, 1),
+                pixel_values=pixel_values,
+                tile_fine_mask=mx.array([True]),
+                cached_image_features=coarse,
+            )
+        assert spy.call_count == 1
+        image_rows = mx.any(fine.deepstack_visual_embeds != 0, axis=(2, 3))
+        assert int(image_rows.sum()) == 16
+
+    def test_server_vision_cache_stores_and_reuses_features(self):
+        from mlx_vlm.vision_cache import VisionFeatureCache
+
+        model = self._model()
+        pixel_values = mx.random.normal((1, 1, 3, 16, 16))
+        ids = self._prompt(4, 1)
+        cache = VisionFeatureCache()
+        options = {"vision_cache": cache, "_image_key": "page"}
+        first = model.get_input_embeddings(ids, pixel_values=pixel_values, **options)
+        assert cache.get("page") is not None
+        with patch.object(
+            type(model.vision_model), "__call__", side_effect=AssertionError
+        ):
+            second = model.get_input_embeddings(
+                ids, pixel_values=pixel_values, **options
+            )
+        assert mx.array_equal(first.inputs_embeds, second.inputs_embeds)
+
+    def test_fine_route_needs_the_fine_connector(self):
+        model = self._model()
+        with pytest.raises(ValueError, match="no fine connector path"):
+            model.get_input_embeddings(
+                self._prompt(16, 1),
+                pixel_values=mx.random.normal((1, 1, 3, 16, 16)),
+                tile_fine_mask=mx.array([True]),
+            )
+
+    def test_padding_tiles_are_dropped(self):
+        model = self._model()
+        ids = self._prompt(4, 1)
+        tile = mx.random.normal((1, 1, 3, 16, 16))
+        padded = mx.concatenate([tile, mx.zeros_like(tile)], axis=1)
+        expected = model(ids, pixel_values=tile).logits
+        actual = model(
+            ids, pixel_values=padded, pixel_attention_mask=mx.array([[True, False]])
+        ).logits
+        assert mx.allclose(expected, actual, atol=1e-5)
+
+    def test_density_router_predicts_per_sample(self):
+        model = self._model(use_fine_route=True, router=True)
+        route = model.predict_fine_route(
+            mx.random.normal((2, 2, 3, 16, 16)),
+            mx.array([[True, True], [True, False]]),
+        )
+        assert route.shape == (2,) and route.dtype == mx.bool_
+
+    def test_router_needs_the_fine_route(self):
+        with pytest.raises(ValueError, match="use_fine_route"):
+            self._config(router=True)
+
+    def test_sanitize_maps_checkpoint_names_and_is_idempotent(self):
+        from mlx_vlm.models import granite_docling
+
+        model = self._model(use_fine_route=True, router=True)
+        expected = dict(tree_flatten(model.parameters()))
+        hf_names = {
+            "language_model.model.": "model.text_model.",
+            "vision_model.": "model.vision_model.",
+            "density_router.": "model.density_router.",
+        }
+        checkpoint = {}
+        for name, value in expected.items():
+            for target, source in hf_names.items():
+                if name.startswith(target):
+                    name = source + name[len(target) :]
+                    break
+            if name.endswith("patch_embedding.weight"):
+                value = value.transpose(0, 3, 1, 2)
+            checkpoint[name] = value
+        # Serving-engine extras and the tied head are not part of the model.
+        checkpoint["mtp.blocks.0.proj.weight"] = mx.zeros((4, 4))
+        checkpoint["lm_head.weight"] = expected[
+            "language_model.model.embed_tokens.weight"
+        ]
+
+        vision = granite_docling.VisionModel(model.config.vision_config)
+        once = vision.sanitize(model.sanitize(checkpoint))
+        twice = vision.sanitize(model.sanitize(once))
+
+        assert set(once) == set(expected)
+        for name, value in expected.items():
+            assert once[name].shape == value.shape, name
+            assert np.array_equal(np.array(twice[name]), np.array(once[name])), name
+        model.load_weights(list(once.items()), strict=True)
