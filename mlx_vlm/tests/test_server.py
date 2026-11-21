@@ -3733,17 +3733,42 @@ def test_response_template_tool_calls(client, api):
     assert "to=self" not in response.text and "<atem:" not in response.text
 
 
+@pytest.mark.parametrize("continuous", [False, True])
 @pytest.mark.parametrize("stream", [False, True])
-def test_inkling_tool_calls(client, stream):
-    config = NS(model_type="inkling2")
-    chunks = [_INKLING_CALL[i : i + 9] for i in range(0, len(_INKLING_CALL), 9)]
+@pytest.mark.parametrize("position", ["before", "after", "between", "none"])
+@pytest.mark.parametrize("parser", ["inkling", "atem"])
+def test_response_template_tool_text(client, stream, continuous, position, parser):
+    if parser == "inkling":
+        config = NS(model_type="inkling2")
+        tokenizer = _InklingResponseTemplateTokenizer()
+        thinking, content, call = (
+            "<|message_model|>" + segment
+            for segment in _INKLING_CALL.split("<|message_model|>")[1:]
+        )
+    else:
+        config = NS(model_type="muse_glimmer")
+        tokenizer = _MuseResponseTemplateTokenizer()
+        thinking, call = _MUSE_CALL.split("<|start|>", 1)
+        call = "<|start|>" + call + "<|eom|>"
+        content = "<|start|>assistant to=user<|message|>Checking.<|eom|>"
+    segments = {
+        "before": [thinking, content, call],
+        "after": [thinking, call, content],
+        "between": [thinking, call, content, call],
+        "none": [thinking, call],
+    }[position]
+    output = "".join(segments)
+    chunks = [output[i : i + 9] for i in range(0, len(output), 9)]
     tokens = [*map(_token, chunks), _token(finish_reason="stop")]
     with _endpoint(
         config=config,
-        processor=NS(config=config, tokenizer=_InklingResponseTemplateTokenizer()),
-        result=_result(_INKLING_CALL),
-        generator=_streaming(tokens) if stream else None,
-        parser=load_tool_module("inkling"),
+        processor=NS(config=config, tokenizer=tokenizer),
+        result=_result(output),
+        chunks=[
+            _result(token.text, finish_reason=token.finish_reason) for token in tokens
+        ],
+        generator=_streaming(tokens) if continuous else None,
+        parser=load_tool_module(parser),
     ):
         response = _post(client, tools=[_tool()], stream=stream)
     assert response.status_code == 200
@@ -3759,14 +3784,13 @@ def test_inkling_tool_calls(client, stream):
     else:
         choice = response.json()["choices"][0]
         message, finish_reason = choice["message"], choice["finish_reason"]
-    (call,) = message["tool_calls"]
     assert finish_reason == "tool_calls"
-    assert call["function"]["name"] == "get_weather"
-    assert json.loads(call["function"]["arguments"]) == {"city": "Warsaw"}
+    assert len(message["tool_calls"]) == (2 if position == "between" else 1)
+    for call in message["tool_calls"]:
+        assert call["function"]["name"] == "get_weather"
+        assert json.loads(call["function"]["arguments"]) == {"city": "Warsaw"}
     assert message["reasoning_content"] == "I need the weather tool."
-    # Neither the thinking nor the call's recipient header reaches content. A
-    # non-streamed response slices out every message beside a call.
-    assert message["content"] == ("Checking." if stream else None)
+    assert (message["content"] or "") == ("" if position == "none" else "Checking.")
     assert "<|" not in response.text
 
 
@@ -8725,12 +8749,32 @@ def test_tool_stream_matches_non_streamed_content(parser, text):
 _WEATHER_CALL = '<tool_call>{"name": "get_weather", "arguments": {}}</tool_call>'
 
 
-def test_chat_fallback_stream_parses_tool_calls(client):
+@pytest.fixture(params=[False, True], ids=["no-template", "broken-template"])
+def fallback_processor(request):
+    if not request.param:
+        return None
+    tokenizer = _MuseResponseTemplateTokenizer()
+    tokenizer.parse_response = Mock(side_effect=ValueError("invalid template"))
+    tokenizer.get_response_parser = Mock(side_effect=ValueError("invalid template"))
+    return NS(tokenizer=tokenizer)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_chat_fallback_parses_tool_calls(client, stream, fallback_processor):
     # Without a response generator the stream_generate fallback streamed the
     # raw tool-call markup as content and never emitted tool_calls.
     result = _result(f"Checking.{_WEATHER_CALL}", finish_reason="stop")
-    with _endpoint(chunks=[result], parser=_JSON_TOOLS):
-        response = _post(client, stream=True, tools=[_tool()])
+    with _endpoint(
+        result=result, chunks=[result], parser=_JSON_TOOLS, processor=fallback_processor
+    ):
+        response = _post(client, stream=stream, tools=[_tool()])
+    assert response.status_code == 200
+    if not stream:
+        choice = response.json()["choices"][0]
+        assert choice["finish_reason"] == "tool_calls"
+        assert choice["message"]["content"] == "Checking."
+        assert choice["message"]["tool_calls"][0]["function"]["name"] == "get_weather"
+        return
     deltas = _deltas(response)
     assert _joined(deltas, "content") == "Checking."
     calls = [call for delta in deltas for call in delta.get("tool_calls") or []]
@@ -8742,6 +8786,41 @@ def test_chat_fallback_stream_parses_tool_calls(client):
         if choice.get("finish_reason")
     ]
     assert reasons == ["tool_calls"]
+
+
+@pytest.mark.parametrize("continuous", [False, True])
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        (
+            f"Use the closing tag </think> in XML. {_WEATHER_CALL}Done.",
+            "Use the closing tag  in XML.  Done.",
+        ),
+        (
+            f"<mm:think>First</mm:think>Before{_WEATHER_CALL}<think>Second</think>After",
+            "Before SecondAfter",
+        ),
+    ],
+    ids=["literal-close-marker", "mixed-thinking-markers"],
+)
+def test_chat_nonstream_tool_cleanup_preserves_fallback_content(
+    client, continuous, fallback_processor, text, expected
+):
+    result = _result(text, finish_reason="stop")
+    with _endpoint(
+        result=result,
+        generator=(
+            _streaming([_token(text, finish_reason="stop")]) if continuous else None
+        ),
+        parser=_JSON_TOOLS,
+        processor=fallback_processor,
+    ):
+        response = _post(client, tools=[_tool()])
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["content"] == expected
+    assert choice["message"]["tool_calls"][0]["function"]["name"] == "get_weather"
 
 
 @pytest.mark.parametrize("api", ["chat", "responses", "messages"])
