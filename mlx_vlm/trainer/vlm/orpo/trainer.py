@@ -5,7 +5,6 @@ from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_map
 
 from ..cross_entropy.runtime import _completion_mask, vlm_batch_metrics
 from ..cross_entropy.trainer import TrainingArgs
@@ -224,20 +223,6 @@ def train_orpo(
         )
     shared_args = _shared_args(args)
     task = _legacy_task(shared_args, loss_fn, train_on_completions, assistant_id)
-    if args.grad_clip is not None:
-
-        def gradients(policy, compile):
-            compute = nn.value_and_grad(policy, task.loss)
-
-            def clipped(*values):
-                result, grad = compute(*values)
-                return result, tree_map(
-                    lambda g: mx.clip(g, -args.grad_clip, args.grad_clip), grad
-                )
-
-            return clipped
-
-        task.value_and_grad_factory = gradients
     return train(
         model,
         optimizer,
