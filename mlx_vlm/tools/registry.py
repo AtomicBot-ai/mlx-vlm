@@ -65,6 +65,7 @@ SPECS: Tuple[ParserSpec, ...] = (
     ParserSpec("kimi_k2", (("<|tool_calls_section_begin|>",),)),
     ParserSpec("mistral", (("[TOOL_CALLS]",),)),
     ParserSpec("harmony", (("<|channel|>commentary", "<|call|>"),)),
+    ParserSpec("inkling", (("<|content_invoke_tool_json|>",),)),
     ParserSpec("json_tools", (("<tool_call>", "tool_call.name"),), priority=0),
 )
 

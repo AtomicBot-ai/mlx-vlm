@@ -2972,6 +2972,8 @@ WIRE_CALLS = {
     "mistral": '[TOOL_CALLS]get_weather[ARGS]{"city": "Paris", "days": 3}',
     "harmony": "<|channel|>commentary to=functions.get_weather <|constrain|>json"
     '<|message|>{"city": "Paris", "days": 3}<|call|>',
+    "inkling": '<|message_model|>get_weather<|content_invoke_tool_json|>{"name":'
+    '"get_weather","args":{"city":"Paris","days":3}}<|end_message|>',
     "pythonic": '<|tool_call_start|>[get_weather(city="Paris", days=3)]<|tool_call_end|>',
     "qwen3_coder": "<tool_call>\n<function=get_weather><parameter=city>Paris</parameter>"
     "<parameter=days>3</parameter></function></tool_call>",
@@ -3573,6 +3575,47 @@ def test_harmony_ignores_plain_commentary_preamble():
     result = process_tool_calls(preamble, load_tool_module("harmony"), None)
     assert result.calls == []
     assert result.remaining_text == preamble
+
+
+INKLING_THINKING = (
+    "<|message_model|><|content_thinking|>The user wants the weather.<|end_message|>"
+)
+
+
+@pytest.mark.parametrize(
+    "output,count",
+    [
+        (INKLING_THINKING + WIRE_CALLS["inkling"], 1),
+        (
+            INKLING_THINKING
+            + "<|message_model|><|content_text|>Checking.<|end_message|>"
+            + WIRE_CALLS["inkling"]
+            + INKLING_THINKING
+            + WIRE_CALLS["inkling"],
+            2,
+        ),
+    ],
+    ids=["thinking-then-call", "text-and-two-calls"],
+)
+def test_inkling_extracts_calls_from_message_framing(output, count):
+    result = process_tool_calls(output, load_tool_module("inkling"), WEATHER_TOOLS)
+    assert len(result.calls) == count
+    for call in result.calls:
+        assert call["function"]["name"] == "get_weather"
+        assert json.loads(call["function"]["arguments"]) == WEATHER_ARGS
+    # Every message is sliced out, so no thinking or recipient header remains.
+    assert result.remaining_text == ""
+
+
+@pytest.mark.parametrize(
+    "body",
+    ['{"name":"get_weather","args":{"city":', '{"args":{}}', '{"name":"f","args":[]}'],
+    ids=["truncated", "no-name", "non-object-arguments"],
+)
+def test_inkling_drops_malformed_call(body):
+    output = f"<|message_model|>f<|content_invoke_tool_json|>{body}<|end_message|>"
+    result = process_tool_calls(output, load_tool_module("inkling"), None)
+    assert result.calls == []
 
 
 # Loading and utility contracts

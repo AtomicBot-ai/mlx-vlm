@@ -24,6 +24,9 @@ mlx_vlm.generate --model thinkingmachines/Inkling-2-Mini \
 For text-only generation, omit `--image`. To use Mini's bundled drafter,
 add `--draft-model thinkingmachines/Inkling-2-Mini`.
 
+Tool calling works through `mlx_vlm.server`: send `tools` with a request and
+the model's `invoke_tool_json` messages come back as structured tool calls.
+
 ## Generate with Small
 
 Small's download is approximately 394 GB, including the bundled draft. Target weights

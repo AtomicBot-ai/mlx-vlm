@@ -233,6 +233,53 @@ class _HarmonyResponseTemplateTokenizer:
         return ResponseParser(self.response_template, prefix=prefix)
 
 
+# The response template shipped in Inkling 2's tokenizer_config.json.
+_INKLING_HEADER = r"(?:<\|message_model\|>[^<]*)?"
+_INKLING_RESPONSE_TEMPLATE = {
+    "defaults": {"role": "assistant"},
+    "start_anchor_pattern": r"<\|end_message\|>|<\|content_model_end_sampling\|>",
+    "fields": {
+        "reasoning_content": {
+            "open_pattern": _INKLING_HEADER + r"<\|content_thinking\|>",
+            "close": "<|end_message|>",
+            "repeats": True,
+            "join": "",
+            "content": "text",
+            "content_args": {"strip": False},
+        },
+        "content": {
+            "open_pattern": _INKLING_HEADER
+            + r"<\|content_(?:text|tool_error|invoke_tool_text)\|>",
+            "close": "<|end_message|>",
+            "repeats": True,
+            "join": "",
+            "content": "text",
+            "content_args": {"strip": False},
+        },
+        "tool_calls": {
+            "open_pattern": _INKLING_HEADER + r"<\|content_invoke_tool_json\|>",
+            "close": "<|end_message|>",
+            "repeats": True,
+            "content": "json",
+            "transform": {
+                "type": "function",
+                "function": {"name": "{content.name}", "arguments": "{content.args}"},
+            },
+        },
+    },
+}
+
+
+class _InklingResponseTemplateTokenizer:
+    response_template = _INKLING_RESPONSE_TEMPLATE
+
+    def parse_response(self, response, prefix=None):
+        return parse_response(response, self.response_template, prefix=prefix)
+
+    def get_response_parser(self, prefix=None):
+        return ResponseParser(self.response_template, prefix=prefix)
+
+
 def _harmony_processor():
     """A processor prepared exactly as the gpt-oss loader prepares it."""
     return _attach_harmony_template(NS(tokenizer=_HarmonyResponseTemplateTokenizer()))
@@ -345,6 +392,12 @@ _JSON_TOOLS = NS(
     tool_call_start="<tool_call>",
     tool_call_end="</tool_call>",
     parse_tool_call=lambda call, tools: json.loads(call),
+)
+_INKLING_CALL = (
+    "<|message_model|><|content_thinking|>I need the weather tool.<|end_message|>"
+    "<|message_model|><|content_text|>Checking.<|end_message|>"
+    "<|message_model|>get_weather<|content_invoke_tool_json|>"
+    '{"name":"get_weather","args":{"city":"Warsaw"}}<|end_message|>'
 )
 _MUSE_CALL = (
     "to=self<|message|>I need the weather tool.<|eom|>"
@@ -3678,6 +3731,43 @@ def test_response_template_tool_calls(client, api):
         arguments = call["input"]
     assert call["name"] == "get_weather" and arguments == {"city": "Warsaw"}
     assert "to=self" not in response.text and "<atem:" not in response.text
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_inkling_tool_calls(client, stream):
+    config = NS(model_type="inkling2")
+    chunks = [_INKLING_CALL[i : i + 9] for i in range(0, len(_INKLING_CALL), 9)]
+    tokens = [*map(_token, chunks), _token(finish_reason="stop")]
+    with _endpoint(
+        config=config,
+        processor=NS(config=config, tokenizer=_InklingResponseTemplateTokenizer()),
+        result=_result(_INKLING_CALL),
+        generator=_streaming(tokens) if stream else None,
+        parser=load_tool_module("inkling"),
+    ):
+        response = _post(client, tools=[_tool()], stream=stream)
+    assert response.status_code == 200
+    if stream:
+        choices = [c["choices"][0] for c in _data(response) if c.get("choices")]
+        deltas = [choice["delta"] for choice in choices]
+        message = dict(
+            reasoning_content=_joined(deltas, "reasoning_content"),
+            content=_joined(deltas, "content"),
+            tool_calls=choices[-1]["delta"]["tool_calls"],
+        )
+        finish_reason = choices[-1]["finish_reason"]
+    else:
+        choice = response.json()["choices"][0]
+        message, finish_reason = choice["message"], choice["finish_reason"]
+    (call,) = message["tool_calls"]
+    assert finish_reason == "tool_calls"
+    assert call["function"]["name"] == "get_weather"
+    assert json.loads(call["function"]["arguments"]) == {"city": "Warsaw"}
+    assert message["reasoning_content"] == "I need the weather tool."
+    # Neither the thinking nor the call's recipient header reaches content. A
+    # non-streamed response slices out every message beside a call.
+    assert message["content"] == ("Checking." if stream else None)
+    assert "<|" not in response.text
 
 
 def test_chat_completions_endpoint_falls_back_from_video_to_images(client):
