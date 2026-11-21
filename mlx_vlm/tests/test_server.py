@@ -217,11 +217,13 @@ class _ResponseTemplateTokenizer:
     def __init__(self, template):
         self.response_template = copy.deepcopy(template)
 
-    def parse_response(self, response, prefix=None):
-        return parse_response(response, self.response_template, prefix=prefix)
+    def parse_response(self, response, schema=None, *, prefix=None):
+        return parse_response(response, schema or self.response_template, prefix=prefix)
 
-    def get_response_parser(self, prefix=None):
-        return ResponseParser(self.response_template, prefix=prefix)
+    def get_response_parser(self, response_template=None, *, prefix=None):
+        return ResponseParser(
+            response_template or self.response_template, prefix=prefix
+        )
 
 
 # The response template shipped in Inkling 2's tokenizer_config.json.
@@ -7428,6 +7430,124 @@ def test_response_template_missing_anchor(client, api, stream, batched, anchor):
             assert body["output_text"] == "4."
         else:
             assert _joined(body["content"], "text") == "4."
+
+
+@pytest.mark.parametrize("api", ["chat", "responses", "messages"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("batched", [False, True])
+@pytest.mark.parametrize("alone", [False, True], ids=["after-text", "alone"])
+@pytest.mark.parametrize(
+    "arguments,finish",
+    [
+        (
+            '{"name":"get_weather","args":{"city":"War',
+            dict(chat="length", responses="incomplete", messages="max_tokens"),
+        ),
+        (
+            '{"name":"get_weather","args":{city}}<|end_message|>',
+            dict(chat="stop", responses="completed", messages="end_turn"),
+        ),
+    ],
+    ids=["cut-off", "malformed"],
+)
+def test_response_template_undecodable_tool_call(
+    client, api, stream, batched, alone, arguments, finish
+):
+    # A tool call that the template cannot decode costs only that call: the
+    # reasoning, the content and the finish reason of the turn still arrive.
+    start = _INKLING_CALL.index("<|message_model|>get_weather") if alone else 0
+    output = _INKLING_CALL[start : _INKLING_CALL.index("{")] + arguments
+    chunks = [output[i : i + 9] for i in range(0, len(output), 9)]
+    tokens = [*map(_token, chunks), _token(finish_reason=finish["chat"])]
+    payload = dict(tools=[_tool(api=api)], stream=stream)
+    if api == "messages":
+        payload.update(thinking=dict(type="enabled", budget_tokens=4), max_tokens=8)
+    with _endpoint(
+        processor=NS(tokenizer=_ResponseTemplateTokenizer(_INKLING_RESPONSE_TEMPLATE)),
+        result=_result(output, finish_reason=finish["chat"]),
+        chunks=[
+            _result(token.text, finish_reason=token.finish_reason) for token in tokens
+        ],
+        generator=_streaming(tokens) if batched else None,
+        parser=load_tool_module("inkling"),
+    ):
+        response = _post(client, api, **payload)
+    assert response.status_code == 200, response.text
+    assert "<|" not in response.text and "city" not in response.text
+    if stream:
+        reasoning, content = _thinking_text(response, api)
+        if api == "chat":
+            (finished,) = [
+                choice["finish_reason"]
+                for event in _data(response)
+                for choice in event.get("choices") or []
+                if choice.get("finish_reason")
+            ]
+        elif api == "responses":
+            finished = _completed_response(response)["status"]
+        else:
+            finished = _anthropic_stream_stop(response)[0]
+    else:
+        body = response.json()
+        if api == "chat":
+            choice = body["choices"][0]
+            reasoning = choice["message"]["reasoning_content"]
+            content, finished = choice["message"]["content"], choice["finish_reason"]
+        elif api == "responses":
+            reasoning = _joined(
+                [
+                    part
+                    for item in body["output"]
+                    if item["type"] == "reasoning"
+                    for part in item["summary"]
+                ],
+                "text",
+            )
+            content, finished = body["output_text"], body["status"]
+        else:
+            reasoning = _joined(body["content"], "thinking")
+            content, finished = _joined(body["content"], "text"), body["stop_reason"]
+    assert (reasoning or "", content or "") == (
+        ("", "") if alone else ("I need the weather tool.", "Checking.")
+    )
+    assert finished == finish[api]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("alone", [False, True], ids=["after-text", "alone"])
+def test_response_template_tool_call_without_arguments(client, stream, alone):
+    # The tool parser reads a call that has no `args`; the template's transform
+    # does not, and the call must not take the turn's text with it.
+    start = _INKLING_CALL.index("<|message_model|>get_weather") if alone else 0
+    output = _INKLING_CALL[start:].replace(',"args":{"city":"Warsaw"}', "")
+    with _endpoint(
+        processor=NS(tokenizer=_ResponseTemplateTokenizer(_INKLING_RESPONSE_TEMPLATE)),
+        result=_result(output),
+        generator=_streaming([_token(output), _token(finish_reason="stop")]),
+        parser=load_tool_module("inkling"),
+    ):
+        response = _post(client, tools=[_tool()], stream=stream)
+    result = _chat_tool_result(response, stream)
+    assert result.calls == [("get_weather", {})]
+    assert (result.reasoning_content, result.content) == (
+        ("", "") if alone else ("I need the weather tool.", "Checking.")
+    )
+    assert "<|" not in response.text
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_response_template_tool_call_without_tools(client, stream):
+    # A call written for a request that sent no tools is not content, whether
+    # or not the response is streamed.
+    call = _INKLING_CALL[_INKLING_CALL.index("<|message_model|>get_weather") :]
+    with _endpoint(
+        processor=NS(tokenizer=_ResponseTemplateTokenizer(_INKLING_RESPONSE_TEMPLATE)),
+        result=_result(call),
+        generator=_streaming([_token(call), _token(finish_reason="stop")]),
+    ):
+        response = _post(client, stream=stream)
+    assert response.status_code == 200, response.text
+    assert "get_weather" not in response.text
 
 
 def test_response_template_thinking_stream():

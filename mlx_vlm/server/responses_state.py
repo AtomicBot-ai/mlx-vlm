@@ -241,6 +241,32 @@ def _response_template_prefix(tokenizer, prompt: str) -> str:
     return prompt if template.start_anchor_re.search(prompt) else ""
 
 
+_SPLIT_FIELDS = ("content", "reasoning", "reasoning_content")
+_REGION_KEYS = ("open", "open_pattern", "close", "close_pattern", "repeats")
+
+
+def _reasoning_content_template(template: Any) -> Any:
+    """Copy a response template so that only reasoning and content are decoded.
+
+    The server takes reasoning and content from the template; tool calls come
+    from the tool parser. Transformers decodes every field as its region closes
+    and raises when a structured one, such as a JSON tool call, is malformed,
+    cut off, or lacks a key its transform reads, which loses the reasoning and
+    content around it. Every other field is therefore reduced to its delimiters
+    and read as text, so its text still stays out of the content.
+    """
+    if not isinstance(template, dict):
+        return template
+    fields = {}
+    for name, field in template.get("fields", {}).items():
+        if name not in _SPLIT_FIELDS:
+            field = {key: field[key] for key in _REGION_KEYS if key in field}
+            # Named groups in a pattern are only valid with a transform.
+            field["transform"] = "{content}"
+        fields[name] = field
+    return {**template, "fields": fields}
+
+
 def make_response_stream_state(
     processor,
     enable_thinking: bool = False,
@@ -254,7 +280,8 @@ def make_response_stream_state(
         try:
             return ResponseTemplateStreamState(
                 tokenizer.get_response_parser(
-                    prefix=_response_template_prefix(tokenizer, prompt)
+                    _reasoning_content_template(tokenizer.response_template),
+                    prefix=_response_template_prefix(tokenizer, prompt),
                 )
             )
         except (AttributeError, TypeError, ValueError):
@@ -493,12 +520,16 @@ def _parse_response_template(
     if tokenizer is not None and hasattr(tokenizer, "parse_response"):
         try:
             parsed = tokenizer.parse_response(
-                text, prefix=_response_template_prefix(tokenizer, prompt)
+                text,
+                _reasoning_content_template(tokenizer.response_template),
+                prefix=_response_template_prefix(tokenizer, prompt),
             )
+            # A turn of tool calls alone is a decoded turn with no content.
             if isinstance(parsed, dict) and (
                 "content" in parsed
                 or "reasoning" in parsed
                 or "reasoning_content" in parsed
+                or parsed.get("tool_calls")
             ):
                 reasoning = parsed.get("reasoning_content") or parsed.get("reasoning")
                 content = parsed.get("content")
