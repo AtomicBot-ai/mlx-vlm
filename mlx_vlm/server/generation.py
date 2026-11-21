@@ -1340,6 +1340,7 @@ class ResponseGenerator:
                 media={
                     "audio": raw_inputs.get("input_features"),
                     "video": raw_inputs.get("pixel_values_videos"),
+                    "second_per_grid_ts": _apc.video_timing_key(raw_inputs),
                 },
                 model=getattr(self.model, "language_model", self.model),
                 processor=self.processor,

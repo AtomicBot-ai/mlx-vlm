@@ -24,6 +24,7 @@ from mlx_vlm.generate import (
     BatchResponse,
     BatchStats,
     GenerationBatch,
+    PromptCacheState,
     PromptProcessingBatch,
     SpeculativeGenerationBatch,
     _left_pad_prompts,
@@ -191,6 +192,24 @@ def test_batch_generator_apc_media_token_ids_handles_text_only_model(mock_proces
     )
 
     assert generator._apc_media_token_ids() == set()
+
+
+def test_batch_generator_apc_key_includes_per_video_timing(mock_model, mock_processor):
+    generator = BatchGenerator(
+        mock_model,
+        mock_processor,
+        apc_manager=apc_module.APCManager(num_blocks=1),
+        manage_wired_limit=False,
+    )
+    pixels = mx.zeros((8, 4))
+    keys = [
+        generator._apc_extra_hash(
+            {"pixel_values_videos": pixels, "second_per_grid_ts": seconds}
+        )
+        for seconds in ([1.0, 0.5], mx.array([1.0, 0.5]), [0.5, 1.0])
+    ]
+    assert keys[0] == keys[1]
+    assert keys[0] != keys[2]
 
 
 class TestGenerationBatch:
@@ -1764,6 +1783,49 @@ def test_cached_prefix_rope_forwards_video_timing_when_supported():
     assert ok is True
     assert seen["second_per_grid_ts"] is seconds
     assert bool(mx.array_equal(kwargs["rope_deltas"], rope_deltas))
+
+
+@pytest.mark.parametrize("cache_kind", ["apc", "per_turn"])
+def test_video_prefix_reuse_requires_matching_timing(
+    cache_kind, mock_processor, monkeypatch
+):
+    from mlx_vlm.models import qwen2_5_vl
+    from mlx_vlm.tests.test_models import build_config, model_case
+
+    case = model_case("TestGetInputEmbeddings.qwen2_5_vl_input_embeddings")
+    config = build_config(qwen2_5_vl, case["config"])
+    config.vision_start_token_id, config.video_token_id = 27, 28
+    config.vision_config.window_size = 56
+    model = qwen2_5_vl.Model(config)
+    pixels = mx.random.normal((8, 1176))
+    if cache_kind == "apc":
+        monkeypatch.setenv("APC_LAYER_MAJOR_MEMORY_MIN_TOKENS", "4")
+        cache_kwargs = {
+            "apc_manager": apc_module.APCManager(num_blocks=8, block_size=4)
+        }
+    else:
+        cache_kwargs = {"prompt_cache_state": PromptCacheState()}
+
+    def run(seconds, suffix, **kwargs):
+        return list(
+            dispatch_module.stream_generate(
+                model,
+                mock_processor,
+                prompt="",
+                max_tokens=1,
+                input_ids=mx.array([[27, 28, 28] + [5] * 17 + [suffix]]),
+                pixel_values_videos=pixels,
+                video_grid_thw=mx.array([[2, 2, 2]]),
+                second_per_grid_ts=seconds,
+                **kwargs,
+            )
+        )[-1]
+
+    assert run([1.0], 6, **cache_kwargs).cached_tokens == 0
+    assert run(mx.array([1.0]), 7, **cache_kwargs).cached_tokens == 20
+    changed = run(mx.array([0.75]), 8, **cache_kwargs)
+    assert changed.cached_tokens == 0
+    assert mx.array_equal(changed.logprobs, run([0.75], 8).logprobs)
 
 
 def test_cached_prefix_rope_keeps_legacy_signature_working():

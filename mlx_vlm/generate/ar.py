@@ -2867,6 +2867,7 @@ class BatchGenerator:
             media={
                 "audio": prompt_kwargs.get("input_features"),
                 "video": prompt_kwargs.get("pixel_values_videos"),
+                "second_per_grid_ts": _apc.video_timing_key(prompt_kwargs),
                 "embeddings": prompt_kwargs.get("inputs_embeds"),
                 "masks": prompt_kwargs.get("attention_mask"),
             },

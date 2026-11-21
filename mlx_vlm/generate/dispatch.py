@@ -751,14 +751,12 @@ def _prime_cached_prefix_rope_state(
         return True
     try:
         rope_kwargs: Dict[str, Any] = {}
-        try:
-            accepts_video_timing = (
-                "second_per_grid_ts" in inspect.signature(get_rope_index).parameters
-            )
-        except (TypeError, ValueError):
-            accepts_video_timing = False
-        if accepts_video_timing:
-            rope_kwargs["second_per_grid_ts"] = kwargs.get("second_per_grid_ts", None)
+        seconds = kwargs.get("second_per_grid_ts")
+        if (
+            seconds is not None
+            and "second_per_grid_ts" in inspect.signature(get_rope_index).parameters
+        ):
+            rope_kwargs["second_per_grid_ts"] = seconds
         position_ids, rope_deltas = get_rope_index(
             full_input_ids,
             kwargs.get("image_grid_thw", None),
@@ -973,6 +971,10 @@ def stream_generate(
         else:
             apc_coordinator.prepare_prefill(len(full_input_ids_list))
 
+    video_timing = ()
+    if apc_manager is not None or prompt_cache_state is not None:
+        video_timing = _apc.video_timing_key(kwargs)
+
     if apc_manager is not None:
         image_hash = _apc.hash_image_payload(pixel_values=pixel_values, image_ref=image)
         audio_features = kwargs.get("input_features")
@@ -983,6 +985,7 @@ def stream_generate(
             media={
                 "audio": audio_features if audio_features is not None else audio,
                 "video": video_features if video_features is not None else video,
+                "second_per_grid_ts": video_timing,
                 "embeddings": custom_inputs_embeds,
                 "masks": custom_mask,
             },
@@ -991,7 +994,9 @@ def stream_generate(
         )
 
     if prompt_cache_state is not None and prompt_cache_state.cache is not None:
-        prefix_len = prompt_cache_state.find_prefix_length(full_input_ids_list)
+        prefix_len = prompt_cache_state.find_prefix_length(
+            full_input_ids_list, video_timing=video_timing
+        )
         kv_cache = prompt_cache_state.cache
         # None => a cache can't be trimmed back to the shared prefix (wrapped
         # rotating window); reusing it would corrupt state, so cold-prefill instead.
@@ -1211,7 +1216,7 @@ def stream_generate(
             all_ids = full_input_ids_list + [
                 t.item() if hasattr(t, "item") else t for t in generated_tokens
             ]
-            prompt_cache_state.update(all_ids, tracked_cache)
+            prompt_cache_state.update(all_ids, tracked_cache, video_timing=video_timing)
 
         # APC: harvest new blocks from the post-generation KV state.
         if apc_coordinator is not None and not apc_coordinator.is_checkpoint:

@@ -6390,6 +6390,32 @@ class TestResponseGenerator:
                 processor=gen.processor,
             )
 
+    def test_server_apc_key_includes_per_video_timing(self):
+        gen = _ready_generator(
+            apc_manager=object(),
+            apc_mode="block",
+            model=NS(language_model=NS()),
+            processor=NS(),
+        )
+        video = mx.zeros((8, 4))
+        inputs = [
+            dict(
+                input_ids=mx.array([[1, 2]]),
+                pixel_values_videos=video,
+                second_per_grid_ts=mx.array(seconds),
+            )
+            for seconds in ([1.0, 0.5], [0.5, 1.0])
+        ]
+        gen._preprocess_request = MagicMock(side_effect=inputs)
+        queued = _capture_requests(gen, prompt_tokens=2)
+        for _ in inputs:
+            _, tokens = gen.generate(
+                "prompt", videos=["a.mp4", "b.mp4"], args=Args(max_tokens=1)
+            )
+            tokens.close()
+
+        assert queued[0].apc_semantic_hash != queued[1].apc_semantic_hash
+
     def test_runtime_context_limit(self, monkeypatch):
         monkeypatch.setenv("MAX_KV_SIZE", "8")
         _reset_runtime(
