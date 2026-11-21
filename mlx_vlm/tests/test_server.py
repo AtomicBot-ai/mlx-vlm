@@ -213,18 +213,9 @@ _MUSE_RESPONSE_TEMPLATE = {
 }
 
 
-class _MuseResponseTemplateTokenizer:
-    response_template = _MUSE_RESPONSE_TEMPLATE
-
-    def parse_response(self, response, prefix=None):
-        return parse_response(response, self.response_template, prefix=prefix)
-
-    def get_response_parser(self, prefix=None):
-        return ResponseParser(self.response_template, prefix=prefix)
-
-
-class _HarmonyResponseTemplateTokenizer:
-    response_template = HARMONY_RESPONSE_TEMPLATE
+class _ResponseTemplateTokenizer:
+    def __init__(self, template):
+        self.response_template = copy.deepcopy(template)
 
     def parse_response(self, response, prefix=None):
         return parse_response(response, self.response_template, prefix=prefix)
@@ -270,19 +261,11 @@ _INKLING_RESPONSE_TEMPLATE = {
 }
 
 
-class _InklingResponseTemplateTokenizer:
-    response_template = _INKLING_RESPONSE_TEMPLATE
-
-    def parse_response(self, response, prefix=None):
-        return parse_response(response, self.response_template, prefix=prefix)
-
-    def get_response_parser(self, prefix=None):
-        return ResponseParser(self.response_template, prefix=prefix)
-
-
 def _harmony_processor():
     """A processor prepared exactly as the gpt-oss loader prepares it."""
-    return _attach_harmony_template(NS(tokenizer=_HarmonyResponseTemplateTokenizer()))
+    return _attach_harmony_template(
+        NS(tokenizer=_ResponseTemplateTokenizer(HARMONY_RESPONSE_TEMPLATE))
+    )
 
 
 def _msg(content="Hello", role="user", **extra):
@@ -467,6 +450,45 @@ def _chat_events(response, reason):
         chunk for chunk in choices if chunk["choices"][0]["finish_reason"] == reason
     )
     return choices, usage, finish
+
+
+def _chat_tool_result(response, stream):
+    assert response.status_code == 200, response.text
+    if stream:
+        choices = [
+            event["choices"][0] for event in _data(response) if event.get("choices")
+        ]
+        deltas = [choice["delta"] for choice in choices]
+        message = {
+            field: _joined(deltas, field) for field in ("content", "reasoning_content")
+        }
+        functions = {}
+        for delta in deltas:
+            for call in delta.get("tool_calls") or []:
+                function = functions.setdefault(
+                    call["index"], {"name": "", "arguments": ""}
+                )
+                for field in function:
+                    function[field] += call["function"].get(field, "")
+        assert list(functions) == list(range(len(functions)))
+        functions = list(functions.values())
+        finishes = [
+            choice["finish_reason"] for choice in choices if choice.get("finish_reason")
+        ]
+    else:
+        choice = response.json()["choices"][0]
+        message = choice["message"]
+        functions = [call["function"] for call in message["tool_calls"]]
+        finishes = [choice["finish_reason"]]
+    assert finishes == ["tool_calls"]
+    return NS(
+        content=message.get("content") or "",
+        reasoning_content=message.get("reasoning_content") or "",
+        calls=[
+            (function["name"], json.loads(function["arguments"]))
+            for function in functions
+        ],
+    )
 
 
 def _assert_fields(actual, **expected):
@@ -3703,7 +3725,9 @@ def test_response_template_tool_calls(client, api):
     token = _token(_MUSE_CALL, finish_reason="stop", prompt_tps=20, cached_tokens=2)
     with _endpoint(
         config=config,
-        processor=NS(config=config, tokenizer=_MuseResponseTemplateTokenizer()),
+        processor=NS(
+            config=config, tokenizer=_ResponseTemplateTokenizer(_MUSE_RESPONSE_TEMPLATE)
+        ),
         result=_result(_MUSE_CALL, prompt_tokens=7, generation_tokens=6),
         generator=_streaming([token], 10) if api == "chat" else None,
         parser=load_tool_module("atem"),
@@ -3736,21 +3760,33 @@ def test_response_template_tool_calls(client, api):
 @pytest.mark.parametrize("continuous", [False, True])
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("position", ["before", "after", "between", "none"])
-@pytest.mark.parametrize("parser", ["inkling", "atem"])
-def test_response_template_tool_text(client, stream, continuous, position, parser):
-    if parser == "inkling":
-        config = NS(model_type="inkling2")
-        tokenizer = _InklingResponseTemplateTokenizer()
-        thinking, content, call = (
-            "<|message_model|>" + segment
-            for segment in _INKLING_CALL.split("<|message_model|>")[1:]
-        )
-    else:
-        config = NS(model_type="muse_glimmer")
-        tokenizer = _MuseResponseTemplateTokenizer()
-        thinking, call = _MUSE_CALL.split("<|start|>", 1)
-        call = "<|start|>" + call + "<|eom|>"
-        content = "<|start|>assistant to=user<|message|>Checking.<|eom|>"
+@pytest.mark.parametrize(
+    "parser,template,parts",
+    [
+        (
+            "inkling",
+            _INKLING_RESPONSE_TEMPLATE,
+            [
+                "<|message_model|>" + part
+                for part in _INKLING_CALL.split("<|message_model|>")[1:]
+            ],
+        ),
+        (
+            "atem",
+            _MUSE_RESPONSE_TEMPLATE,
+            [
+                _MUSE_CALL.split("<|start|>", 1)[0],
+                "<|start|>assistant to=user<|message|>Checking.<|eom|>",
+                "<|start|>" + _MUSE_CALL.split("<|start|>", 1)[1] + "<|eom|>",
+            ],
+        ),
+    ],
+    ids=["inkling", "muse"],
+)
+def test_response_template_tool_text(
+    client, stream, continuous, position, parser, template, parts
+):
+    thinking, content, call = parts
     segments = {
         "before": [thinking, content, call],
         "after": [thinking, call, content],
@@ -3761,8 +3797,7 @@ def test_response_template_tool_text(client, stream, continuous, position, parse
     chunks = [output[i : i + 9] for i in range(0, len(output), 9)]
     tokens = [*map(_token, chunks), _token(finish_reason="stop")]
     with _endpoint(
-        config=config,
-        processor=NS(config=config, tokenizer=tokenizer),
+        processor=NS(tokenizer=_ResponseTemplateTokenizer(template)),
         result=_result(output),
         chunks=[
             _result(token.text, finish_reason=token.finish_reason) for token in tokens
@@ -3771,26 +3806,12 @@ def test_response_template_tool_text(client, stream, continuous, position, parse
         parser=load_tool_module(parser),
     ):
         response = _post(client, tools=[_tool()], stream=stream)
-    assert response.status_code == 200
-    if stream:
-        choices = [c["choices"][0] for c in _data(response) if c.get("choices")]
-        deltas = [choice["delta"] for choice in choices]
-        message = dict(
-            reasoning_content=_joined(deltas, "reasoning_content"),
-            content=_joined(deltas, "content"),
-            tool_calls=choices[-1]["delta"]["tool_calls"],
-        )
-        finish_reason = choices[-1]["finish_reason"]
-    else:
-        choice = response.json()["choices"][0]
-        message, finish_reason = choice["message"], choice["finish_reason"]
-    assert finish_reason == "tool_calls"
-    assert len(message["tool_calls"]) == (2 if position == "between" else 1)
-    for call in message["tool_calls"]:
-        assert call["function"]["name"] == "get_weather"
-        assert json.loads(call["function"]["arguments"]) == {"city": "Warsaw"}
-    assert message["reasoning_content"] == "I need the weather tool."
-    assert (message["content"] or "") == ("" if position == "none" else "Checking.")
+    result = _chat_tool_result(response, stream)
+    assert result.calls == [("get_weather", {"city": "Warsaw"})] * (
+        2 if position == "between" else 1
+    )
+    assert result.reasoning_content == "I need the weather tool."
+    assert result.content == ("" if position == "none" else "Checking.")
     assert "<|" not in response.text
 
 
@@ -4016,7 +4037,10 @@ def test_anthropic_response_template_discards_tool_calls_after_stop(client):
         "messages",
         endpoint=dict(
             config=config,
-            processor=NS(config=config, tokenizer=_MuseResponseTemplateTokenizer()),
+            processor=NS(
+                config=config,
+                tokenizer=_ResponseTemplateTokenizer(_MUSE_RESPONSE_TEMPLATE),
+            ),
             parser=load_tool_module("atem"),
         ),
         tools=[_tool(api="messages")],
@@ -7340,18 +7364,19 @@ def test_thinking_stream_markers(family, enabled):
     ],
 )
 def test_response_template_prefilled_thinking(prefix, text, expected):
-    tokenizer = _MuseResponseTemplateTokenizer()
-    tokenizer.response_template = {
-        "start_anchor_pattern": r"<\|im_start\|>assistant\n",
-        "fields": {
-            "reasoning_content": {
-                "open_pattern": r"<think>\n?",
-                "close_pattern": r"</think>\s*",
-                "content": "text",
+    tokenizer = _ResponseTemplateTokenizer(
+        {
+            "start_anchor_pattern": r"<\|im_start\|>assistant\n",
+            "fields": {
+                "reasoning_content": {
+                    "open_pattern": r"<think>\n?",
+                    "close_pattern": r"</think>\s*",
+                    "content": "text",
+                },
+                "content": {"close_pattern": r"<\|im_end\|>\s*", "content": "text"},
             },
-            "content": {"close_pattern": r"<\|im_end\|>\s*", "content": "text"},
-        },
-    }
+        }
+    )
     prompt = (
         "<|im_start|>assistant\n<think>Old.</think>Old answer.<|im_end|>\n"
         "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n" + prefix
@@ -7377,8 +7402,9 @@ def test_response_template_prefilled_thinking(prefix, text, expected):
     ],
 )
 def test_response_template_missing_anchor(client, api, stream, batched, anchor):
-    tokenizer = _MuseResponseTemplateTokenizer()
-    tokenizer.response_template = {**anchor, "fields": {"content": {"content": "text"}}}
+    tokenizer = _ResponseTemplateTokenizer(
+        {**anchor, "fields": {"content": {"content": "text"}}}
+    )
     result = _result("4.", finish_reason="stop")
     worker = _streaming([_token("4.", finish_reason="stop")]) if batched else None
     with _endpoint(
@@ -7406,7 +7432,7 @@ def test_response_template_missing_anchor(client, api, stream, batched, anchor):
 
 def test_response_template_thinking_stream():
     state = server.make_response_stream_state(
-        NS(tokenizer=_MuseResponseTemplateTokenizer()),
+        NS(tokenizer=_ResponseTemplateTokenizer(_MUSE_RESPONSE_TEMPLATE)),
         thinking_start_token="unused-start",
         thinking_end_token="unused-end",
     )
@@ -8753,7 +8779,7 @@ _WEATHER_CALL = '<tool_call>{"name": "get_weather", "arguments": {}}</tool_call>
 def fallback_processor(request):
     if not request.param:
         return None
-    tokenizer = _MuseResponseTemplateTokenizer()
+    tokenizer = _ResponseTemplateTokenizer({"fields": {}})
     tokenizer.parse_response = Mock(side_effect=ValueError("invalid template"))
     tokenizer.get_response_parser = Mock(side_effect=ValueError("invalid template"))
     return NS(tokenizer=tokenizer)
@@ -8768,24 +8794,9 @@ def test_chat_fallback_parses_tool_calls(client, stream, fallback_processor):
         result=result, chunks=[result], parser=_JSON_TOOLS, processor=fallback_processor
     ):
         response = _post(client, stream=stream, tools=[_tool()])
-    assert response.status_code == 200
-    if not stream:
-        choice = response.json()["choices"][0]
-        assert choice["finish_reason"] == "tool_calls"
-        assert choice["message"]["content"] == "Checking."
-        assert choice["message"]["tool_calls"][0]["function"]["name"] == "get_weather"
-        return
-    deltas = _deltas(response)
-    assert _joined(deltas, "content") == "Checking."
-    calls = [call for delta in deltas for call in delta.get("tool_calls") or []]
-    assert [call["function"]["name"] for call in calls] == ["get_weather"]
-    reasons = [
-        choice["finish_reason"]
-        for chunk in _data(response)
-        for choice in chunk.get("choices") or []
-        if choice.get("finish_reason")
-    ]
-    assert reasons == ["tool_calls"]
+    parsed = _chat_tool_result(response, stream)
+    assert parsed.content == "Checking."
+    assert parsed.calls == [("get_weather", {})]
 
 
 @pytest.mark.parametrize("continuous", [False, True])
@@ -8816,11 +8827,9 @@ def test_chat_nonstream_tool_cleanup_preserves_fallback_content(
         processor=fallback_processor,
     ):
         response = _post(client, tools=[_tool()])
-    assert response.status_code == 200
-    choice = response.json()["choices"][0]
-    assert choice["finish_reason"] == "tool_calls"
-    assert choice["message"]["content"] == expected
-    assert choice["message"]["tool_calls"][0]["function"]["name"] == "get_weather"
+    parsed = _chat_tool_result(response, stream=False)
+    assert parsed.content == expected
+    assert parsed.calls == [("get_weather", {})]
 
 
 @pytest.mark.parametrize("api", ["chat", "responses", "messages"])
@@ -10399,22 +10408,7 @@ def test_tool_streaming_filters_calls_consistently(
         assert all(call["type"] == "function_call" for call in calls)
         actual = [(call["name"], json.loads(call["arguments"])) for call in calls]
     else:
-        choices = [event["choices"][0] for event in events if event.get("choices")]
-        assert [
-            choice["finish_reason"] for choice in choices if choice.get("finish_reason")
-        ] == ["tool_calls"]
-        received = {}
-        for choice in choices:
-            for delta in choice["delta"].get("tool_calls") or []:
-                call = received.setdefault(delta["index"], {"arguments": ""})
-                function = delta["function"]
-                if "name" in function:
-                    call["name"] = function["name"]
-                call["arguments"] += function.get("arguments", "")
-        assert list(received) == list(range(len(expected)))
-        actual = [
-            (call["name"], json.loads(call["arguments"])) for call in received.values()
-        ]
+        actual = _chat_tool_result(response, stream=True).calls
     assert actual == expected
 
 
