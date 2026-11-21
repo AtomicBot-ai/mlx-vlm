@@ -1531,15 +1531,29 @@ class TestQwen2_5VLVideoTemporalSpacing:
         result = p(text=["<|video_pad|>"], videos=self._videos())
         assert result["second_per_grid_ts"].tolist() == [1.0]
 
-    def test_second_per_grid_ts_from_video_metadata(self):
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            NS(sampled_fps=4.0),
+            {"fps": 8.0, "total_num_frames": 8, "frames_indices": [0, 2, 4, 6]},
+        ],
+    )
+    def test_second_per_grid_ts_from_video_metadata(self, metadata):
         p = self._processor()
         result = p(
             text=["<|video_pad|>"],
             videos=self._videos(),
-            video_metadata=[NS(sampled_fps=4.0)],
+            video_metadata=[metadata],
         )
         assert result["second_per_grid_ts"].tolist() == [0.5]
         assert "video_metadata" not in p.tokenizer.last_kwargs
+
+    @pytest.mark.parametrize("fps", [3.0, 4.0])
+    def test_prepare_inputs_preserves_sampled_fps(self, fps):
+        result = prepare_inputs(
+            self._processor(), prompts=["<|video_pad|>"], videos=self._videos(), fps=fps
+        )
+        assert result["second_per_grid_ts"].tolist() == pytest.approx([2 / fps])
 
     def test_fps_count_mismatch_raises(self):
         p = self._processor()

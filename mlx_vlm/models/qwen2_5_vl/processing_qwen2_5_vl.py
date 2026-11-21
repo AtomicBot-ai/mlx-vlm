@@ -12,9 +12,18 @@ from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_utils import ImageInput
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
+from transformers.video_utils import VideoMetadata
 
 from ..base import to_mlx
 from ..qwen3_vl.processing_qwen3_vl import _pop_image_processor_kwargs
+
+
+def _sampled_fps(metadata):
+    if isinstance(metadata, dict):
+        if "sampled_fps" in metadata:
+            return metadata["sampled_fps"]
+        metadata = VideoMetadata(**metadata)
+    return metadata.sampled_fps
 
 
 class Qwen2_5_VLProcessor(ProcessorMixin):
@@ -72,6 +81,8 @@ class Qwen2_5_VLProcessor(ProcessorMixin):
             ]
         ] = None,
         videos=None,
+        fps=None,
+        video_metadata=None,
         **kwargs,
     ) -> BatchFeature:
         image_inputs = {}
@@ -89,13 +100,8 @@ class Qwen2_5_VLProcessor(ProcessorMixin):
             # Seconds per temporal grid for video RoPE: the model scales
             # temporal positions by tokens_per_second * this value, so the
             # sampling rate must travel with the grids (HF processor parity).
-            fps = kwargs.pop("fps", None)
-            video_metadata = kwargs.pop("video_metadata", None)
             if fps is None and video_metadata is not None:
-                fps = [
-                    meta["sampled_fps"] if isinstance(meta, dict) else meta.sampled_fps
-                    for meta in video_metadata
-                ]
+                fps = [_sampled_fps(meta) for meta in video_metadata]
             if fps is None:
                 fps = getattr(_video_proc, "fps", 2.0)
             if isinstance(fps, (int, float)):

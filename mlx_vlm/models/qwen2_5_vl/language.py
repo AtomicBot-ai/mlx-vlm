@@ -312,15 +312,14 @@ class LanguageModel(nn.Module):
                     index = mx.broadcast_to(index, (3, text_len))
                     index = index + st_idx
                     llm_pos_ids_list.append(index)
-                    t_index = mx.arange(llm_grid_t).reshape(
-                        llm_grid_t, 1
-                    )  # Equivalent to .view(-1, 1)
+                    # Quantize each temporal coordinate before it can affect
+                    # the starting position of the following text or video.
+                    t_index = (mx.arange(llm_grid_t) * time_interval).astype(
+                        position_ids.dtype
+                    )
                     t_index = mx.broadcast_to(
-                        t_index, (llm_grid_t, llm_grid_h * llm_grid_w)
-                    )  # Equivalent to expand()
-                    t_index = t_index.flatten()  # Flattens to 1D
-                    if time_interval != 1:
-                        t_index = t_index.astype(mx.float32) * time_interval
+                        t_index[:, None], (llm_grid_t, llm_grid_h * llm_grid_w)
+                    ).flatten()
 
                     h_index = mx.arange(llm_grid_h).reshape(
                         1, llm_grid_h, 1

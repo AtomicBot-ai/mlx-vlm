@@ -1331,6 +1331,21 @@ def test_qwen2_5_vl_video_rope_index_uses_per_video_seconds():
     assert deltas.tolist() == [[1]]
 
 
+def test_qwen2_5_vl_fractional_video_positions_do_not_accumulate_across_clips():
+    lm = _qwen2_5_vl_rope_model()
+    tokens = mx.array([[100, 102, 102, 100, 102, 102, 5]])
+    positions, deltas = lm.get_rope_index(
+        tokens,
+        video_grid_thw=mx.array([[2, 2, 2], [2, 2, 2]]),
+        second_per_grid_ts=mx.array([0.75, 0.75]),
+    )
+    # Transformers 4.49 quantizes each temporal index before advancing the
+    # next span from the maximum position of the previous span.
+    assert positions[0, 0].tolist() == [0, 1, 2, 3, 4, 5, 6]
+    assert deltas.dtype == tokens.dtype
+    assert deltas.item() == 0
+
+
 def test_qwen2_5_vl_image_rope_index_keeps_unit_temporal_spacing():
     lm = _qwen2_5_vl_rope_model()
     input_ids = mx.array([[100, 101, 5, 6]], dtype=mx.int32)
