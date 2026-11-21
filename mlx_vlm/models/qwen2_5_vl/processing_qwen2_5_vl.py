@@ -12,9 +12,18 @@ from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_utils import ImageInput
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
+from transformers.video_utils import VideoMetadata
 
 from ..base import to_mlx
 from ..qwen3_vl.processing_qwen3_vl import _pop_image_processor_kwargs
+
+
+def _sampled_fps(metadata):
+    if isinstance(metadata, dict):
+        if "sampled_fps" in metadata:
+            return metadata["sampled_fps"]
+        metadata = VideoMetadata(**metadata)
+    return metadata.sampled_fps
 
 
 class Qwen2_5_VLProcessor(ProcessorMixin):
@@ -72,6 +81,8 @@ class Qwen2_5_VLProcessor(ProcessorMixin):
             ]
         ] = None,
         videos=None,
+        fps=None,
+        video_metadata=None,
         **kwargs,
     ) -> BatchFeature:
         image_inputs = {}
@@ -86,6 +97,27 @@ class Qwen2_5_VLProcessor(ProcessorMixin):
             _video_proc = self.video_processor or self.image_processor
             videos_inputs = _video_proc(videos=videos)
             video_grid_thw = videos_inputs["video_grid_thw"]
+            # Seconds per temporal grid for video RoPE: the model scales
+            # temporal positions by tokens_per_second * this value, so the
+            # sampling rate must travel with the grids (HF processor parity).
+            if fps is None and video_metadata is not None:
+                fps = [_sampled_fps(meta) for meta in video_metadata]
+            if fps is None:
+                fps = getattr(_video_proc, "fps", 2.0)
+            if isinstance(fps, (int, float)):
+                fps = [fps] * len(video_grid_thw)
+            if len(fps) != len(video_grid_thw):
+                raise ValueError(
+                    f"The length of fps ({len(fps)}) must be equal to the length "
+                    f"of video_grid_thw ({len(video_grid_thw)}) or fps should be "
+                    "a single number."
+                )
+            if any(tmp <= 0 for tmp in fps):
+                raise ValueError("fps must be positive for every video.")
+            temporal_patch_size = getattr(_video_proc, "temporal_patch_size", 2)
+            videos_inputs["second_per_grid_ts"] = [
+                temporal_patch_size / tmp for tmp in fps
+            ]
 
         if not isinstance(text, list):
             text = [text]
@@ -149,7 +181,7 @@ class Qwen2_5_VLProcessor(ProcessorMixin):
             dict.fromkeys(
                 tokenizer_input_names
                 + image_processor_input_names
-                + ["mm_token_type_ids"]
+                + ["mm_token_type_ids", "second_per_grid_ts"]
             )
         )
 

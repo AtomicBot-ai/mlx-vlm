@@ -227,6 +227,16 @@ def model_key_dependencies(model: Any = None, processor: Any = None) -> Tuple[in
     return tuple(deps)
 
 
+def video_timing_key(inputs: dict) -> tuple[float, ...]:
+    """Snapshot per-video RoPE timing for prefix reuse across requests."""
+    seconds = inputs.get("second_per_grid_ts")
+    if seconds is None:
+        return ()
+    if isinstance(seconds, (mx.array, np.ndarray)):
+        seconds = seconds.tolist()
+    return tuple(map(float, seconds))
+
+
 def semantic_extra_hash(
     *,
     tenant: Optional[str] = None,
