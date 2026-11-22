@@ -827,8 +827,8 @@ def _describe_split(rows: Any) -> dict[str, Any]:
     from collections.abc import Mapping
 
     count = len(rows)
-    first = rows[0] if count else {}
-    columns = sorted(first) if isinstance(first, Mapping) else []
+    row = rows[0] if count else {}
+    columns = sorted(row) if isinstance(row, Mapping) else []
     report: dict[str, Any] = {"rows": count, "columns": columns}
     if not columns:
         return report
@@ -838,23 +838,19 @@ def _describe_split(rows: Any) -> dict[str, Any]:
             break
     else:
         report["format"], report["algorithms"] = "unknown", []
-    step = max(count // _SAMPLE_ROWS, 1)
-    sample = [rows[i] for i in range(0, count, step)][:_SAMPLE_ROWS]
-    # Columns starting with "_" hold bookkeeping, not training text.
-    lengths = sorted(
-        _text_chars(
-            {k: v for k, v in row.items() if not k.startswith("_")}
-            if isinstance(row, Mapping)
-            else row
-        )
-        for row in sample
-    )
-    with_images = sum(
-        bool(row.get("images") or row.get("image"))
-        for row in sample
-        if isinstance(row, Mapping)
-    )
-    report["sampled_rows"] = len(sample)
+    sample_size = min(count, _SAMPLE_ROWS)
+    lengths = []
+    with_images = 0
+    for i in range(sample_size):
+        if i:
+            row = rows[i * (count - 1) // (sample_size - 1)]
+        if isinstance(row, Mapping):
+            with_images += bool(row.get("images") or row.get("image"))
+            # Columns starting with "_" hold bookkeeping, not training text.
+            row = {k: v for k, v in row.items() if not k.startswith("_")}
+        lengths.append(_text_chars(row))
+    lengths.sort()
+    report["sampled_rows"] = sample_size
     report["text_chars"] = {
         "median": lengths[len(lengths) // 2],
         "p95": lengths[min(int(len(lengths) * 0.95), len(lengths) - 1)],

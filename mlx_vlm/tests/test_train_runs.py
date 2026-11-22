@@ -607,6 +607,35 @@ def test_inspect_dataset_reports_splits(tmp_path):
         inspect_dataset({"data": str(tmp_path), "train_split": "missing"})
 
 
+def test_inspection_fetches_a_bounded_sample_without_retaining_media():
+    import weakref
+    from mlx_vlm.train_runs import _describe_split
+
+    class Image:
+        pass
+
+    class LazyRows:
+        def __init__(self):
+            self.indices = []
+            self.live_images = weakref.WeakSet()
+
+        def __len__(self):
+            return 3999
+
+        def __getitem__(self, index):
+            self.indices.append(index)
+            image = Image()
+            self.live_images.add(image)
+            assert len(self.live_images) <= 2
+            return {"text": "abc", "image": image}
+
+    rows = LazyRows()
+    report = _describe_split(rows)
+    assert report["sampled_rows"] == report["rows_with_images"] == 2000
+    assert report["text_chars"] == {"median": 3, "p95": 3, "max": 3}
+    assert rows.indices == list(range(0, 3999, 2))
+
+
 def test_command_line_prints_json_and_reports_errors(tmp_path, capsys):
     main(["--runs-dir", str(tmp_path), "--max-runs-per-day", "3", "limits"])
     usage = json.loads(capsys.readouterr().out)
