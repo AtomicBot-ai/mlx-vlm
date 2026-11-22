@@ -368,7 +368,11 @@ python -m mlx_vlm.train_runs status          # newest run; or pass a run id or n
 python -m mlx_vlm.train_runs log --lines 50
 python -m mlx_vlm.train_runs history       # every metric as [iteration, value] points
 python -m mlx_vlm.train_runs list
-python -m mlx_vlm.train_runs stop
+python -m mlx_vlm.train_runs stop            # saves weights and trainer state first
+python -m mlx_vlm.train_runs continue        # carry on an ended run in a new run
+python -m mlx_vlm.train_runs config          # the options a run was started with
+python -m mlx_vlm.train_runs sample          # latest generated output (GRPO)
+python -m mlx_vlm.train_runs delete <run>    # remove an ended run and its files
 python -m mlx_vlm.train_runs limits
 ```
 
@@ -380,6 +384,16 @@ validated by the training parser itself. Each run is a detached
 survive a restart of the host. A run ends as `completed`, `capped`, `stopped`
 or `failed`. Set `export_qat_path` in the options to also save a merged,
 standalone model when the run ends; `status` reports it as `export_path`.
+
+`stop` asks the run to end at its next report: it saves its weights and a
+`trainer_state.safetensors` (optimizer state, random state and position)
+beside them. `continue` then starts a new run that restores all of it and
+trains the iterations that were left, so the two parts together match one
+uninterrupted run, including the learning-rate schedule. A run that reached a
+usage cap continues the same way. A run that failed or was killed saved no
+state and continues from its last saved weights with a fresh optimizer. The
+same works from the CLI with `--resume-adapter-file` plus `--resume-state`.
+Validation and checkpoint intervals are counted from where the new run starts.
 
 Caps are set by whoever launches the manager, as flags before the command or
 as environment variables, and are passed on to every run:

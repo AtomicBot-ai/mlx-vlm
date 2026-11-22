@@ -31,6 +31,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import signal
 import subprocess
 import sys
@@ -46,6 +47,13 @@ LIMIT_ENV_PREFIX = "MLX_VLM_TRAIN_"
 DEFAULT_RUNS_DIR = "~/.mlx-vlm/runs"
 LIMITS_FILE = "limits.json"
 ACTIVE = {"running"}
+# Written into a run's folder to ask it to save its weights and end; the
+# trainer looks for it at each report. Its last generation, for algorithms
+# that generate, is kept in the second file.
+STOP_FILE = "stop"
+SAMPLE_FILE = "last_generation.json"
+WEIGHTS_FILE = "adapters.safetensors"
+STATE_FILE = "trainer_state.safetensors"  # optimizer, random state and position
 # Options the manager owns; values passed by a caller are ignored.
 MANAGED = {
     "config",
@@ -293,11 +301,13 @@ class RunManager:
         self._procs.pop(run["id"], None)
         run["exit_code"] = code
         run["ended_at"] = run.get("ended_at") or _now().isoformat(timespec="seconds")
-        if run.get("stop_requested"):
+        info = self.progress(run) if code == 0 else {}
+        if info.get("finished"):
+            run["status"] = "completed"  # it got there before a stop did
+        elif run.get("stop_requested"):
             run["status"] = "stopped"
         elif code == 0:
-            capped = self.progress(run).get("capped")
-            run["status"] = "capped" if capped else "completed"
+            run["status"] = "capped" if info.get("capped") else "completed"
         else:
             run["status"] = "failed"
         self._save(run)
@@ -417,12 +427,27 @@ class RunManager:
         self._save(run)
         return run
 
-    def stop(self, run_id: str = "", wait_s: float = 5.0) -> dict[str, Any]:
+    def stop(
+        self, run_id: str = "", wait_s: float = 5.0, save_s: float = 30.0
+    ) -> dict[str, Any]:
+        """Stop a run, giving it ``save_s`` seconds to save its weights first.
+
+        The trainer sees the request at its next report and saves, which is
+        what lets the run be continued. A run that does not answer in time is
+        ended anyway and keeps only its last checkpoint.
+        """
         run = self.get(run_id)
         if run["status"] not in ACTIVE:
             return run
         run["stop_requested"] = True
         self._save(run)
+        with contextlib.suppress(OSError):
+            (self.root / run["id"] / STOP_FILE).touch()
+        deadline = time.monotonic() + save_s
+        while time.monotonic() < deadline:
+            if self._refresh(run)["status"] not in ACTIVE:
+                return run
+            time.sleep(0.2)
         for sig in (signal.SIGTERM, signal.SIGKILL):
             with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.killpg(run["pid"], sig)
@@ -432,6 +457,96 @@ class RunManager:
                     return run
                 time.sleep(0.2)
         return run
+
+    def options(self, run: dict[str, Any]) -> dict[str, Any]:
+        """The options a run was started with, without what the manager set."""
+        try:
+            config = json.loads((self.root / run["id"] / "config.json").read_text())
+        except (OSError, ValueError) as error:
+            raise LookupError(f"Run '{run['id']}' has no saved options.") from error
+        return {k: v for k, v in config.items() if k not in MANAGED}
+
+    def weights(self, run: dict[str, Any]) -> Path | None:
+        path = Path(run["adapter_path"]) / WEIGHTS_FILE
+        return path if path.is_file() else None
+
+    def remaining(
+        self, run: dict[str, Any], info: dict[str, Any] | None = None
+    ) -> int | None:
+        """Iterations a run had left, when its progress says so."""
+        info = self.progress(run) if info is None else info
+        if not info.get("iters"):
+            return None
+        return max(int(info["iters"]) - int(info.get("iteration") or 0), 0)
+
+    def can_continue(
+        self, run: dict[str, Any], info: dict[str, Any] | None = None
+    ) -> bool:
+        return (
+            run["status"] not in ACTIVE | {"completed"}
+            and self.weights(run) is not None
+            and self.remaining(run, info) != 0
+        )
+
+    def resume(self, run_id: str = "", name: str = "") -> dict[str, Any]:
+        """Continue an ended run in a new run that trains what was left.
+
+        A run that was stopped or reached a usage cap saved its optimizer,
+        random state and position, and is carried on exactly. Any other run
+        continues from its last saved weights with a fresh optimizer.
+        """
+        run = self.get(run_id)
+        if run["status"] in ACTIVE:
+            raise RuntimeError(f"Run '{run['id']}' is still running.")
+        weights = self.weights(run)
+        if weights is None:
+            raise RuntimeError(f"Run '{run['id']}' saved no weights to continue from.")
+        remaining = self.remaining(run)
+        if remaining == 0:
+            raise RuntimeError(f"Run '{run['id']}' already finished its iterations.")
+        options = self.options(run)
+        options["resume_adapter_file"] = str(weights)
+        state = weights.with_name(STATE_FILE)
+        notes = []
+        if state.is_file():
+            # A stopped or capped run: carry on exactly, with the same
+            # iterations and schedule as the whole run.
+            options["resume_state"] = str(state)
+        else:
+            # The run ended without saving its state (it failed or was
+            # killed): only its last saved weights can be carried over.
+            if remaining is not None:
+                options.pop("epochs", None)
+                options["iters"] = remaining
+            notes.append(
+                "No trainer state was saved, so this continues from the last "
+                "saved weights with a fresh optimizer."
+            )
+        label = name.strip() or f"{run.get('name') or run['id']} (continued)"
+        started = self.start(options, label)
+        started["continued_from"] = run["id"]
+        started["notes"] = [*started.get("notes", []), *notes]
+        self._save(started)
+        return started
+
+    def delete(self, run_id: str) -> dict[str, Any]:
+        """Remove a run's folder: its log, metrics and saved weights."""
+        if not run_id:
+            raise ValueError("Name the run to delete.")
+        run = self.get(run_id)
+        if run["status"] in ACTIVE:
+            raise RuntimeError(f"Run '{run['id']}' is still running. Stop it first.")
+        shutil.rmtree(self.root / run["id"])
+        self._procs.pop(run["id"], None)
+        return {"deleted": run["id"]}
+
+    def sample(self, run: dict[str, Any]) -> dict[str, Any]:
+        """The latest generation of a run whose algorithm generates text."""
+        try:
+            found = json.loads((self.root / run["id"] / SAMPLE_FILE).read_text())
+        except (OSError, ValueError):
+            found = None
+        return {"id": run["id"], "sample": found}
 
     def progress(self, run: dict[str, Any]) -> dict[str, Any]:
         """Latest metrics from the run's progress file."""
@@ -450,6 +565,8 @@ class RunManager:
                 info.setdefault("metrics", {}).update(event)
             elif kind == "capped":
                 info["capped"] = event.get("reason")
+            elif kind == "end":
+                info["finished"] = True
         return info
 
     def history(self, run: dict[str, Any], max_points: int = 400) -> dict[str, Any]:
@@ -521,9 +638,13 @@ class RunManager:
             "export_path",
             "log_path",
             "notes",
+            "continued_from",
         )
         out = {key: run.get(key) for key in keep}
-        out.update(self.progress(run))
+        info = self.progress(run)
+        info.pop("finished", None)
+        out.update(info)
+        out["can_continue"] = self.can_continue(run, info)
         if run["status"] == "failed":
             errors = [
                 row
@@ -647,7 +768,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-points", type=int, default=400
     )
     add("list", "List recent runs.").add_argument("--limit", type=int, default=20)
-    add("stop", "Stop a run; saved checkpoints are kept.", run=True)
+    add("stop", "Stop a run; its weights are saved first.", run=True)
+    add("continue", "Continue an ended run in a new run.", run=True).add_argument(
+        "--name", default="", help="Optional label for the new run."
+    )
+    add("config", "Show the options a run was started with.", run=True)
+    add("sample", "Show a run's latest generation, if it makes any.", run=True)
+    add("delete", "Delete an ended run and its files.").add_argument("run_id")
     return parser
 
 
@@ -672,11 +799,23 @@ def run_command(args: argparse.Namespace) -> Any:
         return {"runs": [manager.summary(r) for r in manager.runs()[: args.limit]]}
     if command == "stop":
         return manager.summary(manager.stop(args.run_id))
+    if command == "continue":
+        return manager.summary(manager.resume(args.run_id, args.name))
+    if command == "delete":
+        return manager.delete(args.run_id)
     run = manager.get(args.run_id)
     if command == "log":
         return {"id": run["id"], "log": manager.log_tail(run, args.lines)}
     if command == "history":
         return manager.history(run, args.max_points)
+    if command == "config":
+        return {
+            "id": run["id"],
+            "name": run.get("name"),
+            "options": manager.options(run),
+        }
+    if command == "sample":
+        return manager.sample(run)
     return manager.summary(run)
 
 

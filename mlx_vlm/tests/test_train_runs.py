@@ -31,6 +31,12 @@ echo '{"event": "train", "iteration": 5, "train_loss": 1.5}' >> progress.jsonl
 case "$FAKE_TRAIN" in
   fail) echo "ValueError: boom"; exit 1 ;;
   hang) exec sleep 60 ;;
+  wait)  # a trainer that saves and ends when asked to stop
+    while [ ! -e stop ]; do sleep 0.05; done
+    : > adapters/adapters.safetensors
+    : > adapters/trainer_state.safetensors
+    echo '{"event": "stopped", "iteration": 5}' >> progress.jsonl
+    exit 0 ;;
   capped) echo '{"event": "capped", "reason": "max_minutes (1) reached"}' >> progress.jsonl ;;
 esac
 echo '{"event": "validation", "iteration": 10, "val_loss": 1.2}' >> progress.jsonl
@@ -171,9 +177,13 @@ def test_run_saves_weights_when_a_cap_stops_training(tmp_path):
             "500",
         ]
     )
+    import mlx.core as mx
+
     trainer = MagicMock()
     trainer.args.iters = settings.iters
-    trainer.log_history = [{"iteration": 10, "train_loss": 2.0}]
+    trainer.args.adapter_file = str(tmp_path / "adapters.safetensors")
+    trainer.optimizer.state = {"step": mx.array(10), "weight": {"m": mx.zeros(2)}}
+    trainer.log_history = [{"iteration": 10, "optimizer_step": 10, "train_loss": 2.0}]
 
     def build_trainer(*_, training_callback=None, **__):
         def train():
@@ -193,6 +203,12 @@ def test_run_saves_weights_when_a_cap_stops_training(tmp_path):
         metrics = train_cli.run(args, settings)
     trainer.save_adapter.assert_called_once()
     assert metrics["iteration"] == 10
+    # The state to carry on from is saved beside the weights.
+    state, meta = mx.load(
+        str(tmp_path / "trainer_state.safetensors"), return_metadata=True
+    )
+    assert meta == {"iteration": "10", "optimizer_step": "10"}
+    assert {"optimizer.step", "optimizer.weight.m", "random.key"} <= set(state)
     events = [json.loads(line)["event"] for line in progress.read_text().splitlines()]
     assert events == ["start", "train", "capped"]
 
@@ -261,7 +277,7 @@ def test_concurrency_cap_and_stop(manager, monkeypatch):
     with pytest.raises(RuntimeError, match="1 of 1 concurrent runs"):
         manager.start({"model": "m"})
     assert manager.usage()["active_runs"] == 1
-    stopped = manager.stop(run["id"])
+    stopped = manager.stop(run["id"], save_s=0)
     assert stopped["status"] == "stopped"
     with pytest.raises(ProcessLookupError):
         os.killpg(run["pid"], 0)
@@ -411,3 +427,87 @@ def test_describe_reports_which_optimizers_read_an_option():
     assert set(options["beta1"]["requires"]["optimizer"]) <= set(
         options["optimizer"]["choices"]
     )
+
+
+def test_stop_lets_the_run_save_and_it_can_be_continued(manager, monkeypatch):
+    monkeypatch.setenv("FAKE_TRAIN", "wait")
+    first = manager.start({"model": "m", "algorithm": "sft", "iters": 10}, "job")
+    stopped = manager.stop(first["id"], save_s=10)
+    assert stopped["status"] == "stopped" and stopped["exit_code"] == 0
+    summary = manager.summary(stopped)
+    assert summary["can_continue"] and summary["iteration"] == 5
+
+    monkeypatch.delenv("FAKE_TRAIN")
+    second = manager.resume(first["id"])
+    assert (
+        second["continued_from"] == first["id"] and second["name"] == "job (continued)"
+    )
+    config = json.loads((manager.root / second["id"] / "config.json").read_text())
+    adapters = manager.root / first["id"] / "adapters"
+    # The whole run's iterations are kept; the trainer works out what is left.
+    assert config["iters"] == 10
+    assert config["resume_adapter_file"] == str(adapters / "adapters.safetensors")
+    assert config["resume_state"] == str(adapters / "trainer_state.safetensors")
+    assert manager.summary(wait_for_end(manager, second["id"]))["can_continue"] is False
+
+
+def test_continue_without_saved_state_restarts_from_the_weights(manager, monkeypatch):
+    monkeypatch.setenv("FAKE_TRAIN", "fail")
+    failed = wait_for_end(
+        manager, manager.start({"model": "m", "algorithm": "sft"})["id"]
+    )
+    with pytest.raises(RuntimeError, match="saved no weights"):
+        manager.resume(failed["id"])
+    (manager.root / failed["id"] / "adapters" / "adapters.safetensors").touch()
+    monkeypatch.delenv("FAKE_TRAIN")
+    resumed = manager.resume(failed["id"])
+    config = json.loads((manager.root / resumed["id"] / "config.json").read_text())
+    assert config["iters"] == 5 and "resume_state" not in config
+    assert "fresh optimizer" in resumed["notes"][-1]
+
+
+def test_options_of_a_run_leave_out_what_the_manager_set(manager):
+    run = manager.start({"model": "m", "algorithm": "sft", "iters": 7})
+    assert manager.options(run) == {"model": "m", "algorithm": "sft", "iters": 7}
+
+
+def test_delete_removes_an_ended_run_only(manager, monkeypatch):
+    monkeypatch.setenv("FAKE_TRAIN", "hang")
+    run = manager.start({"model": "m", "algorithm": "sft"})
+    with pytest.raises(RuntimeError, match="still running"):
+        manager.delete(run["id"])
+    manager.stop(run["id"], save_s=0)
+    assert manager.delete(run["id"]) == {"deleted": run["id"]}
+    assert not (manager.root / run["id"]).exists() and manager.runs() == []
+
+
+def test_sample_returns_the_latest_generation(manager, tmp_path):
+    from mlx_vlm.train import record_samples
+
+    run = wait_for_end(manager, manager.start({"model": "m", "algorithm": "sft"})["id"])
+    assert manager.sample(run)["sample"] is None
+
+    def exact(prompts, completions, answer, **_):
+        return [1.0 if c == a else 0.0 for c, a in zip(completions, answer)]
+
+    reward = record_samples(exact, manager.root / run["id"] / "last_generation.json")
+    assert reward.__name__ == "exact"
+    assert reward(prompts=["q"], completions=["x" * 9000], answer=["y"]) == [0.0]
+    assert reward(prompts=["q2"], completions=["a"], answer=["a"]) == [1.0]
+    sample = manager.sample(run)["sample"]
+    assert sample["prompt"] == "q2" and sample["completion"] == "a"
+    assert sample["reward"] == 1.0 and sample["group"] == 2
+
+
+def test_describe_offers_schedules_as_choices_with_their_options():
+    options = {
+        option["name"]: option
+        for option in describe()["tasks"]["vlm"]["algorithms"]["sft"]["options"]
+    }
+    assert options["lr_schedule"]["choices"] == ["cosine_decay", "linear_schedule"]
+    assert options["min_learning_rate"]["requires"] == {
+        "lr_schedule": ["cosine_decay", "linear_schedule"]
+    }
+    assert options["resume_state"]["group"] == "managed"
+    for schedule in options["lr_schedule"]["choices"]:
+        parse_args(["--model", "m", "--lr-schedule", schedule, "--warmup-steps", "2"])

@@ -31,7 +31,11 @@ Use `uv run mlx_vlm.train_runs ...` in a checkout, or `python -m mlx_vlm train_r
 | `status [run]` | Status, iteration, and latest metrics. No argument means the newest run. |
 | `log [run] --lines N` | The end of the run's log. |
 | `list` | Recent runs, newest first. |
-| `stop [run]` | Stop a run. Saved checkpoints are kept. |
+| `stop [run]` | Stop a run. It saves its weights and trainer state first, so it can be continued. |
+| `continue [run]` | Carry on an ended run in a new run. |
+| `config [run]` | The options a run was started with, for starting another like it. |
+| `sample [run]` | The latest generated output of a run that generates (GRPO). |
+| `delete <run>` | Remove an ended run and its files. Only when the user asks. |
 
 `run` is a run id, an unambiguous id prefix, or the `--name` label. Pass long option sets with `--options-file <path>` (`-` reads stdin).
 
@@ -159,7 +163,7 @@ A run that ends `capped` is not a failure. Its `status` has a `capped` reason an
 
 1. Tell the user which cap ended the run and the `iteration` reached out of `iters`.
 2. Report the last metrics so they can judge whether the result is already useful.
-3. Offer to continue in a new run: the same options plus `resume_adapter_file` set to the saved `adapters.safetensors`, with `iters` set to what remains. The optimizer starts fresh. This counts as a new run against the daily cap.
+3. Offer to continue with `continue <run>`. A stopped or capped run carries on exactly: same optimizer state, learning-rate schedule, random state and place in the data, training only the iterations left. A run that failed or was killed saved no state, so it continues from its last saved weights with a fresh optimizer, and `notes` says so. Either way this is a new run and counts against the daily cap.
 4. For a memory cap, continuing unchanged will stop again. Offer a lighter setup first: smaller `batch_size` or `max_seq_length`, `grad_checkpoint`, or a quantized base.
 
 Do not restart a capped run automatically. Ask first.

@@ -1,6 +1,7 @@
 """Thin shared CLI over the notebook Trainer API (python -m mlx_vlm.train)."""
 
 import argparse
+import contextlib
 import json
 import math
 import sys
@@ -39,6 +40,20 @@ def _parse_schedule(value):
         return value
     value = value.strip()
     return json.loads(value) if value.startswith("{") else value
+
+
+# Schedules that work from their name alone, offered as choices by ``describe``.
+NAMED_SCHEDULES = ("cosine_decay", "linear_schedule")
+
+
+def _named_schedule(schedule, learning_rate, min_learning_rate, updates, warmup):
+    """Give a bare ``linear_schedule`` its arguments; pass anything else on."""
+    if schedule != "linear_schedule":
+        return schedule
+    return {
+        "name": schedule,
+        "arguments": [learning_rate, min_learning_rate, max(updates - warmup, 1)],
+    }
 
 
 def registered_tasks():
@@ -136,8 +151,9 @@ def build_parser(task="vlm", algorithm=None):
     parser.add_argument(
         "--lr-schedule",
         type=_parse_schedule,
-        help="Schedule name (cosine_decay) or JSON/YAML object with name, "
-        "arguments, warmup, warmup_init. Steps count optimizer updates.",
+        help="cosine_decay or linear_schedule go from learning_rate to "
+        "min_learning_rate over the run. A JSON/YAML object with name, "
+        "arguments, warmup, warmup_init gives full control.",
     )
     parser.add_argument(
         "--warmup-steps",
@@ -150,7 +166,7 @@ def build_parser(task="vlm", algorithm=None):
         "--min-learning-rate",
         type=float,
         default=0.0,
-        help="Final rate for a bare cosine_decay schedule.",
+        help="Final rate for a bare cosine_decay or linear_schedule.",
     )
     parser.add_argument(
         "--train-type", choices=("lora", "dora", "full"), default="lora"
@@ -204,7 +220,13 @@ def build_parser(task="vlm", algorithm=None):
     parser.add_argument(
         "--resume-adapter-file",
         "--adapter-path",
-        help="Load weights; optimizer state is not restored.",
+        help="Load weights; add --resume-state to restore the optimizer too.",
+    )
+    parser.add_argument(
+        "--resume-state",
+        help="trainer_state.safetensors written when a run was stopped. Restores "
+        "the optimizer, random state and position, and trains the iterations "
+        "left of the same --iters/--epochs.",
     )
     parser.add_argument(
         "--output-path", help="Output file or folder; alias for --adapter-file."
@@ -326,7 +348,13 @@ def parse_args(argv=None, *, task="vlm"):
         )
     try:
         schedule = resolve_schedule_config(
-            args.lr_schedule,
+            _named_schedule(
+                args.lr_schedule,
+                args.learning_rate,
+                args.min_learning_rate,
+                10**9,
+                args.warmup_steps,
+            ),
             learning_rate=args.learning_rate,
             total_updates=10**9,
             warmup_steps=args.warmup_steps,
@@ -354,9 +382,16 @@ def parse_args(argv=None, *, task="vlm"):
 
 
 # Set by a run manager or the operator rather than chosen per run.
-MANAGED_OPTIONS = {"progress_file", "max_iters", "max_minutes", "max_memory_gb"}
+MANAGED_OPTIONS = {
+    "progress_file",
+    "max_iters",
+    "max_minutes",
+    "max_memory_gb",
+    "resume_state",
+}
 # Options only some optimizers read. ``describe`` reports them as ``requires``
 # so a host can hide an option the chosen optimizer ignores.
+SCHEDULE_OPTIONS = {"min_learning_rate": NAMED_SCHEDULES}
 OPTIMIZER_OPTIONS = {
     "beta1": ("adam", "adamw"),
     "beta2": ("adam", "adamw"),
@@ -416,12 +451,20 @@ def describe():
                     "flag": action.option_strings[0],
                     "type": _option_type(action, parser),
                     "default": default if default is not argparse.SUPPRESS else None,
-                    "choices": list(action.choices) if action.choices else None,
+                    "choices": (
+                        list(NAMED_SCHEDULES)
+                        if action.dest == "lr_schedule"
+                        else list(action.choices) if action.choices else None
+                    ),
                     "help": action.help,
                     "requires": (
                         {"optimizer": list(OPTIMIZER_OPTIONS[action.dest])}
                         if action.dest in OPTIMIZER_OPTIONS
-                        else None
+                        else (
+                            {"lr_schedule": list(SCHEDULE_OPTIONS[action.dest])}
+                            if action.dest in SCHEDULE_OPTIONS
+                            else None
+                        )
                     ),
                     "group": (
                         "training"
@@ -454,6 +497,54 @@ class UsageCapReached(Exception):
     """Raised from the progress callback to end training at a usage cap."""
 
 
+class StopRequested(Exception):
+    """Raised from the progress callback when the run was asked to stop."""
+
+
+STOP_FILE = "stop"  # beside the progress file; its presence asks a run to stop
+STATE_FILE = "trainer_state.safetensors"  # beside the saved weights
+SAMPLE_FILE = "last_generation.json"  # beside the progress file
+SAMPLE_CHARS = 4000
+
+
+def _clip(value):
+    text = value if isinstance(value, str) else json.dumps(value, default=str)
+    return text if len(text) <= SAMPLE_CHARS else text[:SAMPLE_CHARS] + " …"
+
+
+def record_samples(reward, path):
+    """Wrap a reward callback so the latest generation is kept in one file.
+
+    Only the first completion of the latest group is written, replacing the
+    previous one, so nothing accumulates in memory or on disk.
+    """
+    from functools import wraps
+
+    path, state = Path(path), {"calls": 0}
+
+    @wraps(reward)
+    def wrapped(*args, **kwargs):
+        scores = reward(*args, **kwargs)
+        state["calls"] += 1
+        with contextlib.suppress(Exception):  # never let this break training
+            first = lambda key: (kwargs.get(key) or [None])[0]  # noqa: E731
+            record = {
+                "time": time.time(),
+                "group": state["calls"],
+                "prompt": _clip(first("prompts")),
+                "completion": _clip(first("completions")),
+                "answer": _clip(first("answer")),
+                "reward": None if not scores or scores[0] is None else float(scores[0]),
+                "reward_function": getattr(reward, "__name__", None),
+            }
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(record))
+            tmp.replace(path)
+        return scores
+
+    return wrapped
+
+
 class ProgressCallback:
     """Write JSON-lines progress and enforce the wall-time and memory caps.
 
@@ -465,6 +556,10 @@ class ProgressCallback:
         self.path, self.wrapped = path, wrapped
         self.max_minutes, self.max_memory_gb = max_minutes, max_memory_gb
         self.started = time.monotonic()
+        # Set when a run continues another: iterations and optimizer updates
+        # already done, and the iterations of the whole run.
+        self.done, self.updates_done, self.total = 0, 0, None
+        self.last = {}  # the latest training report, as the trainer gave it
         if path:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
 
@@ -475,13 +570,31 @@ class ProgressCallback:
         with open(self.path, "a", encoding="utf-8") as file:
             file.write(json.dumps(record, default=float) + "\n")
 
+    def whole_run(self, info):
+        """Report positions within the whole run, not just this part of it."""
+        if not self.done:
+            return info
+        info = dict(info)
+        if "iteration" in info:
+            info["iteration"] += self.done
+            if self.total and "progress" in info:
+                info["progress"] = info["iteration"] / self.total
+        if "optimizer_step" in info:
+            info["optimizer_step"] += self.updates_done
+        return info
+
     def on_train_loss_report(self, train_info):
         import mlx.core as mx
 
         memory = mx.get_active_memory() / 1e9
-        self.write("train", **train_info, active_memory_gb=round(memory, 3))
+        self.last = dict(train_info)
+        self.write(
+            "train", **self.whole_run(train_info), active_memory_gb=round(memory, 3)
+        )
         if self.wrapped is not None:
             self.wrapped.on_train_loss_report(train_info)
+        if self.path and (Path(self.path).parent / STOP_FILE).exists():
+            raise StopRequested("stop requested")
         minutes = (time.monotonic() - self.started) / 60
         if self.max_minutes and minutes >= self.max_minutes:
             raise UsageCapReached(f"max_minutes ({self.max_minutes:g}) reached")
@@ -491,9 +604,83 @@ class ProgressCallback:
             )
 
     def on_val_loss_report(self, val_info):
-        self.write("validation", **val_info)
+        self.write("validation", **self.whole_run(val_info))
         if self.wrapped is not None:
             self.wrapped.on_val_loss_report(val_info)
+
+
+def save_trainer_state(trainer, iteration, optimizer_step):
+    """Save what a later run needs to carry on exactly where this one ended."""
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+
+    arrays = {"optimizer." + k: v for k, v in tree_flatten(trainer.optimizer.state)}
+    arrays["random.key"] = mx.random.state[0]
+    path = Path(trainer.args.adapter_file).parent / STATE_FILE
+    mx.save_safetensors(
+        str(path),
+        arrays,
+        metadata={"iteration": str(iteration), "optimizer_step": str(optimizer_step)},
+    )
+    return path
+
+
+def restore_trainer_state(trainer, path, progress=None):
+    """Continue a stopped run: same optimizer, random state and data position.
+
+    ``trainer.args.iters`` still counts the whole run here, so the schedule
+    was built as before; only the iterations left are trained. Batches the
+    earlier run already used are drawn and discarded to reach its position.
+    """
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+
+    arrays, meta = mx.load(str(path), return_metadata=True)
+    done, updates = int(meta["iteration"]), int(meta["optimizer_step"])
+    total = trainer.args.iters
+    if done >= total:
+        raise ValueError(f"The run already trained its {total} iterations.")
+    saved = {k[10:]: v for k, v in arrays.items() if k[:10] == "optimizer."}
+    optimizer, init = trainer.optimizer, trainer.optimizer.init
+
+    def init_and_restore(parameters):
+        init(parameters)
+        # Write each saved value over the fresh one at the same place, so the
+        # state keeps the shape the optimizer built for these weights.
+        if set(saved) != {key for key, _ in tree_flatten(optimizer.state)}:
+            raise ValueError(
+                "The saved optimizer state does not match this run's optimizer "
+                "or trainable weights."
+            )
+        for key, value in saved.items():
+            *parents, leaf = key.split(".")
+            node = optimizer.state
+            for part in parents:
+                node = node[int(part)] if isinstance(node, list) else node[part]
+            if isinstance(node, list):
+                node[int(leaf)] = value
+            else:
+                node[leaf] = value
+        if "random.key" in arrays:
+            mx.random.state[0][:] = arrays["random.key"]
+
+    optimizer.init = init_and_restore
+    batches = trainer.task.batches
+
+    def later_batches(*args, **kwargs):
+        iterator = iter(batches(*args, **kwargs))
+        if kwargs.get("train"):
+            for _ in range(done):
+                next(iterator)
+            if "random.key" in arrays:  # drawing batches must not move it
+                mx.random.state[0][:] = arrays["random.key"]
+        return iterator
+
+    trainer.task.batches = later_batches
+    trainer.args.iters = total - done
+    if progress is not None:
+        progress.done, progress.updates_done, progress.total = done, updates, total
+    return done, total
 
 
 def _load_model(task, path):
@@ -578,10 +765,17 @@ def build_optimizer(args, iters, accumulation_steps=1):
     if args.optimizer in OPTIMIZER_OPTIONS["weight_decay"]:
         options["weight_decay"] = args.weight_decay
     learning_rate = args.learning_rate
+    updates = total_optimizer_updates(iters, accumulation_steps)
     config = resolve_schedule_config(
-        args.lr_schedule,
+        _named_schedule(
+            args.lr_schedule,
+            args.learning_rate,
+            args.min_learning_rate,
+            updates,
+            args.warmup_steps,
+        ),
         learning_rate=args.learning_rate,
-        total_updates=total_optimizer_updates(iters, accumulation_steps),
+        total_updates=updates,
         warmup_steps=args.warmup_steps,
         warmup_init=args.warmup_init,
         min_learning_rate=args.min_learning_rate,
@@ -655,11 +849,15 @@ def run(args, settings, training_callback=None):
             )
             rewards = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(rewards)
+        reward_funcs = [
+            getattr(rewards, name.strip()) for name in args.reward_functions.split(",")
+        ]
+        if getattr(args, "progress_file", None):
+            reward_funcs[0] = record_samples(
+                reward_funcs[0], Path(args.progress_file).parent / SAMPLE_FILE
+            )
         reward_options = {
-            "reward_funcs": [
-                getattr(rewards, name.strip())
-                for name in args.reward_functions.split(",")
-            ],
+            "reward_funcs": reward_funcs,
             "reward_weights": args.reward_weights,
         }
     optimizer = build_optimizer(
@@ -698,14 +896,33 @@ def run(args, settings, training_callback=None):
         )
     if max_iters and trainer.args.iters > max_iters:
         raise ValueError(f"iters {trainer.args.iters} is over the cap of {max_iters}.")
+    total_iters, resumed_at = trainer.args.iters, 0
+    if getattr(args, "resume_state", None):
+        if not args.resume_adapter_file:
+            raise ValueError("--resume-state needs --resume-adapter-file.")
+        resumed_at, _ = restore_trainer_state(trainer, args.resume_state, progress)
+        print(f"Continuing at iteration {resumed_at + 1} of {total_iters}.")
     if progress is not None:
         progress.write(
             "start",
             task=args.task,
             algorithm=args.algorithm,
-            iters=trainer.args.iters,
+            iters=total_iters,
+            resumed_at=resumed_at,
             adapter_file=settings.adapter_file,
         )
+
+    def interrupted(event, **info):
+        """Keep the work so far, and the state to carry on from it."""
+        trainer.save_adapter()
+        metrics = progress.whole_run(progress.last)
+        if "iteration" in metrics:
+            save_trainer_state(
+                trainer, metrics["iteration"], metrics.get("optimizer_step", 0)
+            )
+        progress.write(event, **info, **metrics)
+        return metrics
+
     callback = None
     try:
         if args.wandb and mx.distributed.init().rank() == 0:
@@ -720,13 +937,14 @@ def run(args, settings, training_callback=None):
             metrics = trainer.train()
         except UsageCapReached as reached:
             # Keep the work done so far; the cap is not a failure.
-            trainer.save_adapter()
             print(f"Stopped at usage cap: {reached}. Weights saved.", file=sys.stderr)
-            metrics = dict(trainer.log_history[-1]) if trainer.log_history else {}
-            progress.write("capped", reason=str(reached), **metrics)
+            metrics = interrupted("capped", reason=str(reached))
+        except StopRequested:
+            print("Stopped on request. Weights saved.", file=sys.stderr)
+            metrics = interrupted("stopped")
         else:
             if progress is not None:
-                progress.write("end", **metrics)
+                progress.write("end", **progress.whole_run(metrics))
         if getattr(args, "export_qat_path", None):
             from .export import export_model
 
