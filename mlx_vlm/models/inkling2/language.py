@@ -22,6 +22,7 @@ import mlx.nn as nn
 from ..base import LanguageModelOutput
 from ..cache import (
     ArraysCache,
+    AttentionSinkKVCache,
     BatchRotatingKVCache,
     CacheList,
     KVCache,
@@ -445,12 +446,15 @@ class Attention(nn.Module):
             sinks = sinks[..., self.head_start : self.head_start + self.n_heads]
         sinks = sinks.transpose(0, 2, 1)[..., None]
         mask = mx.concatenate([mask, sinks], axis=-1)
-        k = mx.concatenate(
-            [k, mx.zeros((b, self.n_kv, 1, self.head_dim), k.dtype)], axis=2
-        )
-        v = mx.concatenate(
-            [v, mx.zeros((b, self.n_kv, 1, self.head_dim), v.dtype)], axis=2
-        )
+        if isinstance(kv, AttentionSinkKVCache):
+            k, v = kv.with_sink(size)
+        else:
+            k = mx.concatenate(
+                [k, mx.zeros((b, self.n_kv, 1, self.head_dim), k.dtype)], axis=2
+            )
+            v = mx.concatenate(
+                [v, mx.zeros((b, self.n_kv, 1, self.head_dim), v.dtype)], axis=2
+            )
         out = mx.fast.scaled_dot_product_attention(
             q, k, v, scale=self.head_dim**-0.5, mask=mask
         )
@@ -878,15 +882,14 @@ class LanguageModel(InklingLanguageModel):
         return logits[..., : self.config.unpadded_vocab_size]
 
     def make_cache(self):
+        def attention_cache(layer):
+            window = self.config.sliding_window_size if layer.is_sliding else None
+            if self.model.loop is not None:
+                return AttentionSinkKVCache(window)
+            return RotatingKVCache(max_size=window, keep=0) if window else KVCache()
+
         return [
-            CacheList(
-                (
-                    RotatingKVCache(max_size=self.config.sliding_window_size, keep=0)
-                    if self.model.layers[i].is_sliding
-                    else KVCache()
-                ),
-                ArraysCache(4),
-            )
+            CacheList(attention_cache(self.model.layers[i]), ArraysCache(4))
             for i in self.model.layer_indices
         ]
 

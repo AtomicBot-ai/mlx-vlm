@@ -960,6 +960,8 @@ def _make_cache(
                     "disable KV quantization for continuous batching"
                 )
             return c.to_batch(left_padding)
+        if isinstance(c, cache.AttentionSinkKVCache) and c.max_size is not None:
+            return cache.BatchRotatingKVCache(c.max_size, left_padding)
         if isinstance(c, cache.KVCache):
             if kv_bits is not None and quantize:
                 return _make_quant_cache(left_padding)
