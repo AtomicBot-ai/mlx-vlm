@@ -657,6 +657,31 @@ def test_options_of_a_run_leave_out_what_the_manager_set(manager):
     assert manager.options(run) == {"model": "m", "algorithm": "sft", "iters": 7}
 
 
+def test_failed_continuation_drops_ancestor_state(manager, monkeypatch):
+    from mlx_vlm.tests.test_training_cli import TinyVLM
+    from mlx_vlm.trainer.common.utils import save_trainable_weights
+
+    monkeypatch.setenv("FAKE_TRAIN", "wait")
+    first = manager.stop(manager.start({"model": "m", "iters": 10})["id"])
+    monkeypatch.setenv("FAKE_TRAIN", "fail")
+    second = wait_for_end(manager, manager.resume(first["id"])["id"])
+    weights = Path(second["adapter_path"]) / "adapters.safetensors"
+    save_trainable_weights(TinyVLM(), weights, iteration=2)
+    progress = Path(second["progress_path"])
+    progress.write_text(
+        '{"event":"start","iters":10,"resumed_at":5}\n'
+        '{"event":"train","iteration":9}\n'
+    )
+    monkeypatch.delenv("FAKE_TRAIN")
+    third = wait_for_end(manager, manager.resume(second["id"])["id"])
+    options = manager.options(third)
+    assert options["resume_adapter_file"] == str(weights)
+    assert "resume_state" not in options and options["iters"] == 3
+    Path(third["progress_path"]).unlink()
+    with pytest.raises(RuntimeError, match="already finished"):
+        manager.resume(third["id"])
+
+
 def test_delete_removes_an_ended_run_only(manager, monkeypatch):
     monkeypatch.setenv("FAKE_TRAIN", "hang")
     run = manager.start({"model": "m", "algorithm": "sft"})

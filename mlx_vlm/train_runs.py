@@ -526,7 +526,23 @@ class RunManager:
         info = self.progress(run) if info is None else info
         if not info.get("iters"):
             return None
-        return max(int(info["iters"]) - int(info.get("iteration") or 0), 0)
+        position = int(info.get("iteration") or 0)
+        weights = self.weights(run)
+        if (
+            run["status"] in {"failed", "stopped"}
+            and weights
+            and not weights.with_name(STATE_FILE).exists()
+        ):
+            from safetensors import SafetensorError, safe_open
+
+            # A crash can fall between a progress report and a weight save.
+            # Older checkpoints did not record the local iteration.
+            with contextlib.suppress(OSError, SafetensorError):
+                with safe_open(weights, framework="numpy") as checkpoint:
+                    saved = (checkpoint.metadata() or {}).get("training_iteration")
+                if saved is not None:
+                    position = int(info.get("resumed_at", 0)) + int(saved)
+        return max(int(info["iters"]) - position, 0)
 
     def can_continue(
         self, run: dict[str, Any], info: dict[str, Any] | None = None
@@ -547,6 +563,8 @@ class RunManager:
         run = self.get(run_id)
         if run["status"] in ACTIVE:
             raise RuntimeError(f"Run '{run['id']}' is still running.")
+        if run["status"] == "completed":
+            raise RuntimeError(f"Run '{run['id']}' already finished its iterations.")
         weights = self.weights(run)
         if weights is None:
             raise RuntimeError(f"Run '{run['id']}' saved no weights to continue from.")
@@ -564,6 +582,7 @@ class RunManager:
         else:
             # The run ended without saving its state (it failed or was
             # killed): only its last saved weights can be carried over.
+            options.pop("resume_state", None)
             if remaining is not None:
                 options.pop("epochs", None)
                 options["iters"] = remaining
@@ -611,6 +630,7 @@ class RunManager:
             event.pop("time", None)
             if kind == "start":
                 info["iters"] = event.get("iters")
+                info["resumed_at"] = info["iteration"] = event.get("resumed_at", 0)
             elif kind in ("train", "validation"):
                 info["iteration"] = event.get("iteration", info.get("iteration"))
                 info.setdefault("metrics", {}).update(event)

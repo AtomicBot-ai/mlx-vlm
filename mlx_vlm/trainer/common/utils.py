@@ -362,7 +362,8 @@ def save_trainable_weights(
 
         weights, head_weights = split_mtp_weights(weights)
         save_mtp_head(head, head_weights, mtp_head_dir(destination))
-    mx.save_safetensors(str(destination), weights)
+    metadata = {"training_iteration": str(iteration)} if iteration is not None else None
+    mx.save_safetensors(str(destination), weights, metadata=metadata)
     config = getattr(model, "config", None)
     adapter_config = getattr(model, "_vlm_adapter_config", None)
     if adapter_config is None:
@@ -379,7 +380,7 @@ def save_trainable_weights(
         return
 
     checkpoint = destination.with_name(f"{iteration:07d}_{destination.name}")
-    mx.save_safetensors(str(checkpoint), weights)
+    mx.save_safetensors(str(checkpoint), weights, metadata=metadata)
     if head is not None:
         save_mtp_head(head, head_weights, mtp_head_dir(checkpoint))
     tqdm.write(
