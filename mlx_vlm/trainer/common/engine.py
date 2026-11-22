@@ -1,7 +1,9 @@
 """One MLX training loop for all modalities and objectives."""
 
 import time
+from dataclasses import dataclass
 from itertools import islice
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -21,6 +23,14 @@ from mlx_vlm.trainer.common.utils import (
     apply_gradient_step,
     save_trainable_weights,
 )
+
+
+@dataclass
+class GradientAccumulation:
+    """Sum of gradients for the microbatches since the last optimizer update."""
+
+    gradients: Any = None
+    microsteps: int = 0
 
 
 def evaluate(
@@ -73,6 +83,7 @@ def train(
     seed: int | None = None,
     *,
     log_history: list[dict] | None = None,
+    accumulation: GradientAccumulation | None = None,
 ) -> dict:
     """Optimize microbatches; return the final training metrics.
 
@@ -121,7 +132,8 @@ def train(
     iterator = iter(task.batches(train_dataset, train=True, seed=seed))
     save = task.save_weights or save_trainable_weights
     model.train()
-    gradients = None
+    if accumulation is None:
+        accumulation = GradientAccumulation()
     accumulator = MetricAccumulator()
     elapsed, data_elapsed, report_steps, trained, optimizer_step = 0.0, 0.0, 0, 0, 0
     compute_total, data_total, reported_updates = 0.0, 0.0, 0
@@ -135,24 +147,29 @@ def train(
         extra = task.loss_args(batch) if task.loss_args is not None else ()
         data_elapsed += time.perf_counter() - data_start
         start = time.perf_counter()
-        update = iteration % args.gradient_accumulation_steps == 0
-        loss, batch_metrics, gradients = step(batch, gradients, update, *extra)
+        microsteps = accumulation.microsteps + 1
+        update = microsteps == args.gradient_accumulation_steps
+        loss, batch_metrics, accumulation.gradients = step(
+            batch, accumulation.gradients, update, *extra
+        )
+        accumulation.microsteps = 0 if update else microsteps
         optimizer_step += int(update)
         accumulator.add(loss, batch_metrics)
         del loss, batch_metrics, batch, extra
-        mx.eval(state, accumulator.state(), gradients)
+        mx.eval(state, accumulator.state(), accumulation.gradients)
         report_steps += 1
         if iteration == args.iters:
             partial = apply_final_accumulated_gradients(
                 model,
                 optimizer,
-                gradients,
-                iteration,
+                accumulation.gradients,
+                accumulation.microsteps,
                 args.gradient_accumulation_steps,
                 args.grad_clip,
             )
             optimizer_step += int(partial > 0)
-            gradients = None
+            accumulation.gradients = None
+            accumulation.microsteps = 0
         elapsed += time.perf_counter() - start
         if iteration % args.steps_per_report == 0 or iteration == args.iters:
             values = accumulator.compute()

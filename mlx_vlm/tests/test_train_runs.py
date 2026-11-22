@@ -209,7 +209,11 @@ def test_run_saves_weights_when_a_cap_stops_training(tmp_path):
     state, meta = mx.load(
         str(tmp_path / "trainer_state.safetensors"), return_metadata=True
     )
-    assert meta == {"iteration": "10", "optimizer_step": "10"}
+    assert meta == {
+        "iteration": "10",
+        "optimizer_step": "10",
+        "pending_microsteps": "0",
+    }
     assert {"optimizer.step", "optimizer.weight.m", "random.key"} <= set(state)
     events = [json.loads(line)["event"] for line in progress.read_text().splitlines()]
     assert events == ["start", "train", "capped"]
@@ -288,6 +292,143 @@ def _distributed_stop_worker(root):
         ):
             metrics = train_cli.run(args, settings)
         assert metrics["iteration"] == 1
+    _check_accumulation_resume(Path(root) / "distributed-resume")
+
+
+def _check_accumulation_resume(root, compile_steps=False):
+    import mlx.core as mx
+    import numpy as np
+
+    from mlx_vlm.tests.test_training_cli import TinyVLM
+
+    world = mx.distributed.init()
+    rank = world.rank()
+    rows = [{"text": str(i)} for i in range(4)]
+
+    def prepare(*, prompts, **kwargs):
+        # Distinct microbatches and worker gradients expose dropped sums.
+        token = 1 + int(prompts[0]) + 4 * rank
+        return {"input_ids": np.array([[token, 2, 3, 4]])}
+
+    for name, previous, stop in (
+        ("baseline", None, False),
+        ("first", None, True),
+        ("second", "first", True),
+        ("resumed", "second", False),
+    ):
+        directory = root / name
+        flags = [
+            "--model",
+            "tiny",
+            "--train-type",
+            "full",
+            "--batch-size",
+            str(world.size()),
+            "--iters",
+            "5",
+            "--gradient-accumulation-steps",
+            "3",
+            "--steps-per-report",
+            "1",
+            "--optimizer",
+            "sgd",
+            "--learning-rate",
+            "0.03",
+            "--progress-file",
+            str(directory / "progress.jsonl"),
+            "--adapter-file",
+            str(directory / "adapters.safetensors"),
+        ]
+        if compile_steps:
+            flags.append("--compile")
+        if previous:
+            flags += [
+                "--resume-adapter-file",
+                str(root / previous / "adapters.safetensors"),
+                "--resume-state",
+                str(root / previous / "trainer_state.safetensors"),
+            ]
+        args, settings = parse_args(flags)
+        if stop and rank == 0:
+            directory.mkdir(parents=True)
+            (directory / "stop").touch()
+        with (
+            patch.object(
+                train_cli,
+                "_load_model",
+                side_effect=lambda *_: (TinyVLM(), SimpleNamespace(pad_token_id=0)),
+            ),
+            patch.object(train_cli, "_load_dataset", return_value={"train": rows}),
+            patch(
+                "mlx_vlm.trainer.vlm.cross_entropy.dataset._load_vlm_helpers",
+                return_value=({}, None, prepare, None),
+            ),
+        ):
+            train_cli.run(args, settings)
+        if world.size() > 1:
+            mx.eval(mx.distributed.all_sum(mx.array(1), stream=mx.cpu))
+        if stop:
+            arrays, meta = mx.load(
+                str(directory / "trainer_state.safetensors"), return_metadata=True
+            )
+            assert meta["pending_microsteps"] == ("1" if name == "first" else "2")
+            assert "gradient.projection.weight" in arrays
+
+    for name in ("baseline", "resumed"):
+        end = json.loads((root / name / "progress.jsonl").read_text().splitlines()[-1])
+        assert (end["event"], end["iteration"], end["optimizer_step"]) == ("end", 5, 2)
+    baseline, resumed = [
+        mx.load(str(root / name / "adapters.safetensors"))
+        for name in ("baseline", "resumed")
+    ]
+    assert resumed.keys() == baseline.keys()
+    for key in baseline:
+        if world.size() == 1:
+            assert mx.array_equal(baseline[key], resumed[key]).item(), key
+        else:
+            assert mx.allclose(
+                baseline[key], resumed[key], atol=1e-7, rtol=1e-6
+            ).item(), key
+
+
+@pytest.mark.parametrize("compile_steps", [False, True])
+def test_resume_preserves_pending_gradients_and_final_partial_update(
+    tmp_path, compile_steps
+):
+    _check_accumulation_resume(tmp_path, compile_steps)
+
+
+def test_legacy_accumulation_state_and_incompatible_windows(tmp_path):
+    import mlx.core as mx
+    import mlx.optimizers as optim
+
+    from mlx_vlm.tests.test_training_cli import TinyVLM
+
+    path = tmp_path / "trainer_state.safetensors"
+    model = TinyVLM()
+    trainer = SimpleNamespace(
+        model=model,
+        args=SimpleNamespace(iters=5, gradient_accumulation_steps=3),
+        optimizer=optim.SGD(0.1),
+        task=SimpleNamespace(batches=iter),
+    )
+    meta = {"iteration": "1", "optimizer_step": "0"}
+    mx.save_safetensors(str(path), {"optimizer.step": mx.array(0)}, metadata=meta)
+    assert train_cli.restore_trainer_state(trainer, path) == (1, 5)
+    assert (
+        trainer.accumulation.microsteps == 0 and trainer.accumulation.gradients is None
+    )
+    mx.save_safetensors(
+        str(path),
+        {"gradient.projection.weight": model.projection.weight},
+        metadata={
+            **meta,
+            "pending_microsteps": "1",
+            "gradient_accumulation_steps": "2",
+        },
+    )
+    with pytest.raises(ValueError, match="original gradient_accumulation_steps"):
+        train_cli.restore_trainer_state(trainer, path)
 
 
 def test_stop_and_caps_exit_all_ranks_at_the_same_report(tmp_path):
@@ -526,6 +667,7 @@ def test_local_paths_become_absolute(tmp_path):
 
 def _tiny_training_cli():
     import numpy as np
+
     from mlx_vlm.tests.test_training_cli import TinyVLM
 
     def prepare(**kwargs):
@@ -609,6 +751,7 @@ def test_inspect_dataset_reports_splits(tmp_path):
 
 def test_inspection_fetches_a_bounded_sample_without_retaining_media():
     import weakref
+
     from mlx_vlm.train_runs import _describe_split
 
     class Image:

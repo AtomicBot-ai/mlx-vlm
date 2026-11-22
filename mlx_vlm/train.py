@@ -655,11 +655,23 @@ def save_trainer_state(trainer, iteration, optimizer_step):
 
     arrays = {"optimizer." + k: v for k, v in tree_flatten(trainer.optimizer.state)}
     arrays["random.key"] = mx.random.state[0]
+    accumulation = trainer.accumulation
+    metadata = {"iteration": str(iteration), "optimizer_step": str(optimizer_step)}
+    if accumulation is not None:
+        metadata["pending_microsteps"] = str(accumulation.microsteps)
+        if accumulation.microsteps:
+            metadata["gradient_accumulation_steps"] = str(
+                trainer.args.gradient_accumulation_steps
+            )
+            arrays.update(
+                ("gradient." + key, grad)
+                for key, grad in tree_flatten(accumulation.gradients)
+            )
     path = Path(trainer.args.adapter_file).parent / STATE_FILE
     mx.save_safetensors(
         str(path),
         arrays,
-        metadata={"iteration": str(iteration), "optimizer_step": str(optimizer_step)},
+        metadata=metadata,
     )
     return path
 
@@ -672,13 +684,39 @@ def restore_trainer_state(trainer, path, progress=None):
     earlier run already used are drawn and discarded to reach its position.
     """
     import mlx.core as mx
-    from mlx.utils import tree_flatten
+    from mlx.utils import tree_flatten, tree_map_with_path
+
+    from .trainer.common.engine import GradientAccumulation
 
     arrays, meta = mx.load(str(path), return_metadata=True)
     done, updates = int(meta["iteration"]), int(meta["optimizer_step"])
     total = trainer.args.iters
     if done >= total:
         raise ValueError(f"The run already trained its {total} iterations.")
+    pending = int(meta.get("pending_microsteps", 0))
+    window = trainer.args.gradient_accumulation_steps
+    gradients = {
+        k.removeprefix("gradient."): v
+        for k, v in arrays.items()
+        if k.startswith("gradient.")
+    }
+    if not 0 <= pending < window or bool(pending) != bool(gradients):
+        raise ValueError("Invalid pending gradient accumulation in trainer state.")
+    trainer.accumulation = GradientAccumulation()
+    if pending:
+        if int(meta["gradient_accumulation_steps"]) != window:
+            raise ValueError(
+                "Pending gradients require the original gradient_accumulation_steps."
+            )
+        parameters = trainer.model.trainable_parameters()
+        if {k: v.shape for k, v in tree_flatten(parameters)} != {
+            k: v.shape for k, v in gradients.items()
+        }:
+            raise ValueError("Saved gradients do not match the trainable weights.")
+        trainer.accumulation = GradientAccumulation(
+            tree_map_with_path(lambda key, _: gradients[key], parameters), pending
+        )
+    random_key = arrays.get("random.key")
     saved = {k[10:]: v for k, v in arrays.items() if k[:10] == "optimizer."}
     optimizer, init = trainer.optimizer, trainer.optimizer.init
 
@@ -700,8 +738,8 @@ def restore_trainer_state(trainer, path, progress=None):
                 node[int(leaf)] = value
             else:
                 node[leaf] = value
-        if "random.key" in arrays:
-            mx.random.state[0][:] = arrays["random.key"]
+        if random_key is not None:
+            mx.random.state[0][:] = random_key
 
     optimizer.init = init_and_restore
     batches = trainer.task.batches
@@ -711,8 +749,8 @@ def restore_trainer_state(trainer, path, progress=None):
         if kwargs.get("train"):
             for _ in range(done):
                 next(iterator)
-            if "random.key" in arrays:  # drawing batches must not move it
-                mx.random.state[0][:] = arrays["random.key"]
+            if random_key is not None:  # drawing batches must not move it
+                mx.random.state[0][:] = random_key
         return iterator
 
     trainer.task.batches = later_batches
@@ -937,6 +975,10 @@ def run(args, settings, training_callback=None):
     if max_iters and trainer.args.iters > max_iters:
         raise ValueError(f"iters {trainer.args.iters} is over the cap of {max_iters}.")
     total_iters, resumed_at = trainer.args.iters, 0
+    if progress is not None:
+        from .trainer.common.engine import GradientAccumulation
+
+        trainer.accumulation = GradientAccumulation()
     if getattr(args, "resume_state", None):
         if not args.resume_adapter_file:
             raise ValueError("--resume-state needs --resume-adapter-file.")
@@ -956,6 +998,15 @@ def run(args, settings, training_callback=None):
     def interrupted(event, **info):
         """Keep the work so far, and the state to carry on from it."""
         metrics = progress.whole_run(progress.last)
+        if trainer.accumulation.microsteps and progress.world.size() > 1:
+            from mlx.nn.utils import average_gradients
+
+            # Each rank has a different partial sum. Restoring their mean on
+            # every rank preserves its contribution at the next gradient reduction.
+            trainer.accumulation.gradients = average_gradients(
+                trainer.accumulation.gradients
+            )
+            mx.eval(trainer.accumulation.gradients)
         if not primary:
             return metrics
         trainer.save_adapter()

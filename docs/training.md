@@ -396,6 +396,9 @@ usage cap continues the same way. A run that failed or was killed saved no
 state and continues from its last saved weights with a fresh optimizer. The
 same works from the CLI with `--resume-adapter-file` plus `--resume-state`.
 Validation and checkpoint intervals are counted from where the new run starts.
+New trainer-state files also preserve pending gradients and their microbatch
+count when a run stops between optimizer updates. Older files saved mid-window
+start a fresh accumulation window because they lack those gradients.
 
 Caps are set by whoever launches the manager, as flags before the command or
 as environment variables, and are passed on to every run:
