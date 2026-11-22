@@ -20,5 +20,7 @@ def test_math_vista_integer_ignores_commas_in_prose(response, expected):
     assert evaluate_answer(prediction, expected)
 
 
-def test_math_vista_integer_answer_pattern_keeps_comma_grouping():
-    assert normalize_answer("So, the answer is 1,024.", INTEGER_PROBLEM) == "1024"
+def test_math_vista_explicit_integer_answer_takes_precedence_over_last_number():
+    response = "The answer is 1,024 after doubling 512."
+
+    assert normalize_answer(response, INTEGER_PROBLEM) == "1024"
