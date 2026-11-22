@@ -87,6 +87,7 @@ jobs:
             extras: 'test,cpu'
             tests: >-
               tests/test_checkpoint_transfer.py
+              tests/test_evals.py
               tests/test_cli.py
               tests/test_generate.py
               tests/test_sampling_defaults.py
