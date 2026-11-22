@@ -365,6 +365,48 @@ def test_existing_orpo_pipeline_prints_train_and_validation_metrics(tmp_path, ca
     assert (tmp_path / "adapters.safetensors").is_file()
 
 
+@pytest.mark.parametrize("accumulation_steps", [2, 3], ids=["full", "partial"])
+@pytest.mark.parametrize("grad_clip,expected", [(1.0, -1 / math.sqrt(2)), (None, -3.0)])
+def test_legacy_orpo_clips_averaged_gradient(
+    tmp_path, accumulation_steps, grad_clip, expected
+):
+    class TokenScores(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scores = mx.zeros((2,))
+
+        def __call__(self, input_ids, pixel_values, attention_mask):
+            scores = self.scores[input_ids]
+            return mx.stack([scores, mx.zeros_like(scores)], axis=-1)
+
+    def loss(
+        chosen_logps, chosen_logits, rejected_logps, rejected_logits, *masks, beta
+    ):
+        return 8 * chosen_logits - 2 * rejected_logits, {}
+
+    # Swapping the pair gives gradients [8, -2] and [-2, 8]. Their mean is
+    # [3, 3], while clipping each microbatch elementwise at 1 would cancel them.
+    left, right = mx.array([0, 1]), mx.array([1, 0])
+    rows = [
+        {"chosen_input_ids": left, "rejected_input_ids": right},
+        {"chosen_input_ids": right, "rejected_input_ids": left},
+    ]
+    model = TokenScores()
+    args = LegacyORPOTrainingArgs(
+        iters=2,
+        batch_size=1,
+        max_seq_length=2,
+        gradient_accumulation_steps=accumulation_steps,
+        grad_clip=grad_clip,
+        adapter_file=str(tmp_path / "adapters.safetensors"),
+    )
+    metrics = train_orpo(
+        model, optim.SGD(learning_rate=1.0), rows, args=args, loss_fn=loss
+    )
+    assert metrics["optimizer_step"] == 1
+    assert model.scores.tolist() == pytest.approx([expected, expected], abs=1e-6)
+
+
 @pytest.mark.parametrize("legacy", [False, True])
 def test_public_orpo_trains_both_dataset_formats_through_shared_engine(
     legacy, tmp_path

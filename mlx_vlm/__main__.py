@@ -16,6 +16,8 @@ if __name__ == "__main__":
         "chat_ui",
         "server",
         "moe_offload",
+        "train",
+        "train_runs",
     }
 
     if len(sys.argv) < 2:
