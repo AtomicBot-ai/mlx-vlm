@@ -10,6 +10,10 @@ class TrainingCallback:
     are passed through, so pipelines can include their own additional metrics.
     """
 
+    # Opt in when training reports must participate in a collective on every
+    # rank. Validation and ordinary metric callbacks still run on rank zero.
+    train_report_on_all_ranks = False
+
     def on_train_loss_report(self, train_info: dict) -> None:
         """Receive training metrics at the trainer's reporting interval."""
 

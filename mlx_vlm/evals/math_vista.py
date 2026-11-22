@@ -157,9 +157,9 @@ def normalize_answer(response: str, problem: dict) -> Optional[str]:
         # Try common answer patterns near the end
         end_section = response[-500:] if len(response) > 500 else response
         answer_patterns = [
-            r"(?:the\s+)?answer\s+is\s+(-?[\d,]+\.?\d*[eE][+-]?\d+|-?[\d,]+)",
-            r"answer:\s*(-?[\d,]+\.?\d*[eE][+-]?\d+|-?[\d,]+)",
-            r"(?:total|result|left|remaining)(?:\s+is|\s+are|:)\s*(-?[\d,]+\.?\d*[eE][+-]?\d+|-?[\d,]+)",
+            r"(?:the\s+)?answer\s+is\s+(-?\d[\d,]*\.?\d*[eE][+-]?\d+|-?\d[\d,]*)",
+            r"answer:\s*(-?\d[\d,]*\.?\d*[eE][+-]?\d+|-?\d[\d,]*)",
+            r"(?:total|result|left|remaining)(?:\s+is|\s+are|:)\s*(-?\d[\d,]*\.?\d*[eE][+-]?\d+|-?\d[\d,]*)",
         ]
 
         for pattern in answer_patterns:
@@ -181,8 +181,9 @@ def normalize_answer(response: str, problem: dict) -> Optional[str]:
                 pass
 
         # Fall back to finding all numbers (including comma-formatted) and taking the last one
-        # Match numbers with optional commas: 7,518 or 7518
-        numbers = re.findall(r"-?[\d,]+", response)
+        # Match numbers with optional commas: 7,518 or 7518. A number must start with a
+        # digit, so a comma in the prose is not taken as a number.
+        numbers = re.findall(r"-?\d[\d,]*", response)
         if numbers:
             try:
                 # Remove commas and try the last number first

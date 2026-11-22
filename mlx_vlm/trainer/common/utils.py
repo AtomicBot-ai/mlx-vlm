@@ -70,6 +70,13 @@ def pad_arrays(
     return result
 
 
+def batch_shuffle_rng(seed: int | None, world_size: int):
+    """Use the same batch order on every rank, preserving unseeded single-rank runs."""
+    if seed is None and world_size > 1:
+        seed = 0
+    return np.random if seed is None else np.random.default_rng(seed)
+
+
 def iterate_batch_indices(
     size: int,
     batch_size: int,
@@ -116,9 +123,7 @@ def iterate_batch_indices(
     del groups, indices
     local_size = batch_size // world_size
     local_start = rank * local_size
-    if seed is None and world_size > 1:
-        seed = 0
-    rng = np.random if seed is None else np.random.default_rng(seed)
+    rng = batch_shuffle_rng(seed, world_size)
     while True:
         order = rng.permutation(len(batches)) if train else range(len(batches))
         for position in order:
@@ -255,22 +260,46 @@ def accumulate_gradients(gradients, previous=None):
     )
 
 
+def average_worker_gradients(gradients, group):
+    """Average gradients across ranks for an optimizer update or checkpoint."""
+    if group.size() == 1:
+        return gradients
+    if not mx.metal.is_available():
+        return average_gradients(gradients, group=group)
+    # Finish the ring collective before a GPU command buffer consumes it
+    # (Metal watchdog, #2179). MLX drops the explicit stream when its
+    # grouped reduction falls back recursively for mixed dtypes.
+    dtypes = {g.dtype for _, g in tree_flatten(gradients)}
+    options = {"all_reduce_size": 0} if len(dtypes) > 1 else {}
+    with mx.stream(mx.cpu):
+        gradients = average_gradients(
+            gradients, group=group, communication_stream=mx.cpu, **options
+        )
+    mx.eval(gradients)
+    return gradients
+
+
 def apply_accumulated_gradients(
     model: nn.Module,
     optimizer,
     gradients,
     steps: int,
     grad_clip: float | None = None,
+    *,
+    optimizer_update: Callable | None = None,
 ) -> None:
     """Average across workers and actual microsteps, then update the model."""
     if steps < 1:
         raise ValueError("Accumulation steps must be at least 1.")
-    gradients = average_gradients(gradients)
+    gradients = average_worker_gradients(gradients, mx.distributed.init())
     if steps > 1:
         gradients = tree_map(lambda value: value / steps, gradients)
     if grad_clip is not None:
         gradients, _ = optim.clip_grad_norm(gradients, grad_clip)
-    apply_optimizer_update(model, optimizer, gradients)
+    if optimizer_update is None:
+        apply_optimizer_update(model, optimizer, gradients)
+    else:
+        optimizer_update(model, gradients)
 
 
 def apply_gradient_step(
@@ -284,6 +313,7 @@ def apply_gradient_step(
     accumulation_steps: int,
     loss_args: Sequence[Any] = (),
     grad_clip: float | None = None,
+    optimizer_update: Callable | None = None,
 ) -> tuple[Any, Any, Any]:
     """Evaluate one batch, accumulate its gradient, and optionally update.
 
@@ -296,7 +326,12 @@ def apply_gradient_step(
     gradients = accumulate_gradients(gradients, previous_gradients)
     if update:
         apply_accumulated_gradients(
-            model, optimizer, gradients, accumulation_steps, grad_clip
+            model,
+            optimizer,
+            gradients,
+            accumulation_steps,
+            grad_clip,
+            optimizer_update=optimizer_update,
         )
         gradients = None
     return loss_value, metrics, gradients
@@ -309,6 +344,8 @@ def apply_final_accumulated_gradients(
     total_steps: int,
     accumulation_steps: int,
     grad_clip: float | None = None,
+    *,
+    optimizer_update: Callable | None = None,
 ) -> int:
     """Apply a final incomplete accumulation and return its microstep count."""
     if total_steps < 0:
@@ -320,7 +357,14 @@ def apply_final_accumulated_gradients(
     if gradients is None or partial_steps == 0:
         return 0
 
-    apply_accumulated_gradients(model, optimizer, gradients, partial_steps, grad_clip)
+    apply_accumulated_gradients(
+        model,
+        optimizer,
+        gradients,
+        partial_steps,
+        grad_clip,
+        optimizer_update=optimizer_update,
+    )
     mx.eval(model.state, optimizer.state)
     return partial_steps
 
@@ -362,7 +406,8 @@ def save_trainable_weights(
 
         weights, head_weights = split_mtp_weights(weights)
         save_mtp_head(head, head_weights, mtp_head_dir(destination))
-    mx.save_safetensors(str(destination), weights)
+    metadata = {"training_iteration": str(iteration)} if iteration is not None else None
+    mx.save_safetensors(str(destination), weights, metadata=metadata)
     config = getattr(model, "config", None)
     adapter_config = getattr(model, "_vlm_adapter_config", None)
     if adapter_config is None:
@@ -379,7 +424,7 @@ def save_trainable_weights(
         return
 
     checkpoint = destination.with_name(f"{iteration:07d}_{destination.name}")
-    mx.save_safetensors(str(checkpoint), weights)
+    mx.save_safetensors(str(checkpoint), weights, metadata=metadata)
     if head is not None:
         save_mtp_head(head, head_weights, mtp_head_dir(checkpoint))
     tqdm.write(
