@@ -999,12 +999,12 @@ def run(args, settings, training_callback=None):
         """Keep the work so far, and the state to carry on from it."""
         metrics = progress.whole_run(progress.last)
         if trainer.accumulation.microsteps and progress.world.size() > 1:
-            from mlx.nn.utils import average_gradients
+            from .trainer.common.utils import average_worker_gradients
 
             # Each rank has a different partial sum. Restoring their mean on
             # every rank preserves its contribution at the next gradient reduction.
-            trainer.accumulation.gradients = average_gradients(
-                trainer.accumulation.gradients
+            trainer.accumulation.gradients = average_worker_gradients(
+                trainer.accumulation.gradients, progress.world
             )
             mx.eval(trainer.accumulation.gradients)
         if not primary:

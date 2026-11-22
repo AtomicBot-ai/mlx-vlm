@@ -480,8 +480,11 @@ They use their original argument classes. The public `ORPOTrainingArgs` now
 configures the notebook/shared engine API; import
 `mlx_vlm.trainer.vlm.orpo.trainer.ORPOTrainingArgs` (also exposed as
 `mlx_vlm.trainer.vlm.LegacyORPOTrainingArgs`) for the older `ORPOTrainer` /
-`train_orpo` recipe. `TrainingArgs` continues to configure the older SFT recipe;
-use `VLMTrainingArgs` with the new `Trainer`.
+`train_orpo` recipe.
+
+`train(..., args=TrainingArgs(...))` and `SFTTrainer.fit()` run on the shared
+engine and keep their historical batch format, loss arguments, checkpoint names,
+and `None` return value.
 
 ## GRPO with optional vision inputs
 

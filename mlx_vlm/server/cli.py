@@ -54,7 +54,7 @@ def main():
         "--model",
         type=str,
         default=None,
-        help="Pre-load a language model at startup (e.g. mlx-community/Qwen2.5-VL-3B-Instruct-4bit).",
+        help="Pre-load a language model in the background; monitor readiness and progress at /health.",
     )
     distributed_mode = parser.add_mutually_exclusive_group()
     distributed_mode.add_argument(

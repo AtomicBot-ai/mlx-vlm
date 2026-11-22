@@ -201,7 +201,7 @@ class ToolCallDeltaState:
                 try:
                     parsed = self.module.parse_tool_call(body.strip(), self.tools)
                     parsed = [parsed] if isinstance(parsed, dict) else iter(parsed)
-                except (ValueError, KeyError, TypeError):
+                except (ValueError, KeyError, TypeError, SyntaxError):
                     if len(self.calls) > self.offset:
                         raise
                     parsed = []

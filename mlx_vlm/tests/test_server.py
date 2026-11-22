@@ -52,6 +52,7 @@ from mlx_vlm import apc, sample_utils
 from mlx_vlm.apc import hash_image_payload
 from mlx_vlm.generate import GenerationResult
 from mlx_vlm.generate.image import ImageGenerationResult
+from mlx_vlm.load_progress import ModelLoadCancelled
 from mlx_vlm.models.cache import KVCache
 from mlx_vlm.models.gpt_oss.processing_gpt_oss import (
     HARMONY_RESPONSE_TEMPLATE,
@@ -232,6 +233,53 @@ class _HarmonyResponseTemplateTokenizer:
         return ResponseParser(self.response_template, prefix=prefix)
 
 
+# The response template shipped in Inkling 2's tokenizer_config.json.
+_INKLING_HEADER = r"(?:<\|message_model\|>[^<]*)?"
+_INKLING_RESPONSE_TEMPLATE = {
+    "defaults": {"role": "assistant"},
+    "start_anchor_pattern": r"<\|end_message\|>|<\|content_model_end_sampling\|>",
+    "fields": {
+        "reasoning_content": {
+            "open_pattern": _INKLING_HEADER + r"<\|content_thinking\|>",
+            "close": "<|end_message|>",
+            "repeats": True,
+            "join": "",
+            "content": "text",
+            "content_args": {"strip": False},
+        },
+        "content": {
+            "open_pattern": _INKLING_HEADER
+            + r"<\|content_(?:text|tool_error|invoke_tool_text)\|>",
+            "close": "<|end_message|>",
+            "repeats": True,
+            "join": "",
+            "content": "text",
+            "content_args": {"strip": False},
+        },
+        "tool_calls": {
+            "open_pattern": _INKLING_HEADER + r"<\|content_invoke_tool_json\|>",
+            "close": "<|end_message|>",
+            "repeats": True,
+            "content": "json",
+            "transform": {
+                "type": "function",
+                "function": {"name": "{content.name}", "arguments": "{content.args}"},
+            },
+        },
+    },
+}
+
+
+class _InklingResponseTemplateTokenizer:
+    response_template = _INKLING_RESPONSE_TEMPLATE
+
+    def parse_response(self, response, prefix=None):
+        return parse_response(response, self.response_template, prefix=prefix)
+
+    def get_response_parser(self, prefix=None):
+        return ResponseParser(self.response_template, prefix=prefix)
+
+
 def _harmony_processor():
     """A processor prepared exactly as the gpt-oss loader prepares it."""
     return _attach_harmony_template(NS(tokenizer=_HarmonyResponseTemplateTokenizer()))
@@ -344,6 +392,12 @@ _JSON_TOOLS = NS(
     tool_call_start="<tool_call>",
     tool_call_end="</tool_call>",
     parse_tool_call=lambda call, tools: json.loads(call),
+)
+_INKLING_CALL = (
+    "<|message_model|><|content_thinking|>I need the weather tool.<|end_message|>"
+    "<|message_model|><|content_text|>Checking.<|end_message|>"
+    "<|message_model|>get_weather<|content_invoke_tool_json|>"
+    '{"name":"get_weather","args":{"city":"Warsaw"}}<|end_message|>'
 )
 _MUSE_CALL = (
     "to=self<|message|>I need the weather tool.<|eom|>"
@@ -1620,6 +1674,8 @@ def _reset_runtime(monkeypatch, **overrides):
         model_cache=server.ModelCacheRegistry(),
         response_generator=None,
         model_load_progress=None,
+        preload_in_progress=False,
+        preload_failures={},
         apc_manager=None,
     )
     for name, value in (state | overrides).items():
@@ -2060,6 +2116,35 @@ def test_model_resources_forward_loading_observer(monkeypatch, distributed):
         "demo", None, progress_callback=events.append
     ) == (model, processor, model.config)
     assert events == [{"stage": "loading_checkpoint"}]
+
+
+def test_cancelled_loader_releases_partial_weights(monkeypatch, caplog):
+    owners = []
+
+    class Weights:
+        pass
+
+    def load(*args, progress_callback, **kwargs):
+        weights = Weights()
+        owners.append(weakref.ref(weights))
+        progress_callback({"stage": "evaluating_layers"})
+
+    def cancel(event):
+        raise ModelLoadCancelled("shutdown")
+
+    monkeypatch.setattr(generation, "load", load)
+    monkeypatch.setattr(server.runtime, "distributed_worker", None)
+    gen = _generator(load_progress_callback=cancel)
+    worker = Thread(target=gen._run)
+    worker.start()
+    worker.join(5)
+    assert not worker.is_alive()
+    assert gen._ready.is_set()
+    assert isinstance(gen._load_error, ModelLoadCancelled)
+    assert gen._load_error.__traceback__ is None
+    gc.collect()
+    assert owners[0]() is None
+    assert not any(r.levelno >= logging.ERROR for r in caplog.records)
 
 
 def test_server_caches_apc_mode_when_model_initializes(monkeypatch):
@@ -3646,6 +3731,43 @@ def test_response_template_tool_calls(client, api):
         arguments = call["input"]
     assert call["name"] == "get_weather" and arguments == {"city": "Warsaw"}
     assert "to=self" not in response.text and "<atem:" not in response.text
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_inkling_tool_calls(client, stream):
+    config = NS(model_type="inkling2")
+    chunks = [_INKLING_CALL[i : i + 9] for i in range(0, len(_INKLING_CALL), 9)]
+    tokens = [*map(_token, chunks), _token(finish_reason="stop")]
+    with _endpoint(
+        config=config,
+        processor=NS(config=config, tokenizer=_InklingResponseTemplateTokenizer()),
+        result=_result(_INKLING_CALL),
+        generator=_streaming(tokens) if stream else None,
+        parser=load_tool_module("inkling"),
+    ):
+        response = _post(client, tools=[_tool()], stream=stream)
+    assert response.status_code == 200
+    if stream:
+        choices = [c["choices"][0] for c in _data(response) if c.get("choices")]
+        deltas = [choice["delta"] for choice in choices]
+        message = dict(
+            reasoning_content=_joined(deltas, "reasoning_content"),
+            content=_joined(deltas, "content"),
+            tool_calls=choices[-1]["delta"]["tool_calls"],
+        )
+        finish_reason = choices[-1]["finish_reason"]
+    else:
+        choice = response.json()["choices"][0]
+        message, finish_reason = choice["message"], choice["finish_reason"]
+    (call,) = message["tool_calls"]
+    assert finish_reason == "tool_calls"
+    assert call["function"]["name"] == "get_weather"
+    assert json.loads(call["function"]["arguments"]) == {"city": "Warsaw"}
+    assert message["reasoning_content"] == "I need the weather tool."
+    # Neither the thinking nor the call's recipient header reaches content. A
+    # non-streamed response slices out every message beside a call.
+    assert message["content"] == ("Checking." if stream else None)
+    assert "<|" not in response.text
 
 
 def test_chat_completions_endpoint_falls_back_from_video_to_images(client):
@@ -6358,6 +6480,32 @@ class TestResponseGenerator:
                 processor=gen.processor,
             )
 
+    def test_server_apc_key_includes_per_video_timing(self):
+        gen = _ready_generator(
+            apc_manager=object(),
+            apc_mode="block",
+            model=NS(language_model=NS()),
+            processor=NS(),
+        )
+        video = mx.zeros((8, 4))
+        inputs = [
+            dict(
+                input_ids=mx.array([[1, 2]]),
+                pixel_values_videos=video,
+                second_per_grid_ts=mx.array(seconds),
+            )
+            for seconds in ([1.0, 0.5], [0.5, 1.0])
+        ]
+        gen._preprocess_request = MagicMock(side_effect=inputs)
+        queued = _capture_requests(gen, prompt_tokens=2)
+        for _ in inputs:
+            _, tokens = gen.generate(
+                "prompt", videos=["a.mp4", "b.mp4"], args=Args(max_tokens=1)
+            )
+            tokens.close()
+
+        assert queued[0].apc_semantic_hash != queued[1].apc_semantic_hash
+
     def test_runtime_context_limit(self, monkeypatch):
         monkeypatch.setenv("MAX_KV_SIZE", "8")
         _reset_runtime(
@@ -6994,7 +7142,10 @@ class TestResponseGenerator:
             monkeypatch.setenv("MLX_VLM_PRELOAD_" + key, kind)
         calls = []
 
-        def load(model_path, adapter_path=None, *, model_kind="auto"):
+        def load(
+            model_path, adapter_path=None, *, model_kind="auto", cancel_event=None
+        ):
+            assert (cancel_event is not None) == (model_kind == "text_generation")
             calls.append(model_kind)
             if model_kind == "audio_stt":
                 raise server.HTTPException(
@@ -7008,7 +7159,12 @@ class TestResponseGenerator:
 
         async def run():
             async with server._app_module.lifespan(server.app):
-                pass
+
+                async def wait_for_preloads():
+                    while server.runtime.preload_in_progress:
+                        await asyncio.sleep(0.001)
+
+                await asyncio.wait_for(wait_for_preloads(), 5)
 
         asyncio.run(run())
         assert calls == list(kinds.values())
@@ -7782,6 +7938,204 @@ def settings_client(monkeypatch, tmp_path):
         if not generator.stopped:
             generator.stop_and_join()
     client.close()
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_startup_preload_serves_progress_and_recovers(
+    settings_client, monkeypatch, fail
+):
+    _, generators = settings_client
+    for key in list(os.environ):
+        if key.startswith("MLX_VLM_PRELOAD_"):
+            monkeypatch.delenv(key)
+    monkeypatch.setenv("MLX_VLM_PRELOAD_MODEL", "demo")
+    monkeypatch.setenv("MLX_VLM_SERVER_API_KEY", "test-key")
+    entered, release = Event(), Event()
+    generator_class = server._app_module.ResponseGenerator
+    ready = generator_class.wait_until_ready
+
+    def loading(self):
+        self.load_progress_callback(
+            {"stage": "evaluating_layers", "completed_layers": 1, "total_layers": 2}
+        )
+        entered.set()
+        assert release.wait(5)
+        if fail and len(generators) == 1:
+            raise ValueError("broken checkpoint")
+        return ready(self)
+
+    monkeypatch.setattr(generator_class, "wait_until_ready", loading)
+    monkeypatch.setattr(
+        generator_class,
+        "_cpu_preprocess",
+        lambda *a, **k: {"input_ids": np.array([[1, 2, 3]])},
+        raising=False,
+    )
+    monkeypatch.setattr(openai, "apply_chat_template", lambda *a, **k: "prompt")
+    monkeypatch.setattr(
+        openai,
+        "_build_gen_args",
+        lambda *a, **k: NS(
+            to_template_kwargs=lambda: {}, preprocessing_kwargs=lambda: {}
+        ),
+    )
+
+    async def check():
+        async with server._app_module.lifespan(server.app):
+            # Lifespan startup has returned while the loader is still blocked.
+            try:
+                assert await asyncio.to_thread(entered.wait, 2)
+                async with httpx2.AsyncClient(
+                    transport=httpx2.ASGITransport(app=server.app),
+                    base_url="http://test",
+                    headers={"Authorization": "Bearer test-key"},
+                ) as client:
+                    denied = await client.get(
+                        "/health", headers={"Authorization": "wrong"}
+                    )
+                    assert denied.status_code == 401
+                    health = await asyncio.wait_for(client.get("/health"), 1)
+                    body = health.json()
+                    assert body["status"] == "healthy" and not body["model_ready"]
+                    assert body["preload_in_progress"] and body["loaded_model"] is None
+                    assert body["model_load_progress"]["stage_percent"] == 50.0
+                    metrics = (await client.get("/metrics")).json()["server"]
+                    assert metrics["model_load_progress"] == body["model_load_progress"]
+                    for route in (
+                        "/v1/responses",
+                        "/v1/chat/completions",
+                        "/v1/messages",
+                        "/v1/responses/input_tokens",
+                    ):
+                        pending = await client.post(
+                            route,
+                            json={
+                                "model": "demo",
+                                "input": "Hello",
+                                "messages": [{"role": "user", "content": "Hello"}],
+                                "max_tokens": 8,
+                            },
+                        )
+                        assert pending.status_code == 503
+                        assert pending.json()["detail"]["code"] == "model_loading"
+                        assert pending.headers["Retry-After"] == "1"
+                    assert (await client.post("/unload")).status_code == 409
+                    assert (
+                        await client.patch("/v1/settings", json={})
+                    ).status_code == 409
+                    assert len(generators) == 1
+                    release.set()
+
+                    async def finished():
+                        while server.runtime.preload_in_progress:
+                            await asyncio.sleep(0.001)
+
+                    await asyncio.wait_for(finished(), 2)
+                    body = (await client.get("/health")).json()
+                    assert body["model_ready"] is not fail
+                    assert body["model_load_progress"]["stage"] == (
+                        "failed" if fail else "ready"
+                    )
+                    if fail:
+                        assert generators[0].stopped
+                        assert (
+                            body["preload_failures"]["text_generation"]["error"]
+                            == "broken checkpoint"
+                        )
+                    # Successful preloads are reused; failed ones can be retried normally.
+                    retry = await client.post(
+                        "/v1/responses/input_tokens",
+                        json={"model": "demo", "input": "Hello"},
+                    )
+                    assert retry.status_code == 200
+                    assert len(generators) == (2 if fail else 1)
+                    assert (await client.get("/health")).json()["model_ready"]
+            finally:
+                release.set()
+        assert all(g.stopped for g in generators)
+        assert (
+            not server.runtime.model_cache and server.runtime.response_generator is None
+        )
+
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("cancel_shutdown", [False, True])
+def test_shutdown_cancels_preload_at_next_boundary(
+    settings_client, monkeypatch, cancel_shutdown
+):
+    _, generators = settings_client
+    monkeypatch.setenv("MLX_VLM_PRELOAD_MODEL", "demo")
+    monkeypatch.setenv("MLX_VLM_PRELOAD_MESH_MODEL", "must-not-start")
+    entered, release = Event(), Event()
+    generator_class = server._app_module.ResponseGenerator
+    ready = Mock(wraps=generator_class.wait_until_ready)
+
+    def loading(self):
+        self.load_progress_callback(
+            {"stage": "evaluating_layers", "completed_layers": 0, "total_layers": 2}
+        )
+        entered.set()
+        # Stand in for one indivisible native evaluation already in progress.
+        assert release.wait(5)
+        self.load_progress_callback(
+            {"stage": "evaluating_layers", "completed_layers": 1, "total_layers": 2}
+        )
+        return ready(self)
+
+    monkeypatch.setattr(generator_class, "wait_until_ready", loading)
+    mesh = Mock(side_effect=AssertionError("Shutdown must skip the next preload"))
+    monkeypatch.setattr(server._app_module, "load_3d_model", mesh)
+
+    async def check():
+        context = server._app_module.lifespan(server.app)
+        await context.__aenter__()
+        assert await asyncio.to_thread(entered.wait, 2)
+        closing = asyncio.create_task(context.__aexit__(None, None, None))
+        try:
+            await asyncio.sleep(0.05)
+            if cancel_shutdown:
+                closing.cancel()
+                await asyncio.sleep(0)
+            assert not closing.done() and not generators[0].stopped
+        finally:
+            release.set()
+            if cancel_shutdown:
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(closing, 2)
+            else:
+                await asyncio.wait_for(closing, 2)
+        assert generators[0].stopped and not server.runtime.model_cache
+        assert not server.runtime.preload_in_progress
+        assert not server.runtime.preload_failures
+        ready.assert_not_called()
+        mesh.assert_not_called()
+
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("when", ["before_start", "after_initialize"])
+def test_preload_cancellation_does_not_publish_model(settings_client, when):
+    _, generators = settings_client
+    stopping = Event()
+    if when == "before_start":
+        stopping.set()
+
+    original = server._app_module.ResponseGenerator.wait_until_ready
+
+    def ready(self):
+        result = original(self)
+        stopping.set()
+        return result
+
+    with patch.object(server._app_module.ResponseGenerator, "wait_until_ready", ready):
+        with pytest.raises(ModelLoadCancelled):
+            server._app_module.get_cached_model("demo", cancel_event=stopping)
+    assert len(generators) == (when == "after_initialize")
+    assert all(g.stopped for g in generators)
+    assert not server.runtime.model_cache
+    assert server.runtime.response_generator is None
+    assert server.runtime.apc_manager is None
 
 
 @pytest.mark.parametrize("fail", [False, True])

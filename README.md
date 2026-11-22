@@ -61,8 +61,9 @@ Some models have detailed documentation with prompt formats, examples, and best 
 
 | Model | Documentation |
 |-------|---------------|
-| Inkling 2 Small | [Docs](mlx_vlm/models/inkling2/README.md) |
+| Inkling 2 Mini and Small | [Docs](mlx_vlm/models/inkling2/README.md) |
 | LFM3 / LFM3-VL | [Docs](mlx_vlm/models/lfm3/README.md) |
+| SenseNova-Loop-9B | [Docs](mlx_vlm/models/sensenova_loop/README.md) |
 | LFM3-Audio | [Docs](mlx_vlm/models/lfm3_audio/README.md) |
 | LFM3-Omni | [Docs](mlx_vlm/models/lfm3_omni/README.md) |
 | DeepSeek-OCR | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/deepseekocr/README.md) |
@@ -93,6 +94,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | PP-DocLayoutV3 | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/pp_doclayout_v3/README.md) |
 | Granite Vision 3.2 | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/granite_vision/README.md) |
 | Granite Vision (4.0, 4.1) | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/granite4_vision/README.md) |
+| Granite for Docling | [Docs](mlx_vlm/models/granite_docling/README.md) |
 | MiniCPM-OCR 1.0 | [Docs](mlx_vlm/models/minicpm_ocr/README.md) |
 | MiniCPM-OCR Jev | [Docs](mlx_vlm/models/minicpm_ocr_jev/README.md) |
 | MiniCPM-V 4.7 | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/minicpmv4_7/README.md) |
@@ -108,6 +110,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | Ripple | [Docs](mlx_vlm/models/ricursive/README.md) |
 | Nemotron 3.5 Super VL / Bolt / Nano Omni | [Docs](mlx_vlm/models/nemotron_h_nano_omni/README.md) |
 | Idol (image to 3D Gaussian splats) | [Docs](mlx_vlm/models/idol/README.md) |
+| Depth Pro 2 (image and video depth) | [Docs](mlx_vlm/models/depth_pro_2/README.md) · [S](https://huggingface.co/nativ-community/DepthPro2-S) · [B](https://huggingface.co/nativ-community/DepthPro2-B) · [L](https://huggingface.co/nativ-community/DepthPro2-L) · [H+](https://huggingface.co/nativ-community/DepthPro2-H) |
 
 ## Installation
 
@@ -205,12 +208,14 @@ mlx_vlm.generate --model mlx-community/Qwen3.5-2B-4bit \
 
 | Flag | Description |
 |------|-------------|
-| `--enable-thinking` | Activate thinking mode in the chat template |
+| `--enable-thinking` / `--no-enable-thinking` | Enable / disable thinking in the chat template; omit both to use the model's default |
 | `--thinking-budget` | Max tokens allowed inside the thinking block |
 | `--thinking-start-token` | Token that opens a thinking block (default: `<think>`) |
 | `--thinking-end-token` | Token that closes a thinking block (default: `</think>`) |
 
-When the budget is exceeded, the model is forced to emit `\n</think>` and transition to the answer. If `--enable-thinking` is passed but the model's chat template does not support it, the budget is applied only if the model generates the start token on its own.
+For `mlx_vlm.generate` (including `--chat`) and `mlx_vlm.chat`, omitting both thinking flags preserves the model's chat-template default. Use `--no-enable-thinking` to explicitly request a response without thinking when supported by the model. `--thinking-mode` takes precedence for templates that use that setting.
+
+When the budget is exceeded, the model is forced to emit `\n</think>` and transition to the answer. The budget also works with the model's default thinking mode: it starts counting when the prompt leaves a thinking block open or the model generates the start token. Closed thinking blocks in earlier turns do not count toward the budget.
 
 On the server, thinking mode is disabled by default. Start the server with `--enable-thinking` to make thinking mode the default for requests that do not specify it:
 

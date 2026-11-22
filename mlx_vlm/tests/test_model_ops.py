@@ -1278,6 +1278,88 @@ def test_mrope_rope_index_handles_fully_masked_rows(module_name):
     assert rope_deltas.tolist()[0] == [0]
 
 
+def _qwen2_5_vl_rope_model(tokens_per_second=2):
+    module = importlib.import_module("mlx_vlm.models.qwen2_5_vl.language")
+    lm = module.LanguageModel.__new__(module.LanguageModel)
+    config = _mrope_config()
+    config.vision_config.tokens_per_second = tokens_per_second
+    lm.config = config
+    return lm
+
+
+def test_qwen2_5_vl_video_rope_index_scales_temporal_positions():
+    lm = _qwen2_5_vl_rope_model()
+    # vision_start + two video tokens (grid 2x2x2, merge 2) + two text tokens.
+    input_ids = mx.array([[100, 102, 102, 5, 6]], dtype=mx.int32)
+    video_grid_thw = mx.array([[2, 2, 2]], dtype=mx.int32)
+
+    # Without second_per_grid_ts each temporal grid defaults to one second,
+    # so temporal positions step by tokens_per_second (2), not by 1.
+    position_ids, deltas = lm.get_rope_index(input_ids, video_grid_thw=video_grid_thw)
+    mx.eval(position_ids, deltas)
+    # get_rope_index returns integer positions (HF LongTensor parity), even
+    # though the temporal axis is scaled through a float intermediate.
+    assert position_ids.dtype == mx.int32
+    assert position_ids[0, 0].tolist() == [0, 1, 3, 4, 5]
+    assert position_ids[1, 0].tolist() == [0, 1, 1, 4, 5]
+    assert position_ids[2, 0].tolist() == [0, 1, 1, 4, 5]
+    assert deltas.tolist() == [[1]]
+
+    # Explicit seconds-per-grid rescales the temporal axis only.
+    for seconds in ([0.5], mx.array([0.5])):
+        position_ids, deltas = lm.get_rope_index(
+            input_ids, video_grid_thw=video_grid_thw, second_per_grid_ts=seconds
+        )
+        mx.eval(position_ids, deltas)
+        assert position_ids[0, 0].tolist() == [0, 1, 2, 3, 4]
+        assert position_ids[1, 0].tolist() == [0, 1, 1, 3, 4]
+        assert deltas.tolist() == [[0]]
+
+
+def test_qwen2_5_vl_video_rope_index_uses_per_video_seconds():
+    lm = _qwen2_5_vl_rope_model()
+    input_ids = mx.array([[100, 102, 102, 100, 102, 102, 5]], dtype=mx.int32)
+    video_grid_thw = mx.array([[2, 2, 2], [2, 2, 2]], dtype=mx.int32)
+
+    position_ids, deltas = lm.get_rope_index(
+        input_ids,
+        video_grid_thw=video_grid_thw,
+        second_per_grid_ts=[0.5, 1.0],
+    )
+    mx.eval(position_ids, deltas)
+    assert position_ids[0, 0].tolist() == [0, 1, 2, 3, 4, 6, 7]
+    assert deltas.tolist() == [[1]]
+
+
+def test_qwen2_5_vl_fractional_video_positions_do_not_accumulate_across_clips():
+    lm = _qwen2_5_vl_rope_model()
+    tokens = mx.array([[100, 102, 102, 100, 102, 102, 5]])
+    positions, deltas = lm.get_rope_index(
+        tokens,
+        video_grid_thw=mx.array([[2, 2, 2], [2, 2, 2]]),
+        second_per_grid_ts=mx.array([0.75, 0.75]),
+    )
+    # Transformers 4.49 quantizes each temporal index before advancing the
+    # next span from the maximum position of the previous span.
+    assert positions[0, 0].tolist() == [0, 1, 2, 3, 4, 5, 6]
+    assert deltas.dtype == tokens.dtype
+    assert deltas.item() == 0
+
+
+def test_qwen2_5_vl_image_rope_index_keeps_unit_temporal_spacing():
+    lm = _qwen2_5_vl_rope_model()
+    input_ids = mx.array([[100, 101, 5, 6]], dtype=mx.int32)
+    image_grid_thw = mx.array([[1, 2, 2]], dtype=mx.int32)
+
+    baseline, _ = lm.get_rope_index(input_ids, image_grid_thw=image_grid_thw)
+    scaled, _ = lm.get_rope_index(
+        input_ids, image_grid_thw=image_grid_thw, second_per_grid_ts=[0.5]
+    )
+    mx.eval(baseline, scaled)
+    assert mx.array_equal(baseline, scaled)
+    assert baseline[0, 0].tolist() == [0, 1, 2, 3]
+
+
 def test_glm_ocr_rope_index_handles_fully_masked_rows():
     module = importlib.import_module("mlx_vlm.models.glm_ocr.language")
     lm = module.LanguageModel.__new__(module.LanguageModel)

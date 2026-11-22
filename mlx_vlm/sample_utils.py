@@ -285,6 +285,10 @@ def apply_min_p(
         raise ValueError(
             f"`min_tokens_to_keep` has to be a positive integer, but is {min_tokens_to_keep}"
         )
+    if min_p == 0:
+        # A zero threshold keeps every token; skip the filter so that
+        # `math.log(0)` never runs.
+        return logprobs
     return _apply_min_p(logprobs, min_p, min_tokens_to_keep)
 
 
@@ -390,7 +394,8 @@ def apply_xtc(
         )
 
     probs = mx.softmax(logits, -1)
-    mask = probs > mx.where(probs > xtc_threshold, probs, mx.inf).min()
+    cutoff = mx.where(probs > xtc_threshold, probs, mx.inf).min(axis=-1, keepdims=True)
+    mask = probs > cutoff
     if xtc_special_tokens:
         mask[..., xtc_special_tokens] = False
 

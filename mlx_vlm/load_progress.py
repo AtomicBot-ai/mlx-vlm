@@ -9,6 +9,10 @@ import mlx.core as mx
 ProgressCallback = Callable[[dict], None]
 
 
+class ModelLoadCancelled(RuntimeError):
+    """A loading observer requested cancellation at a safe loader boundary."""
+
+
 class LoadingProgress:
     def __init__(self, model, callback: Optional[ProgressCallback] = None):
         self.model = str(model)

@@ -60,13 +60,14 @@ DATA = json.loads(Path(__file__).with_name("model_cases.json").read_text())[
 ]
 
 
-def inkling2_dspark_case(dtype=mx.float32):
+def inkling2_dspark_case(dtype=mx.float32, config=None):
     from mlx_vlm.models.inkling2 import Model, ModelConfig
     from mlx_vlm.speculative.drafters.inkling2_dspark import Model as Draft
     from mlx_vlm.speculative.drafters.inkling2_dspark import ModelConfig as DraftConfig
 
-    config = deepcopy(model_case("inkling2")["config"])
-    config["mtp_config"] = deepcopy(DATA["inkling2_dspark"])
+    if config is None:
+        config = deepcopy(model_case("inkling2")["config"])
+        config["mtp_config"] = deepcopy(DATA["inkling2_dspark"])
     target = Model(ModelConfig.from_dict(config))
     draft = Draft(
         DraftConfig(
@@ -83,11 +84,24 @@ def inkling2_dspark_case(dtype=mx.float32):
     return target, draft
 
 
-@parametrize("location", ["root", "text"])
+@parametrize("location", ["root", "text", "loop"])
 def test_inkling2_dspark_native_and_standalone_loading(tmp_path, location):
-    target, draft = inkling2_dspark_case(mx.bfloat16)
     config = deepcopy(model_case("inkling2")["config"])
     config.update(model_type="inkling2", mtp_config=deepcopy(DATA["inkling2_dspark"]))
+    if location == "loop":
+        config["model_type"] = "inkling2_loop"
+        config["text_config"].update(
+            model_type="inkling2_loop_text",
+            n_layers_per_attn_res_block=1,
+            loop_config={
+                "core_start": 1,
+                "core_end": 2,
+                "num_passes": 3,
+                "gate_rank": 8,
+            },
+        )
+        config["mtp_config"]["target_layer_ids"] = [1, 3, 5]
+    target, draft = inkling2_dspark_case(mx.bfloat16, config)
     if location == "text":
         config["text_config"]["mtp_config"] = config.pop("mtp_config")
     # Target quantization must not quantize the BF16 sidecar.
@@ -1585,6 +1599,92 @@ def test_mistral_dspark_standard_generation(
     assert actual == expected
     assert draft.draft_lens and sum(draft.draft_lens) > 0
     assert generated(model, draft, **options) == expected
+
+
+@parametrize("family", ["mistral", "inkling"])
+@parametrize("entrypoint", ["step", "stream"])
+def test_dspark_generation_stays_on_one_stream(family, entrypoint, monkeypatch):
+    from mlx_vlm.generate.common import generation_stream
+
+    if family == "mistral":
+        lm, draft = mistral_dspark_case()
+        model = NS(
+            language_model=lm,
+            get_input_embeddings=lambda ids, *args, **kwargs: InputEmbeddingsFeatures(
+                inputs_embeds=lm.model.embed_tokens(ids)
+            ),
+        )
+    else:
+        model, draft = inkling2_dspark_case()
+        lm = model.language_model
+
+    seen = {}
+    with mx.stream(generation_stream):
+        expected_stream = mx.default_stream(mx.default_device())
+
+    def observe(cls, name):
+        original = getattr(cls, name)
+
+        def call(self, *args, **kwargs):
+            stream = mx.default_stream(mx.default_device())
+            seen.setdefault(name, []).append(stream)
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(cls, name, call)
+
+    observe(type(lm), "__call__")
+    stages = ["reset", "draft_block"]
+    if family == "mistral":
+        stages.append("prepare_target_hidden")
+    for name in stages:
+        observe(type(draft), name)
+
+    expected = generated(model)
+    caller_stream = mx.new_stream(mx.default_device())
+    with mx.stream(caller_stream):
+        if entrypoint == "step":
+            actual = generated(model, draft)
+        else:
+            from mlx_vlm.generate import dispatch
+            from mlx_vlm.tests.test_generate import MockProcessor
+
+            prepare = dispatch._prepare_generation_inputs
+
+            def prepare_inputs(*args, **kwargs):
+                seen.setdefault("prepare_inputs", []).append(
+                    mx.default_stream(mx.default_device())
+                )
+                return prepare(*args, **kwargs)
+
+            monkeypatch.setattr(dispatch, "_prepare_generation_inputs", prepare_inputs)
+            processor = MockProcessor()
+            processor.tokenizer.stopping_criteria = lambda token: False
+            if family == "mistral":
+                model.config = NS(model_type="mistral_large4", eos_token_id=[])
+            iterator = dispatch.stream_generate(
+                model,
+                processor,
+                "",
+                input_ids=mx.array([[1, 2, 3, 4]]),
+                pixel_values=None,
+                mask=None,
+                max_tokens=12,
+                temperature=0,
+                seed=41,
+                prefill_step_size=None,
+                draft_model=draft,
+                draft_kind="dflash",
+            )
+            for result in iterator:
+                assert mx.default_stream(mx.default_device()) == caller_stream
+            actual = result.token_ids
+            stages.append("prepare_inputs")
+        assert mx.default_stream(mx.default_device()) == caller_stream
+    assert actual == expected
+    assert set(seen) == {"__call__", *stages}
+    assert all(
+        stream == expected_stream for streams in seen.values() for stream in streams
+    )
 
 
 def test_mistral_dspark_greedy_matches_bf16_logprob_ties():

@@ -537,6 +537,29 @@ class AttentionResidual(nn.Module):
         )
 
 
+class MessageController(nn.Module):
+    """Blend a previous pass's message into one sublayer input."""
+
+    def __init__(self, config):
+        super().__init__()
+        rank, width = config.loop_config.gate_rank, config.hidden_size
+        self.down_weight = mx.zeros((rank, 2 * width))
+        self.forget_weight = mx.zeros((width, rank))
+        self.gain_weight = mx.zeros((width, rank))
+        self.eps = config.rms_norm_eps
+
+    def __call__(self, x, message):
+        pair = mx.concatenate(
+            [mx.fast.rms_norm(v, None, self.eps) for v in (x, message)], axis=-1
+        )
+        hidden = (pair.astype(self.down_weight.dtype) @ self.down_weight.T).astype(
+            mx.float32
+        )
+        forget = mx.tanh(hidden @ self.forget_weight.T)
+        gain = mx.tanh(hidden @ self.gain_weight.T)
+        return (1 - forget) * x + gain * message
+
+
 class DecoderLayer(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -563,8 +586,13 @@ class DecoderLayer(nn.Module):
         self.mlp_sconv = ShortConvolution(
             config.hidden_size, config.sconv_kernel_size, 3
         )
+        loop = config.loop_config
+        if loop is not None and loop.core_start <= layer_idx < loop.core_end:
+            self.controllers = {
+                name: MessageController(config) for name in ("attn", "k", "v", "mlp")
+            }
 
-    def __call__(self, x, blocks, cache=None):
+    def __call__(self, x, blocks, cache=None, messages=None):
         conv = cache[1] if cache is not None else None
         mask = _cache_padding_mask(conv, x.shape[1])
         mixed = (
@@ -572,7 +600,7 @@ class DecoderLayer(nn.Module):
             if self.attention_input is not None
             else x[..., None, :]
         )
-        if self.is_sliding:
+        if self.is_sliding and messages is None:
             attn = self.self_attn(
                 self.input_layernorm(mixed[..., 0, :]).astype(x.dtype),
                 cache=cache,
@@ -580,17 +608,21 @@ class DecoderLayer(nn.Module):
             )
         else:
             parts = [mixed[..., min(i, mixed.shape[-2] - 1), :] for i in range(3)]
-            parts = [
-                norm(part).astype(x.dtype)
-                for norm, part in zip(
-                    (
-                        self.q_input_layernorm,
-                        self.k_input_layernorm,
-                        self.v_input_layernorm,
-                    ),
-                    parts,
+            if messages is not None:
+                parts = [
+                    self.controllers[name](part, messages[..., i, :])
+                    for i, (name, part) in enumerate(zip(("attn", "k", "v"), parts))
+                ]
+            norms = (
+                (self.input_layernorm,) * 3
+                if self.is_sliding
+                else (
+                    self.q_input_layernorm,
+                    self.k_input_layernorm,
+                    self.v_input_layernorm,
                 )
-            ]
+            )
+            parts = [norm(part).astype(x.dtype) for norm, part in zip(norms, parts)]
             attn = self.self_attn(*parts, cache=cache, conv_mask=mask)
         residual = self.attn_sconv(attn, conv, mask).astype(mx.float32)
         if self.is_block_boundary:
@@ -598,6 +630,8 @@ class DecoderLayer(nn.Module):
         else:
             residual = residual + x.astype(mx.float32)
         hidden = self.mlp_input(blocks, residual)[..., 0, :]
+        if messages is not None:
+            hidden = self.controllers["mlp"](hidden, messages[..., 3, :])
         hidden = self.mlp(self.post_attention_layernorm(hidden).astype(x.dtype))
         out = (residual + self.mlp_sconv(hidden, conv, mask).astype(mx.float32)).astype(
             x.dtype
@@ -613,6 +647,12 @@ class TextModel(nn.Module):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.embed_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layers = [DecoderLayer(config, i) for i in range(config.num_hidden_layers)]
+        self.layer_indices = config.layer_indices
+        self.loop = config.loop_config
+        if self.loop is not None:
+            self.message_queries = mx.zeros(
+                (self.loop.core_end - self.loop.core_start, 4, config.hidden_size)
+            )
         self.final_input = AttentionResidual(config)
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -632,7 +672,7 @@ class TextModel(nn.Module):
         if capture_layer_ids is not None and (
             len(capture_layer_ids) != len(set(capture_layer_ids))
             or any(
-                type(i) is not int or not 0 <= i <= len(self.layers)
+                type(i) is not int or not 0 <= i <= len(self.layer_indices)
                 for i in capture_layer_ids
             )
         ):
@@ -640,19 +680,36 @@ class TextModel(nn.Module):
         requested = set(capture_layer_ids or [])
         x = self.embed(inputs) if input_embeddings is None else input_embeddings
         blocks = []
-        for i, (layer, c) in enumerate(
-            zip(self.layers, cache or [None] * len(self.layers))
-        ):
+        bank = None
+        if cache and len(cache) != len(self.layer_indices):
+            raise ValueError(
+                "Inkling 2 requires a separate cache for every layer visit"
+            )
+        for visit, index in enumerate(self.layer_indices):
+            if self.loop is not None and index == self.loop.core_start:
+                if visit == index:
+                    prelude, prelude_blocks = x, blocks.copy()
+                else:
+                    # The first block appended in the core is the prelude partial.
+                    # Only completed core blocks and the last partial supply messages.
+                    states = mx.stack([*blocks[len(prelude_blocks) + 1 :], x], axis=-2)
+                    bank = mx.fast.rms_norm(states.astype(mx.float32), None, 1e-6)
+                    x, blocks = prelude, prelude_blocks.copy()
+            messages = None
+            if bank is not None and index < self.loop.core_end:
+                query = self.message_queries[index - self.loop.core_start]
+                scores = (query @ bank.swapaxes(-1, -2)) * x.shape[-1] ** -0.5
+                messages = mx.softmax(scores, axis=-1) @ bank
             # DSpark taps the partial block entering the layer, not its output.
-            if i in requested:
-                captures[i] = x
-            x = layer(x, blocks, c)
-            if speculative_verify and (i + 1) % 4 == 0:
+            if visit in requested:
+                captures[visit] = x
+            x = self.layers[index](x, blocks, cache[visit] if cache else None, messages)
+            if speculative_verify and (visit + 1) % 4 == 0:
                 mx.async_eval(x)
         h = self.final_input(blocks, x)[..., 0, :]
         normalized = self.norm(h).astype(x.dtype)
-        if len(self.layers) in requested:
-            captures[len(self.layers)] = normalized
+        if len(self.layer_indices) in requested:
+            captures[len(self.layer_indices)] = normalized
         result = h if skip_final_norm else normalized
         if capture_layer_ids is not None:
             return result, [captures[i] for i in capture_layer_ids]
@@ -825,12 +882,12 @@ class LanguageModel(InklingLanguageModel):
             CacheList(
                 (
                     RotatingKVCache(max_size=self.config.sliding_window_size, keep=0)
-                    if layer.is_sliding
+                    if self.model.layers[i].is_sliding
                     else KVCache()
                 ),
                 ArraysCache(4),
             )
-            for layer in self.model.layers
+            for i in self.model.layer_indices
         ]
 
     def speculative_verify_hidden(self, inputs, cache):

@@ -20,8 +20,11 @@ def processed_image_key(pixel_values, image_grid_thw=None, **kwargs) -> str:
     """Hash pixels and image metadata, excluding text and generation options."""
     # Identical flattened patches can have different layouts. Include Gemma's
     # positions and DeepSeek's grids/permutations as well as Qwen's patch grid.
+    # Granite for Docling encodes the same pixels on two paths (tile_fine_mask).
     image_inputs = {
-        key: value for key, value in kwargs.items() if key.startswith("image_")
+        key: value
+        for key, value in kwargs.items()
+        if key.startswith("image_") or key == "tile_fine_mask"
     }
     image_inputs.update(pixel_values=pixel_values, image_grid_thw=image_grid_thw)
     return f"processed:{semantic_extra_hash(media=image_inputs)}"

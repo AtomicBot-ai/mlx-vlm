@@ -278,11 +278,17 @@ clones when available. An unsupported clone operation or a cross-filesystem
 source uses a streamed copy; permission, disk-space and other filesystem errors
 fail preparation immediately. It computes whole-file SHA-256 and ordered 16 MiB chunk
 digests during the same initial read, then persists a verified manifest. Files
-and directories are made read-only. A receipt records device/inode identity,
+and directories are made read-only. A receipt records volume/inode identity,
 size, nanosecond modification/change times and modes for the entire snapshot.
 Reuse requires that receipt and the sealed tree to match. A changed tree is
 reverified; corruption fails rather than overwriting the published snapshot.
 Original source files are never chmod'ed or hard-linked into this cache.
+
+On macOS, volume identity uses the filesystem UUID when available, so a changed
+mount-local device number after reboot does not invalidate unchanged weights.
+Other platforms and filesystems without a volume UUID retain device-number
+checks. Receipts created with a mount-local device number follow the normal
+cache-miss path when their identity no longer matches; they are not migrated.
 
 This cache assumes the server account and its private state are trusted. It is
 not protection against an attacker controlling that same OS account. Checking
@@ -534,5 +540,4 @@ Authentication/validation errors also retain standard FastAPI status semantics.
 
 Applications still own discovery, pairing/consent, device UI, and their own
 external process supervision. SSH trust/access and backend/network preparation
-remain deployment responsibilities. No Nativ fields or native onboarding code
-are part of MLX-VLM.
+remain deployment responsibilities.

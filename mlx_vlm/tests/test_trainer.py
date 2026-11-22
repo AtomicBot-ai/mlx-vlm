@@ -10,11 +10,14 @@ from unittest.mock import MagicMock, Mock, patch
 
 import mlx.core as mx
 import mlx.nn as nn
+import mlx.optimizers as optim
+import numpy as np
 import pytest
 from mlx.utils import tree_flatten
 
 from mlx_vlm.tests.test_models import tiny_config
 from mlx_vlm.trainer.datasets.next_token import VisionDataset
+from mlx_vlm.trainer.peft import DoRAEmbedding
 from mlx_vlm.trainer.peft.lora import LoRaLayer
 from mlx_vlm.trainer.peft.lora_layers import LoRALinear
 from mlx_vlm.trainer.peft.utils import (
@@ -32,6 +35,21 @@ from mlx_vlm.trainer.vlm.cross_entropy.trainer import (
 from mlx_vlm.utils import load
 
 # Training workflows, adapter loading and numerical gradient contracts.
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+def test_dora_embedding_rejects_only_quantized_weights(quantized):
+    embedding = nn.Embedding(8, 64)
+    if quantized:
+        embedding = nn.QuantizedEmbedding.from_embedding(
+            embedding, group_size=64, bits=4
+        )
+        with pytest.raises(ValueError, match="does not yet support quantization"):
+            DoRAEmbedding.from_base(embedding, r=2)
+    else:
+        adapter = DoRAEmbedding.from_base(embedding, r=2)
+        ids = mx.array([1, 2])
+        assert mx.allclose(adapter(ids), embedding(ids), atol=1e-5).item()
 
 
 @pytest.fixture
@@ -211,6 +229,86 @@ def test_training_updates_and_saves(monkeypatch, missing_adapter):
             "0000001_adapters.safetensors",
             "adapters.safetensors",
         ]
+
+
+@pytest.mark.parametrize(
+    "clip,after_first_update,final_weights",
+    [
+        (1.0, [-0.6, -0.8], [-0.6, 0.2]),
+        (3.0, [-1.8, -2.4], [-1.8, -0.4]),
+        (None, [-3.0, -4.0], [-3.0, -2.0]),
+    ],
+)
+def test_legacy_sft_clips_averaged_gradient_and_saves_final_update(
+    tmp_path, monkeypatch, clip, after_first_update, final_weights
+):
+    from mlx_vlm.trainer import train
+
+    # The full window averages to [3, 4] (norm 5). The last microbatch has norm 2.
+    scales = mx.array([[10.0, 2.0], [-4.0, 6.0], [0.0, -2.0]])
+    rows = [{"input_ids": mx.array([i, 0])} for i in range(3)]
+    monkeypatch.setattr(np.random, "permutation", np.arange)
+    validation_weights = []
+
+    def loss(model, batch, train_on_completions, assistant_id, mtp_loss_weight):
+        assert train_on_completions and assistant_id == 42 and mtp_loss_weight == 0.25
+        if not model.training:
+            validation_weights.append(model.weight.tolist()[0])
+        return (model.weight * scales[batch["input_ids"][:, 0]]).sum(), {}
+
+    model = nn.Linear(2, 1, bias=False)
+    model.weight = mx.zeros((1, 2))
+    path = tmp_path / "custom.safetensors"
+    args = TrainingArgs(
+        batch_size=1,
+        iters=3,
+        gradient_accumulation_steps=2,
+        grad_clip=clip,
+        grad_checkpoint=True,
+        steps_per_eval=2,
+        steps_per_save=3,
+        adapter_file=str(path),
+        mtp_loss_weight=0.25,
+    )
+    assert (
+        train(model, optim.SGD(learning_rate=1.0), rows, rows[:1], args, loss, True, 42)
+        is None
+    )
+    np.testing.assert_allclose(
+        validation_weights, [[0, 0], [0, 0], after_first_update], atol=1e-6
+    )
+    np.testing.assert_allclose(model.weight.tolist()[0], final_weights, atol=1e-6)
+    for checkpoint in (path, tmp_path / "0000003_adapters.safetensors"):
+        np.testing.assert_allclose(
+            mx.load(str(checkpoint))["weight"].tolist()[0], final_weights, atol=1e-6
+        )
+
+
+def test_legacy_shards_share_shuffle_after_filtering_truncated_images(monkeypatch):
+    class Rows(list):
+        config = {"image_token_id": 99}
+
+    rows = Rows(
+        {"input_ids": mx.array(ids)}
+        for ids in ([0, 0, 99], [1, 1], [2, 2], [3, 3], [4, 4])
+    )
+    shards = []
+    for rank in (0, 1):
+        world = NS(rank=lambda: rank, size=lambda: 2)
+        monkeypatch.setattr(mx.distributed, "init", lambda: world)
+
+        def all_sum(dropped, *, stream):
+            assert stream == mx.cpu
+            assert dropped.tolist() == ([1, 0, 0, 0, 0] if rank == 0 else [0] * 5)
+            return mx.array([1, 0, 0, 0, 0])
+
+        monkeypatch.setattr(mx.distributed, "all_sum", all_sum)
+        batches = iterate_batches(rows, batch_size=2, max_seq_length=2, train=True)
+        shards.append([next(batches)["input_ids"][0, 0].item() for _ in range(6)])
+
+    rng = np.random.default_rng(0)
+    expected = [int(i) for _ in range(3) for i in rng.permutation(2)]
+    assert list(zip(*shards)) == [(2 * i + 1, 2 * i + 2) for i in expected]
 
 
 def test_completion_mask_is_used_without_passing_to_model():
@@ -487,3 +585,20 @@ def test_trainer_public_exports():
     assert trainer.train is vlm.train is train
     assert trainer.train_orpo is vlm.train_orpo is train_orpo
     assert trainer.get_peft_model is get_peft_model
+
+
+def test_legacy_get_learning_rate_handles_warmup_equal_iters():
+    from mlx_vlm.trainer.common.utils import get_learning_rate as common_lr
+    from mlx_vlm.trainer.core import get_learning_rate as legacy_lr
+
+    assert legacy_lr(10, 10, 10, 1e-3, 1e-5) == common_lr(10, 10, 10, 1e-3, 1e-5)
+    assert legacy_lr(10, 3, 5, 1e-3, 1e-5) == common_lr(10, 3, 5, 1e-3, 1e-5)
+
+
+def test_legacy_get_learning_rate_validates_inputs():
+    from mlx_vlm.trainer.core import get_learning_rate as legacy_lr
+
+    with pytest.raises(ValueError, match="iters must be at least 1"):
+        legacy_lr(0, 0, 0, 1e-3, 1e-5)
+    with pytest.raises(ValueError, match="warmup_steps must be between 0 and iters"):
+        legacy_lr(10, 0, 11, 1e-3, 1e-5)

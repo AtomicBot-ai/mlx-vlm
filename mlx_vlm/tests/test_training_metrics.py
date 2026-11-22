@@ -183,8 +183,8 @@ def test_preference_losses_report_metrics_without_changing_objectives():
         elif kind == "ipo":
             expected = (logits - 5) ** 2
         else:
-            expected = -nn.log_sigmoid(0.1 * logits) + 50 * mx.maximum(
-                reference - chosen, 0
+            expected = -nn.log_sigmoid(
+                0.1 * (logits - 50 * mx.maximum(reference - chosen, 0))
             )
         assert mx.allclose(losses, expected).item()
     losses, metrics = orpo_objective(chosen, rejected)
@@ -197,6 +197,34 @@ def test_preference_losses_report_metrics_without_changing_objectives():
     )
     assert mx.allclose(legacy_loss, losses.mean()).item()
     assert isinstance(legacy_metrics, dict)
+
+
+@pytest.mark.parametrize(
+    "chosen,beta,delta",
+    [(-2.0, 0.1, 50.0), (-0.5, 0.1, 50.0), (-2.0, 0.3, 50.0), (-2.0, 0.1, 0.0)],
+)
+def test_dpop_loss_and_gradients_match_equation_3(chosen, beta, delta):
+    # https://arxiv.org/html/2402.13228v2#S4
+    def loss(scores):
+        losses, _ = dpo_objective(
+            scores[:1],
+            scores[1:],
+            mx.array([-1.0]),
+            mx.array([-2.0]),
+            beta=beta,
+            delta=delta,
+            loss_type="dpop",
+        )
+        return losses.sum()
+
+    margin = beta * (chosen + 2.0 - delta * max(-1.0 - chosen, 0.0))
+    slope = 1.0 / (1.0 + math.exp(margin))
+    chosen_scale = 1.0 + delta if chosen < -1.0 else 1.0
+    scores = mx.array([chosen, -3.0])
+    assert loss(scores).item() == pytest.approx(math.log1p(math.exp(-margin)))
+    assert mx.grad(loss)(scores).tolist() == pytest.approx(
+        [-beta * chosen_scale * slope, beta * slope]
+    )
 
 
 @pytest.mark.parametrize("compiled", [False, True])
@@ -335,6 +363,48 @@ def test_existing_orpo_pipeline_prints_train_and_validation_metrics(tmp_path, ca
     assert "train_policy_chosen_logps=" in output
     assert "val_policy_chosen_logps=" in output
     assert (tmp_path / "adapters.safetensors").is_file()
+
+
+@pytest.mark.parametrize("accumulation_steps", [2, 3], ids=["full", "partial"])
+@pytest.mark.parametrize("grad_clip,expected", [(1.0, -1 / math.sqrt(2)), (None, -3.0)])
+def test_legacy_orpo_clips_averaged_gradient(
+    tmp_path, accumulation_steps, grad_clip, expected
+):
+    class TokenScores(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scores = mx.zeros((2,))
+
+        def __call__(self, input_ids, pixel_values, attention_mask):
+            scores = self.scores[input_ids]
+            return mx.stack([scores, mx.zeros_like(scores)], axis=-1)
+
+    def loss(
+        chosen_logps, chosen_logits, rejected_logps, rejected_logits, *masks, beta
+    ):
+        return 8 * chosen_logits - 2 * rejected_logits, {}
+
+    # Swapping the pair gives gradients [8, -2] and [-2, 8]. Their mean is
+    # [3, 3], while clipping each microbatch elementwise at 1 would cancel them.
+    left, right = mx.array([0, 1]), mx.array([1, 0])
+    rows = [
+        {"chosen_input_ids": left, "rejected_input_ids": right},
+        {"chosen_input_ids": right, "rejected_input_ids": left},
+    ]
+    model = TokenScores()
+    args = LegacyORPOTrainingArgs(
+        iters=2,
+        batch_size=1,
+        max_seq_length=2,
+        gradient_accumulation_steps=accumulation_steps,
+        grad_clip=grad_clip,
+        adapter_file=str(tmp_path / "adapters.safetensors"),
+    )
+    metrics = train_orpo(
+        model, optim.SGD(learning_rate=1.0), rows, args=args, loss_fn=loss
+    )
+    assert metrics["optimizer_step"] == 1
+    assert model.scores.tolist() == pytest.approx([expected, expected], abs=1e-6)
 
 
 @pytest.mark.parametrize("legacy", [False, True])

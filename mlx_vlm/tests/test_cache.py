@@ -1557,6 +1557,15 @@ class TestVisionFeatureCache:
         assert square != wide
         assert square == processed_image_key(mx.zeros((16, 3)), mx.array([[1, 4, 4]]))
 
+    def test_processed_key_separates_granite_docling_routes(self):
+        pixels = mx.zeros((1, 2, 3, 8, 8))
+        coarse = processed_image_key(pixels)
+        fine = processed_image_key(pixels, tile_fine_mask=mx.array([True]))
+        assert coarse != fine
+        assert fine == processed_image_key(
+            mx.zeros((1, 2, 3, 8, 8)), tile_fine_mask=mx.array([True]), max_tokens=8
+        )
+
     def test_processed_key_handles_ragged_image_batches(self):
         images = [mx.zeros((4, 3)), mx.ones((16, 3))]
         key = processed_image_key(images)
@@ -1683,10 +1692,9 @@ def coordinate(manager, caches):
 @pytest.fixture
 def managers(tmp_path, monkeypatch):
     """Own writers and readers, including reopened namespaces and memory budgets."""
-    # Keep one real host-memory reading per case. Budget/pressure tests override
-    # this explicitly; repeated vm_stat processes add no cache-lifecycle coverage.
-    free_ram = P._free_ram_bytes()
-    monkeypatch.setattr(P, "_free_ram_bytes", lambda: free_ram)
+    # Lifecycle tests must not depend on the runner's current memory pressure.
+    # Budget/pressure tests override this explicitly to exercise admission limits.
+    monkeypatch.setattr(P, "_free_ram_bytes", lambda: 1 << 40)
     owned = []
 
     def make(
@@ -1854,6 +1862,38 @@ def test_hashes_and_dependencies():
     assert P.model_key_dependencies(None, None) == ()
 
 
+@pytest.mark.parametrize("sequence", [list, tuple])
+def test_ragged_image_payloads_scope_exact_cache(prefix_manager, sequence):
+    def image_cache_key(value):
+        slices = (
+            np.zeros((3, 2, 8), dtype=np.float32),
+            np.full((3, 2, 4), value, dtype=np.float32),
+        )
+        pixels = sequence((sequence(slices),))
+        return P.semantic_extra_hash(
+            image_hash=P.hash_image_payload(pixel_values=pixels)
+        )
+
+    manager = prefix_manager(budget=1 << 20)
+    prefix = list(range(32))
+    tokens = prefix + [32]
+    keys = [image_cache_key(value) for value in (0, 1)]
+    assert keys[0] != keys[1]
+
+    for value, key in enumerate(keys):
+        assert manager.lookup_exact_cache(tokens, extra_hash=key) == (None, 0)
+        assert manager.store_exact_cache(
+            prefix, [allocated(len(prefix), value)], extra_hash=key
+        )
+
+    for value in (0, 1):
+        restored, count = manager.lookup_exact_cache(
+            tokens, extra_hash=image_cache_key(value)
+        )
+        assert count == len(prefix)
+        assert restored[0].keys[0, 0, 0, 0].item() == value
+
+
 def test_blocks_and_statistics(managers):
     manager = managers(blocks=16)
     tokens = list(range(53))
@@ -1897,7 +1937,9 @@ def test_layer_major_threshold(managers, monkeypatch):
 
 def test_disk_block_lifecycle(managers, monkeypatch):
     monkeypatch.setenv("APC_DISK_SHARD_MAX_BLOCKS", "1")
-    manager = managers("disk", blocks=1)
+    # Disk restores check both free RAM and the manager's memory headroom.
+    monkeypatch.setenv("APC_DISK_MIN_FREE_RAM_GB", "0")
+    manager = managers("disk", blocks=1, budget=1 << 20)
     first, second = list(range(48)), list(range(100, 148))
     manager.release(store_blocks(manager, first))
     manager.disk.flush()
@@ -1909,7 +1951,7 @@ def test_disk_block_lifecycle(managers, monkeypatch):
     size = manager.disk.disk_bytes
     assert size > 0 and manager.disk.dir.exists()
     manager.close()
-    reader = managers("disk")
+    reader = managers("disk", budget=1 << 20)
     warm, count = reader.lookup_prefix_disk_cache(second)
     assert count == 48 and all(c.offset == 48 for c in warm)
     assert reader.stats_snapshot()["pool_used"] == 0
@@ -1920,8 +1962,10 @@ def test_disk_block_lifecycle(managers, monkeypatch):
 
 
 @parametrize("evicted", [1, 2])
-def test_disk_prefix_with_evicted_leading_blocks(managers, evicted):
-    manager = managers("disk", blocks=3)
+def test_disk_prefix_with_evicted_leading_blocks(managers, evicted, monkeypatch):
+    # Keep prefix restoration independent of the runner's available memory.
+    monkeypatch.setenv("APC_DISK_MIN_FREE_RAM_GB", "0")
+    manager = managers("disk", blocks=3, budget=1 << 20)
     tokens = list(range(48))
     source = [filled(C.KVCache(), 48, heads=1, dim=4)]
     stored = manager.store_kv_blocks(
@@ -1966,10 +2010,10 @@ def test_disk_policy_and_metadata(managers, monkeypatch):
         tokens, allow_memory_overlap=True, max_prefix_tokens=32, min_prefix_tokens=32
     ) == (None, 0)
     manager._disk_min_free_ram_bytes = 2
-    monkeypatch.setattr(P, "_free_ram_bytes", lambda: 1)
     lookup = manager.lookup_prefix_disk_cache
-    assert lookup(tokens, allow_memory_overlap=True) == (None, 0)
-    monkeypatch.undo()
+    with monkeypatch.context() as pressure:
+        pressure.setattr(P, "_free_ram_bytes", lambda: 1)
+        assert lookup(tokens, allow_memory_overlap=True) == (None, 0)
     writer = managers("disk", namespace="metadata")
     tokens = list(range(16))
     writer.release(store_blocks(writer, tokens, extra_hash=1))
@@ -1983,15 +2027,17 @@ def test_disk_policy_and_metadata(managers, monkeypatch):
 
 
 def test_exact_promotion_and_priority(managers, monkeypatch):
+    # Exercise promotion and LRU priority independently of runner memory pressure.
+    monkeypatch.setenv("APC_DISK_MIN_FREE_RAM_GB", "0")
     monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
     tokens = [list(range(20)), list(range(100, 120))]
-    writer = managers("disk")
+    writer = managers("disk", budget=4096)
     for value, ids in enumerate(tokens, 1):
         assert writer.store_exact_cache(ids, [allocated(20, value)])
     writer.disk.flush()
     writer.close()
     monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "1")
-    reader = managers("disk")
+    reader = managers("disk", budget=4096)
     for index, hits in [(0, 1), (0, 1), (1, 2), (0, 3)]:
         warm, count = reader.lookup_exact_cache(tokens[index] + [999])
         assert warm is not None and count == 20 and reader.stats.disk_hits == hits
@@ -2970,9 +3016,9 @@ def test_tensor_limit_replaces_idle_history(managers, monkeypatch, tier):
 
 
 @parametrize("leased", [1, 2])
-def test_tensor_limit_preserves_active_blocks(managers, monkeypatch, leased):
+def test_tensor_limit_preserves_active_blocks(memory_manager, monkeypatch, leased):
     monkeypatch.setenv("APC_MAX_POOL_TENSORS", "8")
-    manager = managers("disk", blocks=8)
+    manager = memory_manager(disk=True)
     old = store_blocks(manager, list(range(32)))
     active = [(b.block_hash, list(b.keys), list(b.values)) for b in old[:leased]]
     manager.release(old[leased:])

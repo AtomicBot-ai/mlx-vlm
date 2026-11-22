@@ -8,7 +8,7 @@ import sys
 import time
 from contextlib import asynccontextmanager, nullcontext
 from pathlib import Path
-from threading import Lock, RLock
+from threading import Event, Lock, RLock
 from types import SimpleNamespace
 from typing import Annotated, List, Literal, Optional, Tuple
 
@@ -25,7 +25,7 @@ from ..generate.edit_image import load_image_edit_model
 from ..generate.image import is_image_generation_model, load_image_generation_model
 from ..generate.image_defaults import ImageSamplingDefaults, resolve_image_defaults
 from ..generate.three_d import load_3d_model
-from ..load_progress import LoadingProgress
+from ..load_progress import LoadingProgress, ModelLoadCancelled
 from ..reranker import RerankerKind, reranker_kind
 from ..structured import build_json_schema_logits_processor
 from ..tools import _infer_tool_parser_from_processor
@@ -92,6 +92,20 @@ def _require_management_api_key(request: HTTPConnection) -> None:
             detail="Invalid API key",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+
+def _require_preload_finished(status_code=503):
+    if runtime.preload_in_progress:
+        raise HTTPException(
+            status_code,
+            {"code": "model_loading", "message": "Startup preloading is in progress"},
+            headers={"Retry-After": "1"},
+        )
+
+
+async def _require_inference_ready(request: HTTPConnection):
+    if request.scope["type"] == "websocket" or request.method not in {"GET", "HEAD"}:
+        _require_preload_finished()
 
 
 def _cache_group_for_cache(cache: dict) -> str:
@@ -175,6 +189,11 @@ def _server_runtime_snapshot() -> dict:
             audio_queue_depth = 0
     return {
         "loaded_model": default_cache.get("model_path", None),
+        "model_ready": (
+            default_cache.get("model_path") is not None
+            and runtime.response_generator is not None
+            and not runtime.preload_in_progress
+        ),
         "loaded_adapter": default_cache.get("adapter_path", None),
         "loaded_models": {
             group: {
@@ -195,6 +214,7 @@ def _server_runtime_snapshot() -> dict:
         "request_queue_depth": queue_depth,
         "audio_queue_depth": audio_queue_depth,
         "preload_failures": dict(runtime.preload_failures),
+        "preload_in_progress": runtime.preload_in_progress,
         "model_load_progress": runtime.model_load_progress,
         "apc": (
             {"enabled": False}
@@ -449,16 +469,8 @@ async def lifespan(app):
 async def _application_lifespan(app):
     model_path = os.environ.pop("MLX_VLM_PRELOAD_MODEL", None)
     adapter_path = os.environ.pop("MLX_VLM_PRELOAD_ADAPTER", None)
-    if model_path:
-        logger.info("Pre-loading language model: %s", model_path)
-        get_cached_model(model_path, adapter_path, model_kind="text_generation")
-        kv_bits = os.environ.get("KV_BITS")
-        kv_scheme = os.environ.get("KV_QUANT_SCHEME", "uniform")
-        if kv_bits:
-            logger.info("KV cache quantization: bits=%s scheme=%s", kv_bits, kv_scheme)
-        logger.info("Language model ready, continuous batching enabled.")
-
     preload_models = (
+        (model_path, adapter_path, "text_generation", "language model"),
         (
             os.environ.pop("MLX_VLM_PRELOAD_MESH_MODEL", None),
             None,
@@ -503,43 +515,83 @@ async def _application_lifespan(app):
         ),
     )
     runtime.preload_failures.clear()
-    for preload_model_path, preload_adapter_path, model_kind, label in preload_models:
-        if not preload_model_path:
-            continue
-        logger.info("Pre-loading %s: %s", label, preload_model_path)
-        try:
-            get_cached_model(
-                preload_model_path,
-                preload_adapter_path,
-                model_kind=model_kind,
-            )
-        except Exception as e:
-            reason = getattr(e, "detail", None) or str(e)
-            runtime.preload_failures[model_kind] = {
-                "model": preload_model_path,
-                "label": label,
-                "error": str(reason),
-            }
-            logger.error(
-                "Failed to pre-load %s %r: %s. Continuing without it.",
-                label,
-                preload_model_path,
-                reason,
-            )
-            continue
-        logger.info("%s ready.", label.capitalize())
-    async with checkpoint_cleanup():
-        try:
+    runtime.preload_in_progress = any(item[0] for item in preload_models)
+    if model_path:
+        # Seed a snapshot before yielding startup, even if the loader is not scheduled yet.
+        progress = LoadingProgress(model_path)
+        progress("starting", adapter_path=adapter_path)
+        runtime.model_load_progress = progress.snapshot
+    stopping = Event()
+    preload_task = asyncio.create_task(_preload_models(preload_models, stopping))
+    try:
+        async with checkpoint_cleanup():
             yield
+    finally:
+        stopping.set()
+        try:
+            # The loading observer aborts at the next safe boundary. Join its
+            # cleanup before clearing caches, even if shutdown itself is cancelled.
+            try:
+                await asyncio.shield(preload_task)
+            except asyncio.CancelledError:
+                await preload_task
+                raise
         finally:
-            if runtime.mesh_jobs is not None:
-                await asyncio.to_thread(runtime.mesh_jobs.shutdown)
-            if runtime.audio_queue is not None:
-                runtime.audio_queue.stop_and_join()
-                runtime.audio_queue = None
-            if runtime.realtime_engine is not None:
-                runtime.realtime_engine.stop_and_join()
-                runtime.realtime_engine = None
+            await asyncio.to_thread(unload_model_sync)
+
+
+async def _preload_models(models, stopping):
+    try:
+        for model_path, adapter_path, model_kind, label in models:
+            if stopping.is_set():
+                break
+            if not model_path:
+                continue
+            logger.info("Pre-loading %s: %s", label, model_path)
+            try:
+                # Distributed collectives must keep rank decisions synchronized;
+                # their lifecycle is owned by the distributed coordinator.
+                cancel_kwargs = (
+                    {"cancel_event": stopping}
+                    if model_kind == "text_generation"
+                    and runtime.distributed_worker is None
+                    else {}
+                )
+                await asyncio.to_thread(
+                    get_cached_model,
+                    model_path,
+                    adapter_path,
+                    model_kind=model_kind,
+                    **cancel_kwargs,
+                )
+            except ModelLoadCancelled:
+                logger.info("Startup preload cancelled: %s", model_path)
+                break
+            except Exception as e:
+                reason = getattr(e, "detail", None) or str(e)
+                if model_kind == "text_generation":
+                    runtime.model_load_progress = {
+                        **(runtime.model_load_progress or {}),
+                        "stage": "failed",
+                        "stage_percent": None,
+                        "updated_at": time.time(),
+                    }
+                runtime.preload_failures[model_kind] = {
+                    "model": model_path,
+                    "label": label,
+                    "error": str(reason),
+                }
+                logger.error("Failed to pre-load %s %r: %s", label, model_path, reason)
+                continue
+            logger.info("%s ready.", label.capitalize())
+            if model_kind == "text_generation" and os.environ.get("KV_BITS"):
+                logger.info(
+                    "KV cache quantization: bits=%s scheme=%s",
+                    os.environ["KV_BITS"],
+                    os.environ.get("KV_QUANT_SCHEME", "uniform"),
+                )
+    finally:
+        runtime.preload_in_progress = False
 
 
 app = FastAPI(
@@ -549,7 +601,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 inference_router = APIRouter(
-    dependencies=[Depends(_require_management_api_key)],
+    dependencies=[
+        Depends(_require_management_api_key),
+        Depends(_require_inference_ready),
+    ],
 )
 
 app.add_middleware(
@@ -650,6 +705,7 @@ def get_cached_model(
     *,
     model_kind: str = "auto",
     revision: str | None = None,
+    cancel_event: Optional[Event] = None,
 ):
     # Text loading runs off the HTTP loop; concurrent callers reuse one loader.
     # Dedicated audio/image workers retain their own initialization lifecycle.
@@ -660,7 +716,11 @@ def get_cached_model(
         else nullcontext()
     ):
         return _get_cached_model(
-            model_path, adapter_path, model_kind=model_kind, revision=revision
+            model_path,
+            adapter_path,
+            model_kind=model_kind,
+            revision=revision,
+            cancel_event=cancel_event,
         )
 
 
@@ -689,11 +749,18 @@ def _get_cached_model(
     *,
     model_kind: str = "auto",
     revision: str | None = None,
+    cancel_event: Optional[Event] = None,
 ):
     """
     Factory function to get or load the appropriate model resources from cache or by loading.
     Also creates/updates the ResponseGenerator for continuous batching.
     """
+
+    def check_cancelled():
+        if cancel_event is not None and cancel_event.is_set():
+            raise ModelLoadCancelled("Server is shutting down")
+
+    check_cancelled()
     load_as_edit = model_kind == "image_edit"
     load_as_audio = _audio_model_kind(model_kind)
     load_as_embedding = model_kind == "embedding"
@@ -1084,12 +1151,14 @@ def _get_cached_model(
     )
 
     def publish_loading(event):
+        if event["stage"] not in ("failed", "cancelled", "ready"):
+            check_cancelled()
         runtime.model_load_progress = {**event, "adapter_path": adapter_path}
 
     progress = LoadingProgress(model_path, publish_loading)
-    progress("starting")
     response_generator = None
     try:
+        progress("starting")
         draft_options = _draft_generator_options(draft)
         response_generator = ResponseGenerator(
             model_path=model_path,
@@ -1109,10 +1178,14 @@ def _get_cached_model(
             load_progress_callback=progress.update,
         )
         model, processor, config = response_generator.wait_until_ready()
-    except Exception:
-        progress("failed")
+        check_cancelled()
+    except Exception as error:
+        progress("cancelled" if isinstance(error, ModelLoadCancelled) else "failed")
         if response_generator is not None:
             response_generator.stop_and_join()
+        elif runtime.apc_manager is not None:
+            runtime.apc_manager.close()
+        runtime.apc_manager = None
         vision_cache.clear()
         raise
 
@@ -1367,6 +1440,7 @@ async def route_distributed_request(request: Request, call_next):
     try:
         # Authenticate before downloading, transferring or loading anything.
         _require_management_api_key(request)
+        _require_preload_finished()
         if worker is not None:
             from .distributed_schedule import RequestScope, request_scope
 
@@ -1422,6 +1496,9 @@ async def health_check(request: Request):
     result = {
         "status": "healthy",
         "loaded_model": runtime["loaded_model"],
+        "model_ready": runtime["model_ready"],
+        "preload_in_progress": runtime["preload_in_progress"],
+        "preload_failures": runtime["preload_failures"],
         "model_load_progress": runtime["model_load_progress"],
         "loaded_adapter": runtime["loaded_adapter"],
         "loaded_models": runtime["loaded_models"],
@@ -1513,6 +1590,7 @@ async def get_runtime_settings(request: Request):
 @app.patch("/settings", include_in_schema=False)
 async def update_runtime_settings(request: Request):
     _require_management_api_key(request)
+    _require_preload_finished(409)
     payload = await request.json()
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="body must be a JSON object")
@@ -1538,6 +1616,7 @@ async def unload_model_endpoint(request: Request):
     """
     _require_management_api_key(request)
     # Loading now yields the HTTP loop. Do not unload a half-initialized model.
+    _require_preload_finished(409)
     if not _model_load_lock.acquire(blocking=False):
         raise HTTPException(
             409, {"code": "model_loading", "message": "Retry after loading finishes"}

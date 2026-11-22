@@ -24,7 +24,12 @@ from PIL import Image, ImageOps
 from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
 
-from .load_progress import LoadingProgress, ProgressCallback, evaluate_model
+from .load_progress import (
+    LoadingProgress,
+    ModelLoadCancelled,
+    ProgressCallback,
+    evaluate_model,
+)
 from .models.base import BaseImageProcessor
 from .quantization.checkpoint import (
     merge_quantization_configs,
@@ -74,6 +79,7 @@ MODEL_REMAPPING = {
     "iquestcoder": "llama",
     "nemotron-nas": "nemotron_nas",
     "inkling_mm_model": "inkling",
+    "inkling2_loop": "inkling2",
     "lille-130m": "lille_130m",
 }
 
@@ -159,6 +165,7 @@ def skip_multimodal_module(path: str) -> bool:
         "sam_model",
         "audio_model",
         "audio_tower",
+        "embed_audio",
         "code_predictor",
         "img_projector",
         "multi_modal_projector",
@@ -541,25 +548,42 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             if quantization_config is not None:
                 config["quantization_config"] = quantization_config
 
-        if quantization_config is None:
+        # Inkling 2 Mini declares ModelOpt NVFP4 at the root, but its native
+        # sidecar specifies the actual format for each expert projection.
+        native_quantization_fn = getattr(model, "quantization_from_metadata", None)
+        read_native_metadata = (
+            native_quantization_fn is not None
+            and (quantization_config or {}).get("quant_method") == "modelopt"
+        )
+        if quantization_config is None or read_native_metadata:
             hf_quant_path = model_path / "hf_quant_config.json"
             if hf_quant_path.exists():
                 with open(hf_quant_path) as f:
                     hf_metadata = json.load(f)
                 hf_quant = hf_metadata.get("quantization", {})
-                if hf_quant.get("quant_algo") == "NVFP4":
+                native_quantization = (
+                    native_quantization_fn(hf_metadata)
+                    if native_quantization_fn is not None
+                    else None
+                )
+                if native_quantization is not None:
+                    quantization_config = native_quantization
+                    model_config.quantization = model_config.quantization_config = (
+                        native_quantization
+                    )
+                    config["quantization"] = config["quantization_config"] = (
+                        native_quantization
+                    )
+                elif (
+                    quantization_config is None
+                    and hf_quant.get("quant_algo") == "NVFP4"
+                ):
                     # nvfp4 implies group_size=16
                     config["quantization"] = config["quantization_config"] = {
                         "group_size": 16,
                         "bits": 4,
                         "mode": "nvfp4",
                     }
-                elif hasattr(model, "quantization_from_metadata"):
-                    native_quantization = model.quantization_from_metadata(hf_metadata)
-                    if native_quantization is not None:
-                        config["quantization"] = config["quantization_config"] = (
-                            native_quantization
-                        )
 
         if quantization_config is not None:
             quant_method = quantization_config.get("quant_method")
@@ -899,7 +923,8 @@ def load(
         progress_callback: Optional callable receiving stage, elapsed time and
             measured file/layer counts. Callbacks run on the loading thread.
             ``loaded`` means model/processor loading finished; with lazy=True,
-            parameter evaluation is still deferred. Exceptions report ``failed``.
+            parameter evaluation is still deferred. ModelLoadCancelled reports
+            ``cancelled``; other exceptions report ``failed``.
         quantize_activations (bool, optional): If True, convert QuantizedLinear layers
             to QQLinear layers for activation quantization. Only supported for models
             quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
@@ -943,10 +968,13 @@ def load(
             processor.image_processor = image_processor
         if hasattr(model, "attach_processor"):
             model.attach_processor(processor)
+        report("loaded", lazy=lazy)
+    except ModelLoadCancelled:
+        report("cancelled")
+        raise
     except BaseException:
         report("failed")
         raise
-    report("loaded", lazy=lazy)
     return model, processor
 
 
@@ -1127,6 +1155,12 @@ def fetch_from_hub(
 ) -> Tuple[nn.Module, dict, ProcessorMixin]:
     model = load_model(model_path, lazy, **kwargs)
     config = load_config(model_path, **kwargs)
+    if (
+        "quantization" not in config
+        and hasattr(model, "quantization_from_metadata")
+        and (native_quantization := getattr(model.config, "quantization", None))
+    ):
+        config["quantization"] = config["quantization_config"] = native_quantization
     processor = load_processor(
         model_path,
         add_detokenizer=False,
@@ -1394,9 +1428,13 @@ def load_image(
 
 
 def resize_image(img, max_size):
+    if max_size[0] <= 0 or max_size[1] <= 0:
+        raise ValueError("resize target dimensions must be positive")
 
     ratio = min(max_size[0] / img.width, max_size[1] / img.height)
-    new_size = (int(img.width * ratio), int(img.height * ratio))
+    # Extreme aspect ratios truncate one side to zero; PIL rejects 0-size
+    # images, so keep at least one pixel on each axis.
+    new_size = (max(1, int(img.width * ratio)), max(1, int(img.height * ratio)))
     return img.resize(new_size)
 
 

@@ -4,6 +4,15 @@ from typing import Optional
 from ..base import BaseModelConfig
 
 
+@dataclass(frozen=True)
+class LoopConfig:
+    core_start: int
+    core_end: int
+    num_passes: int
+    gate_rank: int
+    is_varloop: bool = False
+
+
 @dataclass
 class TextConfig(BaseModelConfig):
     model_type: str = "inkling2_text"
@@ -40,6 +49,38 @@ class TextConfig(BaseModelConfig):
     mlp_gate_softcap: float = 4.0
     mlp_up_softcap: float = 25.0
     final_logit_softcapping: float = 30.0
+    loop_config: LoopConfig | None = None
+
+    def __post_init__(self):
+        if isinstance(self.loop_config, dict):
+            self.loop_config = LoopConfig(**self.loop_config)
+        loop = self.loop_config
+        if loop is None:
+            if self.model_type == "inkling2_loop_text":
+                raise ValueError("Inkling 2 Mini requires loop_config")
+            return
+        if not (
+            0 < loop.core_start < loop.core_end <= self.num_hidden_layers
+            and self.n_layers_per_attn_res_block > 0
+            and loop.core_start % self.n_layers_per_attn_res_block == 0
+            and loop.core_end % self.n_layers_per_attn_res_block == 0
+            and loop.num_passes >= 1
+            and loop.gate_rank >= 1
+            and not loop.is_varloop
+        ):
+            raise ValueError(f"Unsupported Inkling 2 loop_config: {loop}")
+
+    @property
+    def layer_indices(self):
+        indices = tuple(range(self.num_hidden_layers))
+        loop = self.loop_config
+        if loop is None:
+            return indices
+        return (
+            indices[: loop.core_start]
+            + indices[loop.core_start : loop.core_end] * loop.num_passes
+            + indices[loop.core_end :]
+        )
 
     def layer_is_sliding(self, index):
         if self.layer_types is not None:

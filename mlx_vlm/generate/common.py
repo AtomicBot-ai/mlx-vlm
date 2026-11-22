@@ -9,6 +9,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_reduce
 
+from .. import _generation_stream
 from ..kv_quant import from_legacy as kv_quant_from_legacy
 from ..models import cache
 from ..turboquant import HybridQuantKVCache, TurboQuantKVCache, turboquant_enabled
@@ -31,8 +32,7 @@ DEFAULT_PREFILL_BATCH_SIZE = 8
 DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH = 64
 DEFAULT_DIFFUSION_MAX_DENOISING_STEPS = 48
 
-# A stream on the default device just for generation
-generation_stream = mx.new_thread_local_stream(mx.default_device())
+generation_stream = _generation_stream.generation_stream
 
 
 class DiffusionRNG:
@@ -334,10 +334,13 @@ class PromptCacheState:
     def __init__(self):
         self.cache: Optional[List[Any]] = None
         self.token_ids: Optional[List[int]] = None
+        self.video_timing: tuple[float, ...] = ()
 
-    def find_prefix_length(self, new_ids: list) -> int:
-        """Return the number of leading tokens that match the cached ids."""
-        if self.token_ids is None:
+    def find_prefix_length(
+        self, new_ids: list, *, video_timing: tuple[float, ...] = ()
+    ) -> int:
+        """Return the matching token prefix when video timing also agrees."""
+        if self.token_ids is None or self.video_timing != video_timing:
             return 0
         max_len = min(len(self.token_ids), len(new_ids))
         for i in range(max_len):
@@ -345,7 +348,10 @@ class PromptCacheState:
                 return i
         return max_len
 
-    def update(self, token_ids: list, kv_cache: list):
+    def update(
+        self, token_ids: list, kv_cache: list, *, video_timing: tuple[float, ...] = ()
+    ):
         """Store the full token sequence and corresponding KV cache."""
         self.token_ids = list(token_ids)
         self.cache = kv_cache
+        self.video_timing = video_timing
