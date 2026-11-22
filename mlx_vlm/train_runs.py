@@ -38,7 +38,7 @@ import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass, fields
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +47,7 @@ PYTHON_ENV = "MLX_VLM_TRAIN_PYTHON"
 LIMIT_ENV_PREFIX = "MLX_VLM_TRAIN_"
 DEFAULT_RUNS_DIR = "~/.mlx-vlm/runs"
 LIMITS_FILE = "limits.json"
+LAUNCHES_FILE = "launches.json"
 ACTIVE = {"running"}
 # Written into a run's folder to ask it to save its weights and end; the
 # trainer looks for it at each report. Its last generation, for algorithms
@@ -138,6 +139,15 @@ class Limits:
 
 def _now() -> datetime:
     return datetime.now().astimezone()
+
+
+def _write_json(path: Path, data: dict) -> None:
+    tmp = path.with_name(f"{path.stem}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+    try:
+        tmp.write_text(json.dumps(data, indent=2))
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _read_tail(path: Path, max_bytes: int = 256_000, *, keep_first_line=False) -> str:
@@ -302,15 +312,7 @@ class RunManager:
 
     # -- state --------------------------------------------------------------
     def _save(self, run: dict[str, Any]) -> None:
-        path = self.root / run["id"] / "run.json"
-        # Several processes (a host app's polls, its tools) can settle the same
-        # run at once, so each writes its own temporary file before the swap.
-        tmp = path.with_name(f"run.{os.getpid()}.{secrets.token_hex(4)}.tmp")
-        try:
-            tmp.write_text(json.dumps(run, indent=2))
-            tmp.replace(path)
-        finally:
-            tmp.unlink(missing_ok=True)
+        _write_json(self.root / run["id"] / "run.json", run)
 
     def _load(self, run_id: str) -> dict[str, Any] | None:
         try:
@@ -377,14 +379,33 @@ class RunManager:
             return matches[0]
         raise LookupError(f"No run '{run_id}'.")
 
+    def _recent_launches(self, runs: list[dict[str, Any]]) -> dict[str, float]:
+        try:
+            launches = json.loads((self.root / LAUNCHES_FILE).read_text())
+        except FileNotFoundError:
+            launches = {}
+        # Also count runs created before launch history was stored separately.
+        for run in runs:
+            if run["id"] not in launches:
+                launches[run["id"]] = datetime.fromisoformat(
+                    run["created_at"]
+                ).timestamp()
+        cutoff = _now().timestamp() - 24 * 60 * 60
+        return {key: stamp for key, stamp in launches.items() if stamp > cutoff}
+
+    @contextlib.contextmanager
+    def _launch_lock(self):
+        with open(self.root / ".start.lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            yield
+
     def usage(self) -> dict[str, Any]:
         """The caps and how much of each is in use right now."""
         runs = self.runs()
-        day_ago = (_now() - timedelta(days=1)).isoformat(timespec="seconds")
         return {
             "limits": asdict(self.limits),
             "active_runs": sum(r["status"] in ACTIVE for r in runs),
-            "runs_last_24h": sum(r["created_at"] >= day_ago for r in runs),
+            "runs_last_24h": len(self._recent_launches(runs)),
             "system": {"memory_gb": _system_memory_gb()},
         }
 
@@ -396,22 +417,23 @@ class RunManager:
         self.root.mkdir(parents=True, exist_ok=True)
         # Several hosts may share one runs root. Hold one lock over the cap
         # check, the launch and the first state write.
-        with open(self.root / ".start.lock", "a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+        with self._launch_lock():
             return self._start(name, checked["config"], checked["notes"])
 
     def _start(
         self, name: str, config: dict[str, Any], notes: list[str]
     ) -> dict[str, Any]:
-        usage = self.usage()
+        runs = self.runs()
+        launches = self._recent_launches(runs)
+        active = sum(r["status"] in ACTIVE for r in runs)
         cap = self.limits.max_concurrent_runs
-        if cap is not None and usage["active_runs"] >= cap:
+        if cap is not None and active >= cap:
             raise RuntimeError(
-                f"Usage cap: {usage['active_runs']} of {cap} concurrent runs in use. "
+                f"Usage cap: {active} of {cap} concurrent runs in use. "
                 "Stop a run first."
             )
         cap = self.limits.max_runs_per_day
-        if cap is not None and usage["runs_last_24h"] >= cap:
+        if cap is not None and len(launches) >= cap:
             raise RuntimeError(
                 f"Usage cap: {cap} runs were already started in the last 24 hours."
             )
@@ -472,6 +494,8 @@ class RunManager:
             "notes": notes,
         }
         self._save(run)
+        launches[run_id] = now.timestamp()
+        _write_json(self.root / LAUNCHES_FILE, launches)
         return run
 
     def stop(
@@ -606,7 +630,10 @@ class RunManager:
         run = self.get(run_id)
         if run["status"] in ACTIVE:
             raise RuntimeError(f"Run '{run['id']}' is still running. Stop it first.")
-        shutil.rmtree(self.root / run["id"])
+        with self._launch_lock():
+            # Persist this launch first, including when deleting a legacy run.
+            _write_json(self.root / LAUNCHES_FILE, self._recent_launches([run]))
+            shutil.rmtree(self.root / run["id"])
         self._procs.pop(run["id"], None)
         return {"deleted": run["id"]}
 

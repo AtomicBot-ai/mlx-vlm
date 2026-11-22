@@ -465,6 +465,31 @@ def test_daily_run_cap(manager):
     assert manager.usage()["runs_last_24h"] == 1
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+def test_deleted_run_counts_until_its_launch_expires(manager, legacy):
+    from datetime import datetime, timedelta, timezone
+
+    manager.limits = Limits(max_runs_per_day=1)
+    launched = datetime(2026, 11, 1, 8, 30, tzinfo=timezone.utc)
+    with patch("mlx_vlm.train_runs._now", return_value=launched):
+        run = wait_for_end(manager, manager.start({"model": "m"})["id"])
+        if legacy:
+            (manager.root / "launches.json").unlink()
+        manager.delete(run["id"])
+    restarted = RunManager(manager.root, manager.limits, python=manager.python)
+    with patch(
+        "mlx_vlm.train_runs._now",
+        return_value=launched + timedelta(hours=23, minutes=59),
+    ):
+        assert restarted.usage()["runs_last_24h"] == 1
+        with pytest.raises(RuntimeError, match="last 24 hours"):
+            restarted.start({"model": "m"})
+    with patch("mlx_vlm.train_runs._now", return_value=launched + timedelta(hours=24)):
+        assert restarted.usage()["runs_last_24h"] == 0
+        wait_for_end(restarted, restarted.start({"model": "m"})["id"])
+        assert restarted.usage()["runs_last_24h"] == 1
+
+
 def test_invalid_options_start_nothing(tmp_path):
     manager = RunManager(tmp_path / "runs", Limits())
     with pytest.raises(ValueError, match="Unknown config options"):
