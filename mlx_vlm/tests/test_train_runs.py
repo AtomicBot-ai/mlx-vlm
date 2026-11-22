@@ -582,6 +582,26 @@ def test_concurrent_saves_of_one_run_do_not_collide(manager):
     assert not list((manager.root / run["id"]).glob("*.tmp"))
 
 
+def test_long_progress_log_and_nonfinite_metrics(manager):
+    run = wait_for_end(manager, manager.start({"model": "m"})["id"])
+    path = Path(run["progress_path"])
+    path.write_text("")
+    callback = ProgressCallback(path)
+    callback.write("start", iters=1000)
+    callback.write("train", iteration=1, note="x" * 260_000)
+    callback.write("train", iteration=2, loss=float("inf"), perplexity=float("nan"))
+    assert json.loads(path.read_text().splitlines()[-1])["loss"] is None
+    # Older progress files used Python's nonstandard JSON constants.
+    with path.open("a") as log:
+        log.write('{"event":"train","iteration":3,"loss":-Infinity,"perplexity":NaN}\n')
+    status = manager.summary(run)
+    assert status["iters"] == 1000 and manager.remaining(run) == 997
+    assert status["metrics"]["loss"] is None and status["metrics"]["perplexity"] is None
+    history = manager.history(run)
+    assert history["iters"] == 1000 and "loss" not in history["series"]
+    json.dumps([status, history], allow_nan=False)
+
+
 def test_describe_reports_which_optimizers_read_an_option():
     options = {
         option["name"]: option

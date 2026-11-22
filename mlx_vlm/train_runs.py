@@ -140,11 +140,15 @@ def _now() -> datetime:
     return datetime.now().astimezone()
 
 
-def _read_tail(path: Path, max_bytes: int = 256_000) -> str:
+def _read_tail(path: Path, max_bytes: int = 256_000, *, keep_first_line=False) -> str:
     try:
         with open(path, "rb") as file:
-            file.seek(max(0, path.stat().st_size - max_bytes))
-            return file.read().decode("utf-8", "replace")
+            offset = max(0, os.fstat(file.fileno()).st_size - max_bytes)
+            header = file.readline() if offset and keep_first_line else b""
+            file.seek(offset - 1 if header else offset)
+            if header:
+                file.readline()  # discard the partial event at the tail boundary
+            return (header + file.read()).decode("utf-8", "replace")
     except OSError:
         return ""
 
@@ -596,9 +600,11 @@ class RunManager:
     def progress(self, run: dict[str, Any]) -> dict[str, Any]:
         """Latest metrics from the run's progress file."""
         info: dict[str, Any] = {}
-        for line in _read_tail(Path(run["progress_path"])).splitlines():
+        for line in _read_tail(
+            Path(run["progress_path"]), keep_first_line=True
+        ).splitlines():
             try:
-                event = json.loads(line)
+                event = json.loads(line, parse_constant=lambda _: None)
             except ValueError:
                 continue  # a partial first or last line
             kind = event.pop("event", None)
@@ -630,7 +636,7 @@ class RunManager:
             lines = []
         for line in lines:
             try:
-                event = json.loads(line)
+                event = json.loads(line, parse_constant=lambda _: None)
             except ValueError:
                 continue
             kind = event.get("event")
@@ -644,7 +650,7 @@ class RunManager:
             for name, value in event.items():
                 if name in ("event", "time", "iteration") or isinstance(value, bool):
                     continue
-                if isinstance(value, (int, float)) and value == value:  # skips NaN
+                if isinstance(value, (int, float)):
                     series.setdefault(name, []).append([iteration, value])
         max_points = max(2, max_points)
         for name, points in series.items():

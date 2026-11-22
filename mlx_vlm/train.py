@@ -573,8 +573,16 @@ class ProgressCallback:
         if not self.path:
             return
         record = {"event": event, "time": time.time(), **info}
+        try:
+            line = json.dumps(record, default=float, allow_nan=False)
+        except ValueError:
+            # Divergent metrics (including scalar arrays) become JSON null.
+            record = json.loads(
+                json.dumps(record, default=float), parse_constant=lambda _: None
+            )
+            line = json.dumps(record, allow_nan=False)
         with open(self.path, "a", encoding="utf-8") as file:
-            file.write(json.dumps(record, default=float) + "\n")
+            file.write(line + "\n")
 
     def whole_run(self, info):
         """Report positions within the whole run, not just this part of it."""
