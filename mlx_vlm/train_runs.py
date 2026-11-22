@@ -208,8 +208,10 @@ def resolve_paths(options: dict[str, Any], base: Path) -> dict[str, Any]:
         path = Path(value).expanduser()
         if not path.is_absolute():
             path = base / path
-        if path.exists() or (
-            key.endswith(("_path", "_file")) and value.startswith((".", "~", "/"))
+        if (
+            key == "export_qat_path"
+            or path.exists()
+            or (key.endswith(("_path", "_file")) and value.startswith((".", "~", "/")))
         ):
             resolved[key] = str(path.resolve())
     return resolved

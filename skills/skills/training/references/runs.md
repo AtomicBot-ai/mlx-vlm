@@ -65,7 +65,7 @@ When `check` or `start` is refused, name the cap and its value and offer somethi
 
 - Weights and numbered checkpoints are in the run's `adapter_path`, beside `adapter_config.json`. Keep them together.
 - With `lora` or `dora` this is an adapter that only works on top of its base model. Load it with `--adapter-path <adapter_path>` on `mlx_vlm.generate`; see `Skill("mlx-vlm-skills:cli-inference")`.
-- For a standalone model, set `export_qat_path` to a new folder in the options. When the run ends the trained weights are fused into a full model there, and `status` reports it as `export_path`. The folder must not exist yet.
+- For a standalone model, set `export_qat_path` to a new folder in the options. When training completes the trained weights are fused into a full model there, and `status` reports the destination as `export_path`. Stopped and capped runs defer export until completion.
 
 ## Housekeeping
 

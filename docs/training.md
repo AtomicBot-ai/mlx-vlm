@@ -383,7 +383,9 @@ validated by the training parser itself. Each run is a detached
 `train.log`, `progress.jsonl` and `adapters/`. State is on disk, so runs
 survive a restart of the host. A run ends as `completed`, `capped`, `stopped`
 or `failed`. Set `export_qat_path` in the options to also save a merged,
-standalone model when the run ends; `status` reports it as `export_path`.
+standalone model when training completes. Relative export paths resolve from
+the caller's directory. A stopped or capped run saves its training checkpoint
+and defers the export until a continuation finishes.
 
 `stop` asks the run to end at its next report: it saves its weights and a
 `trainer_state.safetensors` (optimizer state, random state and position)

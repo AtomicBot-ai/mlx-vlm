@@ -608,6 +608,8 @@ class ProgressCallback:
             )
             if self.wrapped is not None:
                 self.wrapped.on_train_loss_report(train_info)
+        if self.total is not None and train_info["iteration"] + self.done == self.total:
+            return  # Finish validation, the final checkpoint and any requested export.
         stopped = bool(self.path and (Path(self.path).parent / STOP_FILE).exists())
         minutes = (time.monotonic() - self.started) / 60
         time_cap = (
@@ -936,6 +938,7 @@ def run(args, settings, training_callback=None):
         resumed_at, _ = restore_trainer_state(trainer, args.resume_state, progress)
         print(f"Continuing at iteration {resumed_at + 1} of {total_iters}.")
     if progress is not None:
+        progress.total = total_iters
         progress.write(
             "start",
             task=args.task,
@@ -982,18 +985,18 @@ def run(args, settings, training_callback=None):
             if primary:
                 print("Stopped on request. Weights saved.", file=sys.stderr)
         else:
+            if primary and getattr(args, "export_qat_path", None):
+                from .export import export_model
+
+                export_model(
+                    model,
+                    processor,
+                    args.export_qat_path,
+                    model_path=args.model,
+                    quantize=getattr(args, "export_quantize", None),
+                )
             if progress is not None:
                 progress.write("end", **progress.whole_run(metrics))
-        if primary and getattr(args, "export_qat_path", None):
-            from .export import export_model
-
-            export_model(
-                model,
-                processor,
-                args.export_qat_path,
-                model_path=args.model,
-                quantize=getattr(args, "export_quantize", None),
-            )
         return metrics
     finally:
         if callback is not None:

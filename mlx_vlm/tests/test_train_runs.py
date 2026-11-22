@@ -485,6 +485,71 @@ def test_local_paths_become_absolute(tmp_path):
     assert resolved["iters"] == 5
 
 
+def _tiny_training_cli():
+    import numpy as np
+    from mlx_vlm.tests.test_training_cli import TinyVLM
+
+    def prepare(**kwargs):
+        return {"input_ids": np.array([[1, 2, 3, 4]])}
+
+    with (
+        patch.object(
+            train_cli,
+            "_load_model",
+            return_value=(TinyVLM(), SimpleNamespace(pad_token_id=0)),
+        ),
+        patch(
+            "mlx_vlm.trainer.vlm.cross_entropy.dataset._load_vlm_helpers",
+            return_value=({}, None, prepare, None),
+        ),
+    ):
+        train_cli.main()
+
+
+def test_export_after_continuation_survives_run_deletion(tmp_path, monkeypatch):
+    import mlx.core as mx
+
+    monkeypatch.chdir(tmp_path)
+    Path("base").mkdir()
+    Path("base/config.json").write_text('{"model_type":"tiny"}')
+    Path("train.jsonl").write_text('{"text":"sample"}\n')
+    manager = RunManager(tmp_path / "runs", Limits(max_minutes=0.000001))
+    monkeypatch.setattr(
+        manager,
+        "_train_command",
+        lambda *args: [
+            sys.executable,
+            "-c",
+            "from mlx_vlm.tests.test_train_runs import _tiny_training_cli; _tiny_training_cli()",
+            *args,
+        ],
+    )
+    destination = tmp_path / "models" / "final"
+    run = manager.start(
+        dict(
+            model="base",
+            data="train.jsonl",
+            train_type="full",
+            iters=2,
+            steps_per_report=1,
+            export_qat_path="models/final",
+        )
+    )
+    capped = wait_for_end(manager, run["id"], timeout=90)
+    assert capped["status"] == "capped", manager.log_tail(capped)
+    assert capped["export_path"] == str(destination) and not destination.exists()
+    # The cap also expires during the final iteration of the continuation.
+    finished = wait_for_end(manager, manager.resume(run["id"])["id"], timeout=90)
+    assert finished["status"] == "completed", manager.log_tail(finished)
+    weights = mx.load(str(manager.weights(finished)))
+    exported = mx.load(str(destination / "model.safetensors"))
+    assert exported.keys() == weights.keys()
+    assert all(mx.array_equal(v, exported[k]).item() for k, v in weights.items())
+    manager.delete(capped["id"])
+    manager.delete(finished["id"])
+    assert (destination / "model.safetensors").is_file()
+
+
 def test_inspect_dataset_reports_splits(tmp_path):
     (tmp_path / "train.jsonl").write_text('{"question": "q", "answer": "a"}\n' * 3)
     (tmp_path / "valid.jsonl").write_text('{"question": "q", "answer": "a"}\n')
