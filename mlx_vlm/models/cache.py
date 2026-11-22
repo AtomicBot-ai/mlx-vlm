@@ -639,6 +639,147 @@ class KVCache(_BaseCache):
         return self.keys.nbytes + self.values.nbytes
 
 
+class AttentionSinkKVCache(KVCache):
+    """Chronological K/V with a zero sink row immediately after the newest key.
+
+    A bounded cache compacts only when the next append exhausts the allocation.
+    Keep the entire previous window when compacting so even aborting a verify
+    that crosses this boundary can restore the original prefix.
+    """
+
+    def __init__(self, max_size=None):
+        super().__init__()
+        self.max_size = max_size
+        self._end = 0  # physical write position; offset counts all tokens seen
+        self._written = 0  # rows below here can contain a rejected draft
+
+    def update_and_fetch(self, keys, values):
+        length = keys.shape[2]
+        end = self._end
+        if self.keys is None or end + length >= self.keys.shape[2]:
+            keep = self.size()
+            pad = self.step - (keep + length) % self.step
+
+            def grow(old, new):
+                tail = mx.zeros((*new.shape[:2], pad, new.shape[-1]), new.dtype)
+                parts = [old[..., end - keep : end, :]] if keep else []
+                return mx.concatenate([*parts, new, tail], axis=2)
+
+            self.keys = grow(self.keys, keys)
+            self.values = grow(self.values, values)
+            end = keep
+            self._written = end + length
+        else:
+            stop = end + length
+            self.keys[..., end:stop, :] = keys
+            self.values[..., end:stop, :] = values
+            if stop < self._written:
+                self.keys[..., stop : stop + 1, :] = 0
+                self.values[..., stop : stop + 1, :] = 0
+            self._written = max(self._written, stop)
+        self._end = end + length
+        self.offset += length
+        # The first query in a block needs the preceding window minus one.
+        start = 0 if self.max_size is None else max(0, end - self.max_size + 1)
+        return (
+            self.keys[..., start : self._end, :],
+            self.values[..., start : self._end, :],
+        )
+
+    def with_sink(self, length):
+        rows = slice(self._end - length, self._end + 1)
+        return self.keys[..., rows, :], self.values[..., rows, :]
+
+    def size(self):
+        return self.offset if self.max_size is None else min(self.offset, self.max_size)
+
+    def make_mask(self, N, window_size=None, return_array=False):
+        offset = self.offset
+        if self.max_size is not None:
+            offset = min(offset, self.max_size - 1)
+            window_size = window_size or self.max_size
+        return create_attention_mask(N, offset, return_array, window_size)
+
+    def trim(self, n):
+        # After compaction an earlier prefix is valid only if its full window
+        # is still present. A speculative block always satisfies this condition.
+        limit = self._end if self.offset == self._end else self._end - self.max_size
+        n = max(0, min(n, limit))
+        self.offset -= n
+        self._end -= n
+        return n
+
+    def is_trimmable(self):
+        return self.offset == self._end
+
+    @property
+    def state(self):
+        if self.keys is None:
+            return None, None
+        rows = slice(self._end - self.size(), self._end)
+        return self.keys[..., rows, :], self.values[..., rows, :]
+
+    @state.setter
+    def state(self, state):
+        self.keys, self.values = state
+        self._end = self._written = 0 if self.keys is None else self.keys.shape[2]
+        self.offset = self._end
+
+    @property
+    def meta_state(self):
+        return self.max_size, self.offset
+
+    @meta_state.setter
+    def meta_state(self, metadata):
+        self.max_size, self.offset = metadata
+
+    def prefix_cache_reserve(self, min_capacity_tokens):
+        if self.max_size is not None:
+            return ()
+        return super().prefix_cache_reserve(min_capacity_tokens + 1)
+
+    def _temporal_order(self, value):
+        # BatchRotatingKVCache.merge takes the last size() chronological rows.
+        return value[..., : self._end, :]
+
+    @classmethod
+    def merge(cls, caches):
+        if getattr(caches[0], "max_size", None) is not None:
+            return BatchRotatingKVCache.merge(caches)
+        return BatchKVCache.merge(caches)
+
+    def prefix_cache_merge(self, rows, prefix_lens):
+        # A disk hit or a row extracted from a padded batch can use the legacy
+        # cache layout. Both batch mergers also accept its chronological peers.
+        legacy = KVCache if self.max_size is None else RotatingKVCache
+        if all(
+            type(c) in (AttentionSinkKVCache, legacy)
+            and getattr(c, "max_size", None) == self.max_size
+            for c in rows
+        ):
+            return self.merge(rows)
+        return None
+
+    @property
+    def preserve_auxiliary_kv_state(self):
+        return self.max_size is not None
+
+    def to_quantized(self, group_size=64, bits=4):
+        if self.max_size is not None:
+            raise NotImplementedError("Sliding-window KV quantization is not supported")
+        return super().to_quantized(group_size, bits)
+
+    def memory_profile(self, token_count):
+        profile = _kv_memory_profile(self, token_count)
+        # The buffer can hold a full committed window, the incoming chunk and
+        # its sink. Allow a step of headroom when admission rounds the capacity.
+        return replace(
+            profile,
+            window_size=self.max_size,
+            fixed_bytes=int(self.step * profile.bytes_per_token),
+        )
+
+
 class RotatingKVCache(_BaseCache):
     memory_profile = _windowed_memory_profile
     step = 256

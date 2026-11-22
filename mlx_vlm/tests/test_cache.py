@@ -91,6 +91,7 @@ from mlx_vlm.tests.test_models import (
     DATA,
     build_config,
     make_ernie55_model,
+    make_inkling2_model,
     model_case,
     tiny_language_model,
 )
@@ -4606,13 +4607,9 @@ def test_deepseek_v41_batch_cache_restores_all_state(abort):
     )
 
 
-def test_inkling2_padded_batch_decode_and_extract():
-    from mlx_vlm.generate.ar import _make_cache
-    from mlx_vlm.models.inkling2 import Model, ModelConfig
-
-    mx.random.seed(23)
-    model = Model(ModelConfig.from_dict(model_case("inkling2")["config"]))
-    model.eval()
+@parametrize("family", ["small", "mini"])
+def test_inkling2_padded_batch_decode_and_extract(family):
+    model = make_inkling2_model(family)
     # Nonzero relative profiles expose ordering errors when a ring wraps.
     for layer in model.layers:
         layer.self_attn.rel_proj = mx.random.normal(layer.self_attn.rel_proj.shape)
@@ -4652,6 +4649,89 @@ def test_inkling2_padded_batch_decode_and_extract():
         atol=2e-5,
         rtol=2e-5,
     )
+
+
+@parametrize("prefix_len", [3, 4, 5, 11])
+@parametrize("keep", [0, 2, 5])
+def test_inkling2_sink_cache_window_rollback(prefix_len, keep):
+    from mlx_vlm.speculative.cache_state import start_speculative_cache
+
+    cache = C.AttentionSinkKVCache(max_size=4)
+    cache.step = 4  # exercise physical compaction as well as the logical window
+    prefix = mx.arange(1, prefix_len + 1).reshape(1, 1, -1, 1)
+    draft = mx.arange(51, 56).reshape(1, 1, -1, 1)
+    for i in range(prefix_len):
+        row = prefix[:, :, i : i + 1]
+        cache.update_and_fetch(row, -row)
+    transaction = start_speculative_cache([cache], 5)
+    keys, _ = cache.update_and_fetch(draft, -draft)
+    expected = mx.concatenate([prefix[:, :, -3:], draft], axis=2)
+    np.testing.assert_array_equal(keys, expected)
+    if keep:
+        transaction.commit([keep])
+    else:
+        transaction.abort()
+    history = mx.concatenate([prefix, draft[:, :, :keep]], axis=2)
+    assert cache.offset == prefix_len + keep
+    for actual, sign in zip(cache.state, (1, -1)):
+        np.testing.assert_array_equal(actual, sign * history[:, :, -4:])
+    next_key = mx.array([[[[91]]]])
+    keys, _ = cache.update_and_fetch(next_key, -next_key)
+    expected = mx.concatenate(
+        [history[:, :, -3:], next_key, mx.zeros_like(next_key)], axis=2
+    )
+    for actual, sign in zip(cache.with_sink(keys.shape[2]), (1, -1)):
+        np.testing.assert_array_equal(actual, sign * expected)
+
+
+@parametrize("tier", ["memory", "disk"])
+def test_inkling2_mini_prefix_restore_and_padded_verify(
+    tier, prefix_manager, monkeypatch
+):
+    monkeypatch.setenv("APC_EXACT_MIN_TOKENS", "1")
+    lm = make_inkling2_model("mini").language_model
+    long_prefix, short_prefix = list(range(1, 12)), [13, 14]
+    original = lm.make_cache()
+    assert all(isinstance(layer[0], C.AttentionSinkKVCache) for layer in original)
+    for i in range(0, len(long_prefix), 3):
+        mx.eval(lm(mx.array([long_prefix[i : i + 3]]), cache=original).logits)
+    if tier == "disk":
+        restored, _ = disk_roundtrip(prefix_manager, long_prefix, original, block=1)
+    else:
+        manager = prefix_manager(block=1)
+        assert manager.store_exact_cache(long_prefix, original)
+        restored, count = manager.lookup_exact_cache(long_prefix + [15])
+        assert count == len(long_prefix)
+    assert all(isinstance(layer[0], C.AttentionSinkKVCache) for layer in restored)
+    actual = lm(mx.array([[15]]), cache=restored).logits
+    expected = lm(mx.array([long_prefix + [15]])).logits[:, -1:]
+    np.testing.assert_allclose(actual, expected, atol=2e-5, rtol=2e-5)
+
+    # Padded batch rows and pre-existing disk snapshots can supply legacy
+    # cache types. Merge one such short row with the restored, wrapped row.
+    legacy = [
+        CacheList(
+            RotatingKVCache(kv.max_size) if kv.max_size else KVCache(), ArraysCache(4)
+        )
+        for kv, _ in (layer.caches for layer in original)
+    ]
+    mx.eval(lm(mx.array([short_prefix]), cache=legacy).logits)
+    merged, count = warm_exact(
+        [legacy, restored], [len(short_prefix), len(long_prefix) + 1]
+    )
+    assert count == len(long_prefix) + 1
+    drafts = [[18, 19, 20], [21, 22, 23]]
+    verify = lm(mx.array(drafts), cache=merged, speculative_verify=True)
+    mx.eval(verify.logits)
+    verify.gdn_states.commit([1, 2])
+    actual = lm(mx.array([[24], [25]]), cache=merged).logits
+    for row, tokens in enumerate(
+        (short_prefix + [18, 24], long_prefix + [15, 21, 22, 25])
+    ):
+        expected = lm(mx.array([tokens])).logits[:, -1:]
+        np.testing.assert_allclose(
+            actual[row : row + 1], expected, atol=2e-5, rtol=2e-5
+        )
 
 
 def test_ernie55_chunked_decode_compression_and_sparse_attention():
