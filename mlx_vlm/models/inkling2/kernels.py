@@ -68,7 +68,9 @@ def _divisor(width):
 def short_convolution(
     state, weight, x, mask, width, residual=None, output_dtype=None, write_window=False
 ):
-    """Optionally emit the unmasked FP32 history used for decode and rollback."""
+    """Return None off Metal, otherwise emit the output and optional FP32 window."""
+    if not mx.metal.is_available() or mx.default_device() != mx.gpu:
+        return None
     inputs = [state, weight, x, x if mask is None else mask, _divisor(width)]
     output_dtype = x.dtype if output_dtype is None else output_dtype
     shapes, dtypes = [x.shape], [output_dtype]

@@ -202,15 +202,16 @@ class ShortConvolution(InklingShortConvolution):
                 output_dtype,
                 write_window,
             )
-            if not write_window:
-                _update_conv_cache(cache, self.conv_idx, state, x, mask)
+            if result is not None:
+                if write_window:
+                    result, window = result
+                    width = self.kernel_size - 1
+                    if getattr(cache, "is_speculating", False):
+                        cache.record_speculative_window(self.conv_idx, window, width)
+                    cache[self.conv_idx] = window[:, -width:]
+                else:
+                    _update_conv_cache(cache, self.conv_idx, state, x, mask)
                 return result
-            out, window = result
-            width = self.kernel_size - 1
-            if getattr(cache, "is_speculating", False):
-                cache.record_speculative_window(self.conv_idx, window, width)
-            cache[self.conv_idx] = window[:, -width:]
-            return out
         xf = x.astype(mx.float32)
         inputs = xf if mask is None else mx.where(mask[..., None], xf, 0)
         context = mx.concatenate([state, inputs], axis=1)
