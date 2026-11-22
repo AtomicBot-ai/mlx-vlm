@@ -147,6 +147,14 @@ def _read_tail(path: Path, max_bytes: int = 256_000) -> str:
         return ""
 
 
+def _system_memory_gb() -> float | None:
+    """Installed memory, which on Apple silicon is shared with the GPU."""
+    try:
+        return round(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9, 1)
+    except (ValueError, OSError, AttributeError):
+        return None
+
+
 def _pid_alive(pid: int | None) -> bool:
     if not pid:
         return False
@@ -343,6 +351,7 @@ class RunManager:
             "limits": asdict(self.limits),
             "active_runs": sum(r["status"] in ACTIVE for r in runs),
             "runs_last_24h": sum(r["created_at"] >= day_ago for r in runs),
+            "system": {"memory_gb": _system_memory_gb()},
         }
 
     # -- actions ------------------------------------------------------------
@@ -676,7 +685,92 @@ def validate_model(model: str) -> dict[str, Any]:
     _, model_type = get_model_and_args(config)
     if model_type in not_supported_for_training:
         raise ValueError(f"Model type '{model_type}' is not supported for training.")
-    return {"valid": True, "model": model, "model_type": model_type}
+    quantization = config.get("quantization")
+    # Weight files already on disk, as a guide to memory use. Nothing is
+    # downloaded for this, so it is null for a model that is not local yet.
+    weights = [f for f in config_path.parent.glob("*.safetensors") if f.is_file()]
+    return {
+        "valid": True,
+        "model": model,
+        "model_type": model_type,
+        "quantization_bits": (
+            quantization.get("bits") if isinstance(quantization, dict) else None
+        ),
+        "weights_gb": (
+            round(sum(f.stat().st_size for f in weights) / 1e9, 2) if weights else None
+        ),
+    }
+
+
+# Row shapes the trainers read, and the algorithms each one suits.
+_ROW_FORMATS = (
+    ("preference", {"chosen", "rejected"}, ("orpo", "dpo")),
+    ("reward", {"prompt", "answer"}, ("grpo",)),
+    ("messages", {"messages"}, ("sft",)),
+    ("conversations", {"conversations"}, ("sft",)),
+    ("question_answer", {"question", "answer"}, ("sft",)),
+    ("text", {"text"}, ("uft",)),
+)
+_SAMPLE_ROWS = 2000
+
+
+def _text_chars(value: Any) -> int:
+    """Characters of text in a row, ignoring keys, numbers and media."""
+    if isinstance(value, str):
+        return len(value)
+    if isinstance(value, dict):
+        return sum(
+            _text_chars(v) for k, v in value.items() if k not in ("images", "image")
+        )
+    if isinstance(value, (list, tuple)):
+        return sum(_text_chars(v) for v in value)
+    return 0
+
+
+def _describe_split(rows: Any) -> dict[str, Any]:
+    """Row count, columns, the row format and how long the rows are.
+
+    Lengths are read from an even sample of at most ``_SAMPLE_ROWS`` rows and
+    counted in characters, so no tokenizer or model is loaded for this.
+    """
+    from collections.abc import Mapping
+
+    count = len(rows)
+    first = rows[0] if count else {}
+    columns = sorted(first) if isinstance(first, Mapping) else []
+    report: dict[str, Any] = {"rows": count, "columns": columns}
+    if not columns:
+        return report
+    for name, needs, algorithms in _ROW_FORMATS:
+        if needs <= set(columns):
+            report["format"], report["algorithms"] = name, list(algorithms)
+            break
+    else:
+        report["format"], report["algorithms"] = "unknown", []
+    step = max(count // _SAMPLE_ROWS, 1)
+    sample = [rows[i] for i in range(0, count, step)][:_SAMPLE_ROWS]
+    # Columns starting with "_" hold bookkeeping, not training text.
+    lengths = sorted(
+        _text_chars(
+            {k: v for k, v in row.items() if not k.startswith("_")}
+            if isinstance(row, Mapping)
+            else row
+        )
+        for row in sample
+    )
+    with_images = sum(
+        bool(row.get("images") or row.get("image"))
+        for row in sample
+        if isinstance(row, Mapping)
+    )
+    report["sampled_rows"] = len(sample)
+    report["text_chars"] = {
+        "median": lengths[len(lengths) // 2],
+        "p95": lengths[min(int(len(lengths) * 0.95), len(lengths) - 1)],
+        "max": lengths[-1],
+    }
+    report["rows_with_images"] = with_images
+    return report
 
 
 def inspect_dataset(options: dict[str, Any]) -> dict[str, Any]:
@@ -695,13 +789,7 @@ def inspect_dataset(options: dict[str, Any]) -> dict[str, Any]:
         raw = _load_dataset(args)
     splits = raw if isinstance(raw, Mapping) else {"train": raw}
     train_split = options.get("train_split", "train")
-    report = {}
-    for name, rows in splits.items():
-        first = rows[0] if len(rows) else {}
-        report[name] = {
-            "rows": len(rows),
-            "columns": sorted(first) if isinstance(first, Mapping) else [],
-        }
+    report = {name: _describe_split(rows) for name, rows in splits.items()}
     if not report.get(train_split, {}).get("rows"):
         raise ValueError(f"Dataset has no non-empty '{train_split}' split.")
     return {"valid": True, "splits": report}

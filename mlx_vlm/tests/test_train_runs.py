@@ -331,7 +331,15 @@ def test_inspect_dataset_reports_splits(tmp_path):
     (tmp_path / "train.jsonl").write_text('{"question": "q", "answer": "a"}\n' * 3)
     (tmp_path / "valid.jsonl").write_text('{"question": "q", "answer": "a"}\n')
     report = inspect_dataset({"data": str(tmp_path)})
-    assert report["splits"]["train"] == {"rows": 3, "columns": ["answer", "question"]}
+    assert report["splits"]["train"] == {
+        "rows": 3,
+        "columns": ["answer", "question"],
+        "format": "question_answer",
+        "algorithms": ["sft"],
+        "sampled_rows": 3,
+        "text_chars": {"median": 2, "p95": 2, "max": 2},
+        "rows_with_images": 0,
+    }
     assert report["splits"]["valid"]["rows"] == 1
     with pytest.raises(ValueError, match="no non-empty"):
         inspect_dataset({"data": str(tmp_path), "train_split": "missing"})
