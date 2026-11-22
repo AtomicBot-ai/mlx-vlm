@@ -260,6 +260,25 @@ def accumulate_gradients(gradients, previous=None):
     )
 
 
+def average_worker_gradients(gradients, group):
+    """Average gradients across ranks for an optimizer update or checkpoint."""
+    if group.size() == 1:
+        return gradients
+    if not mx.metal.is_available():
+        return average_gradients(gradients, group=group)
+    # Finish the ring collective before a GPU command buffer consumes it
+    # (Metal watchdog, #2179). MLX drops the explicit stream when its
+    # grouped reduction falls back recursively for mixed dtypes.
+    dtypes = {g.dtype for _, g in tree_flatten(gradients)}
+    options = {"all_reduce_size": 0} if len(dtypes) > 1 else {}
+    with mx.stream(mx.cpu):
+        gradients = average_gradients(
+            gradients, group=group, communication_stream=mx.cpu, **options
+        )
+    mx.eval(gradients)
+    return gradients
+
+
 def apply_accumulated_gradients(
     model: nn.Module,
     optimizer,
@@ -272,21 +291,7 @@ def apply_accumulated_gradients(
     """Average across workers and actual microsteps, then update the model."""
     if steps < 1:
         raise ValueError("Accumulation steps must be at least 1.")
-    group = mx.distributed.init()
-    if group.size() > 1:
-        if mx.metal.is_available():
-            # Finish the ring collective before a GPU command buffer consumes it
-            # (Metal watchdog, #2179). MLX drops the explicit stream when its
-            # grouped reduction falls back recursively for mixed dtypes.
-            dtypes = {g.dtype for _, g in tree_flatten(gradients)}
-            options = {"all_reduce_size": 0} if len(dtypes) > 1 else {}
-            with mx.stream(mx.cpu):
-                gradients = average_gradients(
-                    gradients, group=group, communication_stream=mx.cpu, **options
-                )
-            mx.eval(gradients)
-        else:
-            gradients = average_gradients(gradients, group=group)
+    gradients = average_worker_gradients(gradients, mx.distributed.init())
     if steps > 1:
         gradients = tree_map(lambda value: value / steps, gradients)
     if grad_clip is not None:
@@ -401,7 +406,8 @@ def save_trainable_weights(
 
         weights, head_weights = split_mtp_weights(weights)
         save_mtp_head(head, head_weights, mtp_head_dir(destination))
-    mx.save_safetensors(str(destination), weights)
+    metadata = {"training_iteration": str(iteration)} if iteration is not None else None
+    mx.save_safetensors(str(destination), weights, metadata=metadata)
     config = getattr(model, "config", None)
     adapter_config = getattr(model, "_vlm_adapter_config", None)
     if adapter_config is None:
@@ -418,7 +424,7 @@ def save_trainable_weights(
         return
 
     checkpoint = destination.with_name(f"{iteration:07d}_{destination.name}")
-    mx.save_safetensors(str(checkpoint), weights)
+    mx.save_safetensors(str(checkpoint), weights, metadata=metadata)
     if head is not None:
         save_mtp_head(head, head_weights, mtp_head_dir(checkpoint))
     tqdm.write(

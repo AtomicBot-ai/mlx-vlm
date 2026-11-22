@@ -113,6 +113,8 @@ jobs:
               tests/test_training_batching.py
               tests/test_training_callbacks.py
               tests/test_training_cli.py
+              tests/test_train_runs.py
+              tests/test_training_skill.py
               tests/test_training_cross_entropy.py
               tests/test_training_data_loading.py
               tests/test_training_dataset_preparation.py
