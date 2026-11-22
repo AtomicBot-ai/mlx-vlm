@@ -23,13 +23,16 @@ from .trainer.common.schedule import (
 def _read_config(path):
     if path is None:
         return {}
-    with Path(path).open(encoding="utf-8") as file:
-        if Path(path).suffix == ".json":
-            values = json.load(file)
-        else:
-            import yaml
+    if path == "-":
+        values = json.load(sys.stdin)
+    else:
+        with Path(path).open(encoding="utf-8") as file:
+            if Path(path).suffix == ".json":
+                values = json.load(file)
+            else:
+                import yaml
 
-            values = yaml.safe_load(file) or {}
+                values = yaml.safe_load(file) or {}
     if not isinstance(values, dict):
         raise ValueError("Training config must contain a mapping.")
     return values
@@ -107,7 +110,9 @@ def build_parser(task="vlm", algorithm=None):
         type=float,
         help="Usage cap: save and stop when MLX memory use passes this size.",
     )
-    parser.add_argument("-c", "--config")
+    parser.add_argument(
+        "-c", "--config", help="JSON or YAML config file. Use '-' for JSON on stdin."
+    )
     parser.add_argument("--model", "--model-path", help="Model path or Hub identifier.")
     parser.add_argument(
         "--mtp-model",

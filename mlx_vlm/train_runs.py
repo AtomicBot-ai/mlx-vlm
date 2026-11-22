@@ -279,7 +279,7 @@ class RunManager:
         """Validate options with the real training parser; start nothing."""
         config, notes = self._config(options)
         done = subprocess.run(
-            self._train_command("-c", "/dev/stdin", "--dry-run"),
+            self._train_command("-c", "-", "--dry-run"),
             input=json.dumps(config),
             capture_output=True,
             text=True,

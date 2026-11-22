@@ -1,5 +1,6 @@
 """The self-describing training CLI and the run manager built on it."""
 
+import io
 import json
 import os
 import signal
@@ -378,6 +379,19 @@ def test_run_lifecycle_completes_and_reports_progress(manager):
     assert manager.get(run["id"][:15])["id"] == run["id"]
     # A new manager (the host restarted) still knows the run.
     assert RunManager(manager.root).get()["status"] == "completed"
+
+
+def test_check_reads_nested_schedule_as_json(tmp_path):
+    manager = RunManager(tmp_path)
+    schedule = {"name": "cosine_decay", "arguments": [1e-5, 20, 1e-6]}
+    checked = manager.check({"model": "m", "iters": 20, "lr_schedule": schedule})
+    assert checked["valid"], checked["errors"]
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(checked["config"]))
+    with patch("sys.stdin", io.StringIO(path.read_text())):
+        stdin_args, _ = parse_args(["-c", "-"])
+    file_args, _ = parse_args(["-c", str(path)])
+    assert stdin_args.lr_schedule == file_args.lr_schedule == schedule
 
 
 def test_failed_and_capped_runs_are_told_apart(manager, monkeypatch):
