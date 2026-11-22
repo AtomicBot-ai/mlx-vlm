@@ -2,8 +2,14 @@
 
 import json
 import os
+import signal
+import socket
+import subprocess
+import sys
 import time
+from contextlib import ExitStack
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -11,13 +17,7 @@ import pytest
 
 from mlx_vlm import train as train_cli
 from mlx_vlm.train import ProgressCallback, UsageCapReached, describe, parse_args
-from mlx_vlm.train_runs import (
-    Limits,
-    RunManager,
-    inspect_dataset,
-    main,
-    resolve_paths,
-)
+from mlx_vlm.train_runs import Limits, RunManager, inspect_dataset, main, resolve_paths
 from mlx_vlm.trainer.api import TASKS
 from mlx_vlm.trainer.vlm.config import VLMTrainConfig
 
@@ -31,6 +31,7 @@ echo '{"event": "train", "iteration": 5, "train_loss": 1.5}' >> progress.jsonl
 case "$FAKE_TRAIN" in
   fail) echo "ValueError: boom"; exit 1 ;;
   hang) exec sleep 60 ;;
+  ignore-term) trap '' TERM; touch ready; exec sleep 60 ;;
   wait)  # a trainer that saves and ends when asked to stop
     while [ ! -e stop ]; do sleep 0.05; done
     : > adapters/adapters.safetensors
@@ -228,6 +229,126 @@ def test_run_refuses_epoch_derived_iters_over_the_cap():
     trainer.train.assert_not_called()
 
 
+def _distributed_stop_worker(root):
+    import mlx.core as mx
+    import numpy as np
+
+    from mlx_vlm.tests.test_training_cli import TinyVLM
+
+    mx.set_default_device(mx.cpu)
+    rank = mx.distributed.init(strict=True, backend="ring").rank()
+    for case in ("stop", "memory", "time"):
+        directory = Path(root) / case / str(rank)
+        args, settings = parse_args(
+            [
+                "--model",
+                "tiny",
+                "--iters",
+                "3",
+                "--batch-size",
+                "2",
+                "--steps-per-report",
+                "1",
+                "--steps-per-eval",
+                "1",
+                "--max-memory-gb",
+                "2",
+                "--max-minutes",
+                "0.000001" if case == "time" and rank == 1 else "60",
+                "--target-modules",
+                "projection",
+                "--progress-file",
+                str(directory / "progress.jsonl"),
+                "--adapter-file",
+                str(directory / "adapters.safetensors"),
+            ]
+        )
+        # Only rank zero sees the stop file. Only rank one exceeds the cap.
+        memory = 3_000_000_000 if case == "memory" and rank == 1 else 0
+        rows = [{"text": "first"}, {"text": "second"}]
+
+        def prepare(**kwargs):
+            return {"input_ids": np.array([[1, 2, 3, 4]])}
+
+        with (
+            patch.object(
+                train_cli,
+                "_load_model",
+                return_value=(TinyVLM(), SimpleNamespace(pad_token_id=0)),
+            ),
+            patch.object(
+                train_cli, "_load_dataset", return_value={"train": rows, "valid": rows}
+            ),
+            patch(
+                "mlx_vlm.trainer.vlm.cross_entropy.dataset._load_vlm_helpers",
+                return_value=({}, None, prepare, None),
+            ),
+            patch.object(mx, "get_active_memory", return_value=memory),
+        ):
+            metrics = train_cli.run(args, settings)
+        assert metrics["iteration"] == 1
+
+
+def test_stop_and_caps_exit_all_ranks_at_the_same_report(tmp_path):
+    import mlx.core as mx
+
+    if not mx.distributed.is_available("ring"):
+        pytest.skip("MLX ring backend is unavailable")
+    primary = tmp_path / "stop" / "0"
+    primary.mkdir(parents=True)
+    (primary / "stop").touch()
+    hosts = tmp_path / "hosts.json"
+    with ExitStack() as stack:
+        addresses = []
+        for _ in range(2):
+            sock = stack.enter_context(socket.socket())
+            sock.bind(("127.0.0.1", 0))
+            addresses.append([f"127.0.0.1:{sock.getsockname()[1]}"])
+        hosts.write_text(json.dumps(addresses))
+    command = [
+        sys.executable,
+        "-c",
+        "import sys; from mlx_vlm.tests.test_train_runs import _distributed_stop_worker; "
+        "_distributed_stop_worker(sys.argv[1])",
+        str(tmp_path),
+    ]
+    workers = []
+    try:
+        for rank in range(2):
+            workers.append(
+                subprocess.Popen(
+                    command,
+                    cwd=Path(__file__).resolve().parents[2],
+                    env={
+                        **os.environ,
+                        "MLX_RANK": str(rank),
+                        "MLX_HOSTFILE": str(hosts),
+                    },
+                )
+            )
+        for worker in workers:
+            assert worker.wait(timeout=90) == 0
+    finally:
+        for worker in workers:
+            worker.kill()
+            worker.wait()
+    for case, event in (("stop", "stopped"), ("memory", "capped"), ("time", "capped")):
+        primary = tmp_path / case / "0"
+        events = [
+            json.loads(line)
+            for line in (primary / "progress.jsonl").read_text().splitlines()
+        ]
+        assert [record["event"] for record in events] == ["start", "train", event]
+        if case != "stop":
+            assert ("max_memory_gb" if case == "memory" else "max_minutes") in events[
+                -1
+            ]["reason"]
+        assert events[-1]["iteration"] == 1
+        assert (primary / "adapters.safetensors").is_file()
+        assert (primary / "trainer_state.safetensors").is_file()
+        assert not (primary.parent / "1").exists()
+
+
 # -- the run manager ------------------------------------------------------------
 def test_check_uses_the_real_training_parser(tmp_path):
     manager = RunManager(tmp_path, Limits(max_iters=20))
@@ -283,6 +404,43 @@ def test_concurrency_cap_and_stop(manager, monkeypatch):
         os.killpg(run["pid"], 0)
     assert manager.usage()["active_runs"] == 0
     assert manager.stop(run["id"])["status"] == "stopped"  # stopping twice is fine
+
+
+def test_restarted_manager_escalates_through_run_fifo(manager, monkeypatch):
+    monkeypatch.setenv("FAKE_TRAIN", "ignore-term")
+    run = manager.start({"model": "m"})
+    run_dir = Path(run["run_dir"])
+    supervisor = manager._procs[run["id"]]
+    try:
+        deadline = time.monotonic() + 5
+        while not (run_dir / "ready").exists():
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        # The persisted PID is advisory. Even after restart the supervisor
+        # addresses its own child, including escalation past ignored SIGTERM.
+        run["pid"] = None
+        manager._save(run)
+        restarted = RunManager(manager.root)
+        stopped = restarted.stop(run["id"], save_s=0, wait_s=1)
+        assert stopped["status"] == "stopped"
+        assert stopped["exit_code"] == 128 + signal.SIGKILL
+    finally:
+        manager.stop(run["id"], save_s=0, wait_s=1)
+        supervisor.wait(timeout=5)
+
+
+def test_stale_run_cannot_signal_a_persisted_pid(manager):
+    run = wait_for_end(manager, manager.start({"model": "m"})["id"])
+    (Path(run["run_dir"]) / "exit_code").unlink()
+    restarted = RunManager(manager.root)
+    with patch("os.killpg") as signal_group:
+        for legacy in (False, True):
+            if legacy:
+                run.pop("control_fifo")
+            run.update(status="running", pid=os.getpid())
+            manager._save(run)
+            assert restarted.stop(run["id"], save_s=0)["status"] == "failed"
+        signal_group.assert_not_called()
 
 
 def test_daily_run_cap(manager):

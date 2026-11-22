@@ -552,16 +552,22 @@ class ProgressCallback:
     ``steps_per_report`` iterations of passing one.
     """
 
+    train_report_on_all_ranks = True
+
     def __init__(self, path=None, wrapped=None, max_minutes=None, max_memory_gb=None):
-        self.path, self.wrapped = path, wrapped
+        import mlx.core as mx
+
+        self.world = mx.distributed.init()
+        self.path = path if self.world.rank() == 0 else None
+        self.wrapped = wrapped
         self.max_minutes, self.max_memory_gb = max_minutes, max_memory_gb
         self.started = time.monotonic()
         # Set when a run continues another: iterations and optimizer updates
         # already done, and the iterations of the whole run.
         self.done, self.updates_done, self.total = 0, 0, None
         self.last = {}  # the latest training report, as the trainer gave it
-        if path:
-            Path(path).parent.mkdir(parents=True, exist_ok=True)
+        if self.path:
+            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
 
     def write(self, event, **info):
         if not self.path:
@@ -588,19 +594,37 @@ class ProgressCallback:
 
         memory = mx.get_active_memory() / 1e9
         self.last = dict(train_info)
-        self.write(
-            "train", **self.whole_run(train_info), active_memory_gb=round(memory, 3)
-        )
-        if self.wrapped is not None:
-            self.wrapped.on_train_loss_report(train_info)
-        if self.path and (Path(self.path).parent / STOP_FILE).exists():
-            raise StopRequested("stop requested")
+        if self.world.rank() == 0:
+            self.write(
+                "train", **self.whole_run(train_info), active_memory_gb=round(memory, 3)
+            )
+            if self.wrapped is not None:
+                self.wrapped.on_train_loss_report(train_info)
+        stopped = bool(self.path and (Path(self.path).parent / STOP_FILE).exists())
         minutes = (time.monotonic() - self.started) / 60
-        if self.max_minutes and minutes >= self.max_minutes:
-            raise UsageCapReached(f"max_minutes ({self.max_minutes:g}) reached")
-        if self.max_memory_gb and memory > self.max_memory_gb:
+        time_cap = (
+            self.max_minutes if self.max_minutes and minutes >= self.max_minutes else 0
+        )
+        memory_cap = (
+            self.max_memory_gb
+            if self.max_memory_gb and memory > self.max_memory_gb
+            else 0
+        )
+        if self.world.size() > 1:
+            # Every rank must leave at the same report, before the next
+            # validation or gradient collective. A cap can trip on any rank.
+            with mx.stream(mx.cpu):
+                stopped, time_cap, memory_cap, memory = mx.distributed.all_max(
+                    mx.array([float(stopped), time_cap, memory_cap, memory]),
+                    group=self.world,
+                ).tolist()
+        if stopped:
+            raise StopRequested("stop requested")
+        if time_cap:
+            raise UsageCapReached(f"max_minutes ({time_cap:g}) reached")
+        if memory_cap:
             raise UsageCapReached(
-                f"max_memory_gb ({self.max_memory_gb:g}) passed: {memory:.2f} GB in use"
+                f"max_memory_gb ({memory_cap:g}) passed: {memory:.2f} GB in use"
             )
 
     def on_val_loss_report(self, val_info):
@@ -792,6 +816,7 @@ def run(args, settings, training_callback=None):
     from mlx_vlm.trainer.common.callbacks import WandBCallback
 
     mx.random.seed(args.seed)
+    primary = mx.distributed.init().rank() == 0
     max_iters = getattr(args, "max_iters", None)
     max_minutes = getattr(args, "max_minutes", None)
     max_memory_gb = getattr(args, "max_memory_gb", None)
@@ -852,7 +877,7 @@ def run(args, settings, training_callback=None):
         reward_funcs = [
             getattr(rewards, name.strip()) for name in args.reward_functions.split(",")
         ]
-        if getattr(args, "progress_file", None):
+        if primary and getattr(args, "progress_file", None):
             reward_funcs[0] = record_samples(
                 reward_funcs[0], Path(args.progress_file).parent / SAMPLE_FILE
             )
@@ -914,8 +939,10 @@ def run(args, settings, training_callback=None):
 
     def interrupted(event, **info):
         """Keep the work so far, and the state to carry on from it."""
-        trainer.save_adapter()
         metrics = progress.whole_run(progress.last)
+        if not primary:
+            return metrics
+        trainer.save_adapter()
         if "iteration" in metrics:
             save_trainer_state(
                 trainer, metrics["iteration"], metrics.get("optimizer_step", 0)
@@ -925,7 +952,7 @@ def run(args, settings, training_callback=None):
 
     callback = None
     try:
-        if args.wandb and mx.distributed.init().rank() == 0:
+        if args.wandb and primary:
             callback = WandBCallback(
                 args.wandb,
                 str(Path(settings.adapter_file).parent),
@@ -937,15 +964,19 @@ def run(args, settings, training_callback=None):
             metrics = trainer.train()
         except UsageCapReached as reached:
             # Keep the work done so far; the cap is not a failure.
-            print(f"Stopped at usage cap: {reached}. Weights saved.", file=sys.stderr)
             metrics = interrupted("capped", reason=str(reached))
+            if primary:
+                print(
+                    f"Stopped at usage cap: {reached}. Weights saved.", file=sys.stderr
+                )
         except StopRequested:
-            print("Stopped on request. Weights saved.", file=sys.stderr)
             metrics = interrupted("stopped")
+            if primary:
+                print("Stopped on request. Weights saved.", file=sys.stderr)
         else:
             if progress is not None:
                 progress.write("end", **progress.whole_run(metrics))
-        if getattr(args, "export_qat_path", None):
+        if primary and getattr(args, "export_qat_path", None):
             from .export import export_model
 
             export_model(

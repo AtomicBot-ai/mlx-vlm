@@ -223,8 +223,11 @@ def train(
                 tqdm.write(format_metric_report(metrics, "Training"))
                 if log_history is not None:
                     log_history.append(metrics.copy())
-                if training_callback is not None:
-                    training_callback.on_train_loss_report(metrics.copy())
+            if training_callback is not None and (
+                rank == 0
+                or getattr(training_callback, "train_report_on_all_ranks", False)
+            ):
+                training_callback.on_train_loss_report(metrics.copy())
             accumulator = MetricAccumulator()
             elapsed, data_elapsed, report_steps = 0.0, 0.0, 0
             reported_updates = optimizer_step

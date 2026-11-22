@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import fcntl
 import json
 import os
@@ -54,6 +55,7 @@ STOP_FILE = "stop"
 SAMPLE_FILE = "last_generation.json"
 WEIGHTS_FILE = "adapters.safetensors"
 STATE_FILE = "trainer_state.safetensors"  # optimizer, random state and position
+CONTROL_FIFO = "control.fifo"
 # Options the manager owns; values passed by a caller are ignored.
 MANAGED = {
     "config",
@@ -155,16 +157,37 @@ def _system_memory_gb() -> float | None:
         return None
 
 
-def _pid_alive(pid: int | None) -> bool:
-    if not pid:
+def _contact_worker(run_dir: Path, sig: signal.Signals | None = None) -> bool:
+    """Only the supervisor of this run holds the read end of its FIFO."""
+    try:
+        fd = os.open(run_dir / CONTROL_FIFO, os.O_WRONLY | os.O_NONBLOCK)
+    except OSError as error:
+        if error.errno not in (errno.ENOENT, errno.ENXIO):
+            raise
         return False
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
+        if sig is not None:
+            os.write(fd, bytes([sig]))
         return True
-    return True
+    except BrokenPipeError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def _legacy_worker_alive(run: dict[str, Any]) -> bool:
+    """Recognize the old sh wrapper by its run-specific config argument."""
+    if not run.get("pid") or not run.get("command"):
+        return False
+    result = subprocess.run(
+        ["ps", "-ww", "-p", str(run["pid"]), "-o", "command="],
+        capture_output=True,
+        text=True,
+    )
+    command = result.stdout.strip()
+    return command.startswith("/bin/sh -c ") and command.endswith(
+        " sh " + " ".join(run["command"])
+    )
 
 
 def resolve_paths(options: dict[str, Any], base: Path) -> dict[str, Any]:
@@ -299,12 +322,17 @@ class RunManager:
             if code is None:
                 return run
         else:
-            # The wrapper writes this marker when training exits. Prefer it to
-            # the saved PID, which the OS may have reused for another process.
+            run_dir = self.root / run["id"]
+            if run.get("control_fifo") and _contact_worker(run_dir):
+                return run
             code = None
             with contextlib.suppress(OSError, ValueError):
-                code = int((self.root / run["id"] / "exit_code").read_text().strip())
-            if code is None and _pid_alive(run.get("pid")):
+                code = int((run_dir / "exit_code").read_text().strip())
+            if (
+                code is None
+                and not run.get("control_fifo")
+                and _legacy_worker_alive(run)
+            ):
                 return run
         self._procs.pop(run["id"], None)
         run["exit_code"] = code
@@ -392,23 +420,26 @@ class RunManager:
         (run_dir / "config.json").write_text(json.dumps(config, indent=2))
 
         command = self._train_command("-c", str(run_dir / "config.json"))
-        # sh records the exit code, so the outcome is known after a restart.
-        wrapper = [
-            "/bin/sh",
-            "-c",
-            '"$@"; rc=$?; echo $rc > exit_code; exit $rc',
-            "sh",
-            *command,
-        ]
-        with open(run_dir / "train.log", "ab") as log:
+        fifo = run_dir / CONTROL_FIFO
+        os.mkfifo(fifo, 0o600)
+        # Open before publishing run.json. Holding both ends keeps the FIFO
+        # readable across manager restarts without generating EOF notifications.
+        with (
+            open(fifo, "r+b", buffering=0) as control,
+            open(run_dir / "train.log", "ab") as log,
+        ):
             proc = subprocess.Popen(
-                wrapper,
+                [
+                    sys.executable,
+                    str(Path(__file__).with_name("_train_worker.py")),
+                    *command,
+                ],
                 cwd=run_dir,
-                stdin=subprocess.DEVNULL,
+                stdin=control,
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 env=self._env(),
-                start_new_session=True,  # own process group, so stop kills it all
+                start_new_session=True,
             )
         self._procs[run_id] = proc
         run = {
@@ -416,6 +447,7 @@ class RunManager:
             "name": name.strip() or None,
             "status": "running",
             "pid": proc.pid,
+            "control_fifo": True,
             "created_at": now.isoformat(timespec="seconds"),
             "ended_at": None,
             "exit_code": None,
@@ -457,9 +489,13 @@ class RunManager:
             if self._refresh(run)["status"] not in ACTIVE:
                 return run
             time.sleep(0.2)
+        if not run.get("control_fifo"):
+            # Old wrappers still honor the stop file via the trainer.
+            # They have no persistent channel for forced termination.
+            return self._refresh(run)
         for sig in (signal.SIGTERM, signal.SIGKILL):
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.killpg(run["pid"], sig)
+            if not _contact_worker(self.root / run["id"], sig):
+                return self._refresh(run)
             deadline = time.monotonic() + wait_s
             while time.monotonic() < deadline:
                 if self._refresh(run)["status"] not in ACTIVE:
