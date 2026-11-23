@@ -246,22 +246,14 @@ _REGION_KEYS = ("open", "open_pattern", "close", "close_pattern", "repeats")
 
 
 def _reasoning_content_template(template: Any) -> Any:
-    """Copy a response template so that only reasoning and content are decoded.
-
-    The server takes reasoning and content from the template; tool calls come
-    from the tool parser. Transformers decodes every field as its region closes
-    and raises when a structured one, such as a JSON tool call, is malformed,
-    cut off, or lacks a key its transform reads, which loses the reasoning and
-    content around it. Every other field is therefore reduced to its delimiters
-    and read as text, so its text still stays out of the content.
-    """
+    """Keep malformed tool fields from breaking reasoning and content parsing."""
     if not isinstance(template, dict):
         return template
     fields = {}
     for name, field in template.get("fields", {}).items():
         if name not in _SPLIT_FIELDS:
             field = {key: field[key] for key in _REGION_KEYS if key in field}
-            # Named groups in a pattern are only valid with a transform.
+            # Named capture groups require a transform.
             field["transform"] = "{content}"
         fields[name] = field
     return {**template, "fields": fields}
