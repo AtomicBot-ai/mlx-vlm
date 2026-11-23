@@ -454,7 +454,9 @@ def _chat_events(response, reason):
     return choices, usage, finish
 
 
-def _chat_tool_result(response, stream, finish_reason="tool_calls"):
+def _chat_tool_result(
+    response, stream, finish_reason="tool_calls", *, expected_partial=None
+):
     assert response.status_code == 200, response.text
     if stream:
         choices = [
@@ -482,6 +484,8 @@ def _chat_tool_result(response, stream, finish_reason="tool_calls"):
         message = choice["message"]
         functions = [call["function"] for call in message["tool_calls"]]
         finishes = [choice["finish_reason"]]
+    if expected_partial is not None:
+        assert functions.pop() == expected_partial
     assert finishes == [finish_reason]
     return NS(
         content=message.get("content") or "",
@@ -3808,6 +3812,9 @@ def test_response_template_tool_text(
         parser=load_tool_module(parser),
     ):
         response = _post(client, tools=[_tool()], stream=stream)
+    if stream and parser == "inkling":
+        fragments = [c for d in _deltas(response) for c in d.get("tool_calls") or []]
+        assert len(fragments) > len({c["index"] for c in fragments})
     result = _chat_tool_result(response, stream)
     assert result.calls == [("get_weather", {"city": "Warsaw"})] * (
         2 if position == "between" else 1
@@ -3815,6 +3822,167 @@ def test_response_template_tool_text(
     assert result.reasoning_content == "I need the weather tool."
     assert result.content == ("" if position == "none" else "Checking.")
     assert "<|" not in response.text
+
+
+def _stream_inkling(client, api, chunks, finish_reason, continuous=True):
+    config = NS(model_type="inkling2")
+    result = _token if continuous else _result
+    chunks = [
+        result(text, finish_reason=finish_reason if i == len(chunks) - 1 else None)
+        for i, text in enumerate(chunks)
+    ]
+    with _endpoint(
+        config=config,
+        processor=NS(
+            config=config,
+            tokenizer=_ResponseTemplateTokenizer(_INKLING_RESPONSE_TEMPLATE),
+        ),
+        parser=load_tool_module("inkling"),
+        chunks=chunks,
+        generator=_streaming(chunks) if continuous else None,
+    ):
+        return _post(client, api, tools=[_tool()], stream=True)
+
+
+@pytest.mark.parametrize("api", ["chat", "responses"])
+@pytest.mark.parametrize("continuous", [True, False])
+@pytest.mark.parametrize(
+    "tail, expected_args",
+    [
+        ("sa", '{"city":"Warsa'),
+        ('saw"}}', '{"city":"Warsaw"}'),
+        ('saw"}}<|end_mes', '{"city":"Warsaw"}'),
+    ],
+    ids=["inside-string", "before-end-marker", "inside-end-marker"],
+)
+def test_inkling_length_during_tool_call(client, api, continuous, tail, expected_args):
+    chunks = [
+        "<|message_model|><|content_text|>Checking.<|end_message|>",
+        "<|message_model|>get_weather<|content_invoke_tool_json|>",
+        '{"name":"get_weather","args":{"city":"War',
+        tail,
+    ]
+    wire = _stream_inkling(client, api, chunks, "length", continuous)
+    events = _data(wire)
+    if api == "chat":
+        choices = [e["choices"][0] for e in events]
+        assert choices[-1]["finish_reason"] == "length"
+        deltas = [c["delta"] for c in choices]
+        assert _joined(deltas, "content") == "Checking."
+        calls = [c for d in deltas for c in d.get("tool_calls") or []]
+        assert _joined([c["function"] for c in calls], "arguments") == expected_args
+    else:
+        assert events[-1]["type"] == "response.incomplete"
+        response = _completed_response(wire)
+        assert response["incomplete_details"] == {"reason": "max_output_tokens"}
+        assert response["output_text"] == "Checking."
+        [call] = [i for i in response["output"] if i["type"] == "function_call"]
+        assert call["status"] == "incomplete" and call["arguments"] == expected_args
+        assert not any(
+            e["type"] == "response.function_call_arguments.done" for e in events
+        )
+
+
+@pytest.mark.parametrize("api", ["chat", "responses"])
+def test_inkling_length_after_a_completed_call(client, api):
+    header = "<|message_model|>get_weather<|content_invoke_tool_json|>"
+    chunks = [
+        "<|message_model|><|content_text|>Checking.<|end_message|>",
+        header + '{"name":"get_weather","args":{"city":"Rome"}}<|end_message|>',
+        header + '{"name":"get_weather","args":{"city":"Paris"}}',
+    ]
+    wire = _stream_inkling(client, api, chunks, "length")
+    events = _data(wire)
+    if api == "chat":
+        choices = [e["choices"][0] for e in events]
+        assert choices[-1]["finish_reason"] == "length"
+        calls = [c for x in choices for c in x["delta"].get("tool_calls") or []]
+        assert [c["index"] for c in calls if "id" in c] == [0, 1]
+    else:
+        response = _completed_response(wire)
+        assert response["status"] == "incomplete"
+        assert response["output_text"] == "Checking."
+        completed, partial = [
+            i for i in response["output"] if i["type"] == "function_call"
+        ]
+        assert [completed["status"], partial["status"]] == ["completed", "incomplete"]
+        done = [
+            e for e in events if e["type"] == "response.function_call_arguments.done"
+        ]
+        assert [e["call_id"] for e in done] == [completed["call_id"]]
+        messages, _ = _response_items_to_chat(response["output"])
+        assert [c["id"] for m in messages for c in m.get("tool_calls") or []] == [
+            completed["call_id"]
+        ]
+
+
+@pytest.mark.parametrize("api", ["chat", "responses"])
+@pytest.mark.parametrize(
+    "prefix, tail, emits_args",
+    [("", "[]}", False), ('{"city":"War', 'saw",}}', True)],
+    ids=["array-arguments", "invalid-after-deltas"],
+)
+def test_inkling_malformed_call_reports_error(client, api, prefix, tail, emits_args):
+    chunks = [
+        "<|message_model|>get_weather<|content_invoke_tool_json|>",
+        '{"name":"get_weather","args":' + prefix,
+        tail + "<|end_message|>",
+    ]
+    events = _data(_stream_inkling(client, api, chunks, "stop"))
+    if api == "chat":
+        choices = [e["choices"][0] for e in events if e.get("choices")]
+        assert any(x["delta"].get("tool_calls") for x in choices) == emits_args
+        assert all(x["finish_reason"] is None for x in choices)
+        assert events[-1]["error"]["code"] == "tool_call_parse_error"
+    else:
+        assert (
+            any(
+                e["type"] == "response.output_item.added"
+                and e["item"]["type"] == "function_call"
+                for e in events
+            )
+            == emits_args
+        )
+        assert not any(
+            e["type"] == "response.function_call_arguments.done" for e in events
+        )
+        assert events[-1]["type"] == "response.failed"
+        assert events[-1]["response"]["error"]["code"] == "tool_call_parse_error"
+
+
+@pytest.mark.parametrize("api", ["chat", "responses"])
+@pytest.mark.parametrize("kind", ["text", "thinking", "invalid-args"])
+def test_inkling_ignores_non_calls_before_valid_call(client, api, kind):
+    if kind == "invalid-args":
+        header = "get_weather<|content_invoke_tool_json|>"
+        payload = '{"name":"get_weather","args":[]}'
+    else:
+        header = f"<|content_{kind}|>The example is <|content_invoke_tool_json|>"
+        payload = '{"name":"get_weather","args":{}}'
+    chunks = [
+        "<|message_model|>" + header,
+        payload,
+        "<|end_message|>",
+        "<|message_model|>get_weather<|content_invoke_tool_json|>",
+        '{"name":"get_weather","args":{"city":"Warsaw"}}',
+        "<|end_message|>",
+    ]
+    events = _data(_stream_inkling(client, api, chunks, "stop"))
+    if api == "chat":
+        choices = [e["choices"][0] for e in events]
+        assert choices[-1]["finish_reason"] == "tool_calls"
+        calls = [c for x in choices for c in x["delta"].get("tool_calls") or []]
+        assert [c["function"]["name"] for c in calls if "id" in c] == ["get_weather"]
+        assert all(c["index"] == 0 for c in calls)
+    else:
+        assert events[-1]["type"] == "response.completed"
+        names = [
+            e["item"]["name"]
+            for e in events
+            if e["type"] == "response.output_item.added"
+            and e["item"]["type"] == "function_call"
+        ]
+        assert names == ["get_weather"]
 
 
 def test_chat_completions_endpoint_falls_back_from_video_to_images(client):
@@ -7576,7 +7744,26 @@ def test_response_template_undecodable_tool_call(
             assert response.json()["output_text"] == ("" if alone else "Checking.")
         return
     assert response.status_code == 200, response.text
-    assert "<|" not in response.text and "city" not in response.text
+    assert "<|" not in response.text
+    if stream and case.parser == "inkling" and api in ("chat", "responses"):
+        events = _data(response)
+        if api == "chat":
+            partial = [
+                c["function"]
+                for e in events
+                for x in e.get("choices") or []
+                for c in x["delta"].get("tool_calls") or []
+            ]
+            assert _joined(partial, "arguments") == '{"city":"War'
+        else:
+            partial = [
+                e
+                for e in events
+                if e["type"] == "response.function_call_arguments.delta"
+            ]
+            assert _joined(partial, "delta") == '{"city":"War'
+    else:
+        assert "city" not in response.text
     if stream:
         reasoning, content = _thinking_text(response, api)
         if api == "chat":
@@ -7681,7 +7868,14 @@ def test_response_template_keeps_valid_calls_beside_errors(
     assert response.status_code == 200, response.text
     if api == "chat":
         result = _chat_tool_result(
-            response, stream, "length" if truncated else "tool_calls"
+            response,
+            stream,
+            "length" if truncated else "tool_calls",
+            expected_partial=(
+                {"name": "get_weather", "arguments": '{"city":"War'}
+                if stream and truncated and case.parser == "inkling"
+                else None
+            ),
         )
         assert result.calls == [("get_weather", {"city": "Warsaw"})]
         assert (result.reasoning_content, result.content) == (
@@ -7700,6 +7894,10 @@ def test_response_template_keeps_valid_calls_beside_errors(
         )
         assert body["status"] == ("incomplete" if truncated else "completed")
         calls = [item for item in body["output"] if item["type"] == "function_call"]
+        if stream and truncated and case.parser == "inkling":
+            partial = calls.pop()
+            assert partial["status"] == "incomplete"
+            assert partial["arguments"] == '{"city":"War'
         assert [(c["name"], json.loads(c["arguments"])) for c in calls] == [
             ("get_weather", {"city": "Warsaw"})
         ]

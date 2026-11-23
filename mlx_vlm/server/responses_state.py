@@ -623,6 +623,7 @@ def _response_output_items_from_text(
     tool_delta_state=None,
     *,
     prompt: str = "",
+    use_template_content: bool = False,
     finish_reason: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], str, Optional[str], str]:
     reasoning, content = _split_thinking(
@@ -656,6 +657,9 @@ def _response_output_items_from_text(
                 thinking_start_token,
                 thinking_end_token,
             )
+            # Inkling's extractor consumes whole messages, including spoken text.
+            if use_template_content and not remaining:
+                remaining = content
             return reasoning_items + items, remaining, reasoning, "tool_calls"
     if not content:
         return reasoning_items, content, reasoning, "stop"
@@ -858,6 +862,8 @@ def _append_response_item_to_prompt(
         return
 
     if item_type in ("function_call", "shell_call", "apply_patch_call"):
+        if item.get("status") == "incomplete":
+            return
         chat_messages.append(
             _normalize_tool_message(
                 {

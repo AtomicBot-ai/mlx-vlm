@@ -4,10 +4,21 @@ import json
 import re
 import uuid
 
+from .parsers import inkling
+from .types import ToolCallParseError
+
 _DECODER = json.JSONDecoder()
+_OBJECT_KEY_START = re.compile(r'\{\s*"')
 
 
-def _json_calls(text, name_key="name", args_key="arguments", *, require_arguments=True):
+def _json_calls(
+    text,
+    name_key="name",
+    args_key="arguments",
+    *,
+    require_arguments=True,
+    require_object_arguments=False,
+):
     """Read complete metadata and the argument value's received JSON prefix."""
     text = text.lstrip()
     offset = 1 if text.startswith("[") else 0
@@ -32,10 +43,21 @@ def _json_calls(text, name_key="name", args_key="arguments", *, require_argument
             offset += 1
             offset += len(text[offset:]) - len(text[offset:].lstrip())
             start = offset
+            if (
+                require_object_arguments
+                and key == args_key
+                and text[start : start + 1] != "{"
+            ):
+                return
             try:
                 value, offset = _DECODER.raw_decode(text, start)
             except ValueError:
                 if name and key == args_key and text[start : start + 1] == "{":
+                    # A bare opening brace can still introduce an invalid first key.
+                    if require_object_arguments and not _OBJECT_KEY_START.match(
+                        text, start
+                    ):
+                        return
                     yield name, text[start:]
                 return
             if key in (name_key, "name") and isinstance(value, str):
@@ -149,6 +171,18 @@ def _gemma_call(text, module):
     return [(match[1], json.dumps(arguments)[:-1])]
 
 
+def _inkling_calls(text):
+    """Inkling writes NAME<|content_invoke_tool_json|>{"name": ..., "args": {...}}."""
+    payload = inkling.tool_call_payload(text)
+    if payload is None or not payload.lstrip().startswith("{"):
+        return []
+    # Inkling accepts a single object. Only the final parser can default missing args.
+    call = next(
+        _json_calls(payload, "name", "args", require_object_arguments=True), None
+    )
+    return [call] if call is not None else []
+
+
 class ToolCallDeltaState:
     def __init__(self, module, tools):
         self.module = module
@@ -158,6 +192,7 @@ class ToolCallDeltaState:
         self.inside = False
         self.offset = 0
         self.calls = {}
+        self.incomplete_call = None
 
     def feed(self, text):
         if not self.tools or self.parser_name not in (
@@ -165,6 +200,7 @@ class ToolCallDeltaState:
             "cohere2_moe",
             "qwen3_coder",
             "gemma4",
+            "inkling",
         ):
             return []
         self.buffer += text or ""
@@ -195,14 +231,20 @@ class ToolCallDeltaState:
                     candidates = _xml_call(body, self.tools, self.module)
                 elif name == "gemma4":
                     candidates = _gemma_call(body, self.module)
+                elif name == "inkling":
+                    candidates = _inkling_calls(body)
                 else:
                     candidates = []
             else:
                 try:
                     parsed = self.module.parse_tool_call(body.strip(), self.tools)
                     parsed = [parsed] if isinstance(parsed, dict) else iter(parsed)
-                except (ValueError, KeyError, TypeError, SyntaxError):
+                except (ValueError, KeyError, TypeError, SyntaxError) as exc:
                     if len(self.calls) > self.offset:
+                        if self.parser_name == "inkling":
+                            raise ToolCallParseError(
+                                "An Inkling tool call became invalid after its arguments were streamed."
+                            ) from exc
                         raise
                     parsed = []
                 # Normalize per call, like the final extractor: an element of
@@ -224,23 +266,19 @@ class ToolCallDeltaState:
                     if not arguments.startswith(sent):
                         # JSON formatting is immaterial, but streamed bytes cannot
                         # be retracted. Recover the original complete argument value.
-                        fields = (
-                            ("tool_name", "parameters")
-                            if self.parser_name == "cohere2_moe"
-                            else ("name", "arguments")
-                        )
-                        raw_body = (
-                            body.replace("\\|", "|")
-                            if self.parser_name == "cohere2_moe"
-                            else body
-                        )
-                        raw = list(
-                            _json_calls(
-                                raw_body,
-                                *fields,
-                                require_arguments=self.parser_name != "cohere2_moe",
+                        if self.parser_name == "cohere2_moe":
+                            raw = list(
+                                _json_calls(
+                                    body.replace("\\|", "|"),
+                                    "tool_name",
+                                    "parameters",
+                                    require_arguments=False,
+                                )
                             )
-                        )
+                        elif self.parser_name == "inkling":
+                            raw = _inkling_calls(body)
+                        else:
+                            raw = list(_json_calls(body, "name", "arguments"))
                         if (
                             count <= len(raw)
                             and raw[count - 1][1].startswith(sent)
@@ -276,6 +314,23 @@ class ToolCallDeltaState:
         if fragment:
             return {"index": index, "function": {"arguments": fragment}}
         return None
+
+    def truncate_at_limit(self, text):
+        """Exclude an unclosed Inkling invocation from the final parse at a token limit."""
+        if self.parser_name != "inkling" or not self.inside:
+            return None
+        # The tool stream filters reasoning. Locate the open frame in the raw output.
+        start = text.find(
+            inkling.tool_call_start, text.rfind(inkling.tool_call_end) + 1
+        )
+        if (
+            start < 0
+            or inkling.tool_call_payload(text[start + len(inkling.tool_call_start) :])
+            is None
+        ):
+            return None
+        self.incomplete_call = self.calls.get(self.offset)
+        return text[:start]
 
     def finish(self, calls, *, incomplete=False):
         if len(calls) < len(self.calls) and not incomplete:

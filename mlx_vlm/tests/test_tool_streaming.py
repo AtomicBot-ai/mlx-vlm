@@ -43,11 +43,19 @@ def encoded_call(parser, content):
         )
     if parser == "qwen3_coder":
         return f"<tool_call><function=write_file><parameter=path>demo.py</parameter><parameter=content>\n{content}\n</parameter></function></tool_call>"
+    if parser == "inkling":
+        # The chat template's form: name first, then args, compact JSON.
+        body = {"name": "write_file", "args": args}
+        return (
+            "<|message_model|>write_file<|content_invoke_tool_json|>"
+            + json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+            + "<|end_message|>"
+        )
     return f'<|tool_call>call:write_file{{path:<|"|>demo.py<|"|>,content:<|"|>{content}<|"|>}}<tool_call|>'
 
 
 @pytest.mark.parametrize(
-    "parser", ["json_tools", "cohere2_moe", "qwen3_coder", "gemma4"]
+    "parser", ["json_tools", "cohere2_moe", "qwen3_coder", "gemma4", "inkling"]
 )
 @pytest.mark.parametrize("chunk_size", [1, 7, 31, 8192])
 def test_argument_prefixes_and_final_call_match(parser, chunk_size):
@@ -79,7 +87,7 @@ def test_argument_prefixes_and_final_call_match(parser, chunk_size):
 
 
 @pytest.mark.parametrize(
-    "parser", ["json_tools", "cohere2_moe", "qwen3_coder", "gemma4"]
+    "parser", ["json_tools", "cohere2_moe", "qwen3_coder", "gemma4", "inkling"]
 )
 def test_multiple_calls_keep_separate_ids(parser):
     module = load_tool_module(parser)
@@ -228,6 +236,38 @@ def test_streaming_tolerates_what_the_final_parser_drops(
     assert [call["name"] for call in received.values()] == kept
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '[{"name":"get_time","args":{}}]',
+        '{"name":"get_time","args":"{}"}',
+        '{"name":"get_time","args":null}',
+        '{"name":"get_time","args":[]}',
+        '{"name":"get_time","args":42}',
+    ],
+)
+def test_inkling_rejects_non_object_envelope_and_arguments(payload):
+    module = load_tool_module("inkling")
+    state = ToolCallDeltaState(module, NO_PARAM_TOOLS)
+    text = f"{module.tool_call_start}get_time<|content_invoke_tool_json|>{payload}{module.tool_call_end}"
+    assert all(not state.feed(char) for char in text)
+    final = process_tool_calls(text, module, NO_PARAM_TOOLS).calls
+    assert final == [] and state.finish(final) == []
+
+
+def test_inkling_waits_for_close_before_defaulting_missing_args():
+    module = load_tool_module("inkling")
+    state = ToolCallDeltaState(module, NO_PARAM_TOOLS)
+    text = '<|message_model|>get_time<|content_invoke_tool_json|>{"name":"get_time"}'
+    assert all(not state.feed(char) for char in text)
+    [delta] = state.feed(module.tool_call_end)
+    assert delta["function"] == {"name": "get_time", "arguments": "{}"}
+    final = process_tool_calls(
+        text + module.tool_call_end, module, NO_PARAM_TOOLS
+    ).calls
+    assert state.finish(final) == []
+
+
 def test_trailing_whitespace_before_tool_call_end_keeps_the_call():
     """A blank line before </tool_call> is not grounds to drop the call."""
     module = load_tool_module("qwen3_coder")
@@ -242,12 +282,19 @@ def test_trailing_whitespace_before_tool_call_end_keeps_the_call():
     ]
 
 
-def test_truncated_call_cannot_finish_successfully():
-    module = load_tool_module("json_tools")
-    state = ToolCallDeltaState(module, TOOLS)
-    assert state.feed(
-        '<tool_call>{"name":"write_file","arguments":{"content":"unfinished'
-    )
+@pytest.mark.parametrize(
+    "parser, prefix",
+    [
+        ("json_tools", '<tool_call>{"name":"write_file","arguments":'),
+        (
+            "inkling",
+            '<|message_model|>write_file<|content_invoke_tool_json|>{"name":"write_file","args":',
+        ),
+    ],
+)
+def test_truncated_call_cannot_finish_successfully(parser, prefix):
+    state = ToolCallDeltaState(load_tool_module(parser), TOOLS)
+    assert state.feed(prefix + '{"content":"unfinished')
     with pytest.raises(ValueError, match="incomplete tool call"):
         state.finish([])
 
