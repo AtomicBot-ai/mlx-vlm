@@ -2745,6 +2745,17 @@ def test_nemotron_vision_normalization_and_video_pruning(nemotron_case):
     ).inputs_embeds.shape == (1, 5, 32)
 
 
+@pytest.mark.parametrize("tied", [True, False])
+def test_qwen3_vl_sanitize_drops_lm_head_only_when_tied(tied):
+    module = importlib.import_module("mlx_vlm.models.qwen3_vl")
+    case = model_case("TestGetInputEmbeddings.qwen3_vl_input_embeddings")
+    case["config"]["text_config"]["tie_word_embeddings"] = tied
+    model = module.Model(build_config(module, case["config"]))
+    once = model.sanitize({"lm_head.weight": mx.zeros((32, 16))})
+    assert ("language_model.lm_head.weight" in once) == (not tied)
+    assert model.sanitize(dict(once)).keys() == once.keys()
+
+
 def test_lfm2_encoder_sanitize_and_dispatch():
     case = next(case for case in DATA["cases"] if case["module"] == "lfm2_encoder")
     module = importlib.import_module("mlx_vlm.models.lfm2_encoder")
