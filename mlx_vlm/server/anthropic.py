@@ -430,12 +430,12 @@ def _anthropic_stop_reason(
     tool_calls: bool = False,
     stop_sequence: Optional[str] = None,
 ) -> str:
+    if finish_reason == "length":
+        return "max_tokens"
     if tool_calls:
         return "tool_use"
     if stop_sequence is not None:
         return "stop_sequence"
-    if finish_reason == "length":
-        return "max_tokens"
     if finish_reason == "tool_calls":
         return "tool_use"
     return "end_turn"
@@ -913,7 +913,9 @@ async def anthropic_messages_endpoint(http_request: Request):
 
                     parsed_tool_calls = None
                     if tool_module is not None and tools:
-                        tc = parse_tools(tool_output_before_stop())
+                        tc = parse_tools(
+                            tool_output_before_stop(), finish_reason=finish_reason
+                        )
                         if tc.calls:
                             parsed_tool_calls = tc.calls
 
@@ -1127,7 +1129,7 @@ async def anthropic_messages_endpoint(http_request: Request):
             )
             parsed_tool_calls = None
             if tool_module is not None and tools:
-                tc = parse_tools(full_text)
+                tc = parse_tools(full_text, finish_reason=finish_reason)
                 if tc.calls:
                     parsed_tool_calls = tc.calls
                     # Structured templates already removed tool/routing regions

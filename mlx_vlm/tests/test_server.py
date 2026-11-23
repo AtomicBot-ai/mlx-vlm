@@ -454,7 +454,7 @@ def _chat_events(response, reason):
     return choices, usage, finish
 
 
-def _chat_tool_result(response, stream):
+def _chat_tool_result(response, stream, finish_reason="tool_calls"):
     assert response.status_code == 200, response.text
     if stream:
         choices = [
@@ -482,7 +482,7 @@ def _chat_tool_result(response, stream):
         message = choice["message"]
         functions = [call["function"] for call in message["tool_calls"]]
         finishes = [choice["finish_reason"]]
-    assert finishes == ["tool_calls"]
+    assert finishes == [finish_reason]
     return NS(
         content=message.get("content") or "",
         reasoning_content=message.get("reasoning_content") or "",
@@ -7432,46 +7432,123 @@ def test_response_template_missing_anchor(client, api, stream, batched, anchor):
             assert _joined(body["content"], "text") == "4."
 
 
+@pytest.fixture(params=["inkling", "muse"])
+def template_tool_case(request):
+    if request.param == "inkling":
+        thinking, content, call = [
+            "<|message_model|>" + part
+            for part in _INKLING_CALL.split("<|message_model|>")[1:]
+        ]
+        return NS(
+            parser="inkling",
+            template=_INKLING_RESPONSE_TEMPLATE,
+            thinking=thinking,
+            content=content,
+            call=call,
+            malformed=call.replace('{"city":"Warsaw"}', "{city}"),
+            truncated=call.split("Warsaw")[0] + "War",
+        )
+    thinking, call = _MUSE_CALL.split("<|start|>", 1)
+    call = "<|start|>" + call + "<|eom|>"
+    return NS(
+        parser="atem",
+        template=_MUSE_RESPONSE_TEMPLATE,
+        thinking=thinking,
+        content="<|start|>assistant to=user<|message|>Checking.<|eom|>",
+        call=call,
+        malformed=call.replace('name="get_weather"', ""),
+        truncated=call.split("Warsaw")[0] + "War",
+    )
+
+
+def _assert_tool_parse_error(response, api, stream):
+    assert response.status_code == (200 if stream or api == "responses" else 500)
+    if stream:
+        events = _data(response)
+        if api == "responses":
+            failures = [
+                e["response"] for e in events if e.get("type") == "response.failed"
+            ]
+            assert len(failures) == 1
+            body = failures[0]
+            assert not any(
+                e.get("type") in ("response.completed", "response.incomplete")
+                for e in events
+            )
+        else:
+            failures = [e for e in events if "error" in e]
+            assert len(failures) == 1
+            body = failures[0]
+            assert not any(
+                c.get("finish_reason") for e in events for c in e.get("choices", [])
+            )
+            assert not any(
+                e.get("type") in ("message_stop", "message_delta") for e in events
+            )
+    else:
+        body = response.json()
+    if api == "responses":
+        assert body["status"] == "failed"
+    error = body["error"]
+    assert error["message"].endswith(
+        "The model generated tool calls, but none could be parsed."
+    )
+    if api == "messages":
+        assert error["type"] == "api_error"
+    else:
+        assert error["code"] == "tool_call_parse_error"
+
+
 @pytest.mark.parametrize("api", ["chat", "responses", "messages"])
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("batched", [False, True])
 @pytest.mark.parametrize("alone", [False, True], ids=["after-text", "alone"])
 @pytest.mark.parametrize(
-    "arguments,finish",
+    "failure,finish",
     [
         (
-            '{"name":"get_weather","args":{"city":"War',
+            "cut-off",
             dict(chat="length", responses="incomplete", messages="max_tokens"),
         ),
         (
-            '{"name":"get_weather","args":{city}}<|end_message|>',
+            "malformed",
             dict(chat="stop", responses="completed", messages="end_turn"),
         ),
+        ("unterminated", dict(chat="stop", responses="completed", messages="end_turn")),
     ],
-    ids=["cut-off", "malformed"],
+    ids=["cut-off", "malformed", "unterminated"],
 )
 def test_response_template_undecodable_tool_call(
-    client, api, stream, batched, alone, arguments, finish
+    client, api, stream, batched, alone, failure, finish, template_tool_case
 ):
-    # A tool call that the template cannot decode costs only that call: the
-    # reasoning, the content and the finish reason of the turn still arrive.
-    start = _INKLING_CALL.index("<|message_model|>get_weather") if alone else 0
-    output = _INKLING_CALL[start : _INKLING_CALL.index("{")] + arguments
+    case = template_tool_case
+    output = ("" if alone else case.thinking + case.content) + (
+        case.truncated if failure in ("cut-off", "unterminated") else case.malformed
+    )
     chunks = [output[i : i + 9] for i in range(0, len(output), 9)]
     tokens = [*map(_token, chunks), _token(finish_reason=finish["chat"])]
     payload = dict(tools=[_tool(api=api)], stream=stream)
     if api == "messages":
         payload.update(thinking=dict(type="enabled", budget_tokens=4), max_tokens=8)
     with _endpoint(
-        processor=NS(tokenizer=_ResponseTemplateTokenizer(_INKLING_RESPONSE_TEMPLATE)),
+        processor=NS(tokenizer=_ResponseTemplateTokenizer(case.template)),
         result=_result(output, finish_reason=finish["chat"]),
         chunks=[
             _result(token.text, finish_reason=token.finish_reason) for token in tokens
         ],
         generator=_streaming(tokens) if batched else None,
-        parser=load_tool_module("inkling"),
+        parser=load_tool_module(case.parser),
     ):
         response = _post(client, api, **payload)
+    if failure != "cut-off":
+        _assert_tool_parse_error(response, api, stream)
+        if stream:
+            assert _thinking_text(response, api) == (
+                ("", "") if alone else ("I need the weather tool.", "Checking.")
+            )
+        elif api == "responses":
+            assert response.json()["output_text"] == ("" if alone else "Checking.")
+        return
     assert response.status_code == 200, response.text
     assert "<|" not in response.text and "city" not in response.text
     if stream:
@@ -7548,6 +7625,110 @@ def test_response_template_tool_call_without_tools(client, stream):
         response = _post(client, stream=stream)
     assert response.status_code == 200, response.text
     assert "get_weather" not in response.text
+
+
+@pytest.mark.parametrize("api", ["chat", "responses", "messages"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("batched", [False, True])
+@pytest.mark.parametrize("truncated", [False, True])
+def test_response_template_keeps_valid_calls_beside_errors(
+    client, api, stream, batched, template_tool_case, truncated
+):
+    case = template_tool_case
+    output = case.thinking + case.malformed + case.call + case.malformed + case.content
+    if truncated:
+        output = case.thinking + case.content + case.call + case.truncated
+    finish_reason = "length" if truncated else "stop"
+    chunks = [output[i : i + 7] for i in range(0, len(output), 7)]
+    tokens = [*map(_token, chunks), _token(finish_reason=finish_reason)]
+    payload = dict(stream=stream, tools=[_tool(api=api)])
+    if api == "messages":
+        payload.update(thinking=dict(type="enabled", budget_tokens=4), max_tokens=8)
+    with _endpoint(
+        processor=NS(tokenizer=_ResponseTemplateTokenizer(case.template)),
+        result=_result(output, finish_reason=finish_reason),
+        chunks=[_result(t.text, finish_reason=t.finish_reason) for t in tokens],
+        generator=_streaming(tokens) if batched else None,
+        parser=load_tool_module(case.parser),
+    ):
+        response = _post(client, api, **payload)
+    assert response.status_code == 200, response.text
+    if api == "chat":
+        result = _chat_tool_result(
+            response, stream, "length" if truncated else "tool_calls"
+        )
+        assert result.calls == [("get_weather", {"city": "Warsaw"})]
+        assert (result.reasoning_content, result.content) == (
+            "I need the weather tool.",
+            "Checking.",
+        )
+    elif api == "responses":
+        body = (
+            next(
+                e["response"]
+                for e in _data(response)
+                if e.get("type") in ("response.completed", "response.incomplete")
+            )
+            if stream
+            else response.json()
+        )
+        assert body["status"] == ("incomplete" if truncated else "completed")
+        calls = [item for item in body["output"] if item["type"] == "function_call"]
+        assert [(c["name"], json.loads(c["arguments"])) for c in calls] == [
+            ("get_weather", {"city": "Warsaw"})
+        ]
+        if stream:
+            assert _thinking_text(response, api) == (
+                "I need the weather tool.",
+                "Checking.",
+            )
+    elif stream:
+        events = _data(response)
+        blocks = [
+            e["content_block"]
+            for e in events
+            if e.get("type") == "content_block_start"
+            and e["content_block"]["type"] == "tool_use"
+        ]
+        assert len(blocks) == 1 and blocks[0]["name"] == "get_weather"
+        args = _joined(
+            [e["delta"] for e in events if e.get("type") == "content_block_delta"],
+            "partial_json",
+        )
+        assert json.loads(args) == {"city": "Warsaw"}
+        assert _thinking_text(response, api) == (
+            "I need the weather tool.",
+            "Checking.",
+        )
+        assert _anthropic_stream_stop(response)[0] == (
+            "max_tokens" if truncated else "tool_use"
+        )
+    else:
+        body = response.json()
+        calls = [c for c in body["content"] if c["type"] == "tool_use"]
+        assert [(c["name"], c["input"]) for c in calls] == [
+            ("get_weather", {"city": "Warsaw"})
+        ]
+        assert _joined(body["content"], "thinking") == "I need the weather tool."
+        assert _joined(body["content"], "text") == "Checking."
+        assert body["stop_reason"] == ("max_tokens" if truncated else "tool_use")
+
+
+@pytest.mark.parametrize("api", ["chat", "responses", "messages"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("batched", [False, True])
+def test_tool_parse_failure_without_response_template(client, api, stream, batched):
+    output = "Hello.<tool_call>{broken}</tool_call>"
+    tokens = [_token(output), _token(finish_reason="stop")]
+    with _endpoint(
+        result=_result(output, finish_reason="stop"),
+        chunks=[_result(t.text, finish_reason=t.finish_reason) for t in tokens],
+        generator=_streaming(tokens) if batched else None,
+        parser=_JSON_TOOLS,
+    ):
+        response = _post(client, api, stream=stream, tools=[_tool(api=api)])
+    _assert_tool_parse_error(response, api, stream)
+    assert "{broken}" not in response.text and "<tool_call>" not in response.text
 
 
 def test_response_template_thinking_stream():
@@ -9055,13 +9236,19 @@ def test_anthropic_unfinished_call_matches_stream(
 
     with _endpoint(parser=_JSON_TOOLS, **endpoint_options()):
         response = _post(client, "messages", tools=[_tool(api="messages")])
-    assert response.status_code == 200, response.text
-    blocks = response.json()["content"]
-    assert "".join(b["text"] for b in blocks if b["type"] == "text") == expected
-    assert sum(b["type"] == "tool_use" for b in blocks) == int(completed_call)
+    failed = not completed_call and finish_reason != "length"
+    if failed:
+        _assert_tool_parse_error(response, "messages", False)
+    else:
+        assert response.status_code == 200, response.text
+        blocks = response.json()["content"]
+        assert "".join(b["text"] for b in blocks if b["type"] == "text") == expected
+        assert sum(b["type"] == "tool_use" for b in blocks) == int(completed_call)
 
     with _endpoint(parser=_JSON_TOOLS, **endpoint_options()):
         response = _post(client, "messages", stream=True, tools=[_tool(api="messages")])
+    if failed:
+        _assert_tool_parse_error(response, "messages", True)
     assert _joined(_deltas(response, "messages"), "text") == expected
     tool_blocks = [
         item["content_block"]

@@ -277,8 +277,8 @@ class ToolCallDeltaState:
             return {"index": index, "function": {"arguments": fragment}}
         return None
 
-    def finish(self, calls):
-        if len(calls) < len(self.calls):
+    def finish(self, calls, *, incomplete=False):
+        if len(calls) < len(self.calls) and not incomplete:
             raise ValueError("Generation ended with an incomplete tool call.")
         deltas = []
         for index, call in enumerate(calls):

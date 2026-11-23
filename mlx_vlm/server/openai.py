@@ -19,7 +19,7 @@ from typing import Any, List, Optional, Tuple
 import anyio
 import mlx.core as mx
 from fastapi import HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
 
 from ..generate import generate, stream_generate
@@ -35,6 +35,7 @@ from ..tools import (
     load_tool_module,
 )
 from ..tools.streaming import ToolCallDeltaState
+from ..tools.types import ToolCallParseError
 from ..utils import prepare_inputs
 from . import compaction, continuation
 from .cluster_types import GenerationProgress, PromptProgress
@@ -855,6 +856,10 @@ async def responses_compact_endpoint(http_request: Request, request: CompactRequ
     }
 
 
+def _tool_call_error(exc):
+    return {"type": "server_error", "code": exc.code, "message": str(exc)}
+
+
 def _response_stream_error(exc, response):
     status = exc.status_code if isinstance(exc, HTTPException) else 500
     code = (
@@ -866,6 +871,8 @@ def _response_stream_error(exc, response):
             else ("invalid_prompt" if status < 500 else "server_error")
         )
     )
+    if isinstance(exc, ToolCallParseError):
+        code = exc.code
     return _response_sse_event(
         "response.failed",
         {
@@ -1635,6 +1642,7 @@ async def responses_endpoint(request: Request):
                             starts_in_thinking=starts_in_thinking,
                             tool_delta_state=tool_delta_state,
                             prompt=formatted_prompt,
+                            finish_reason=finish_reason,
                         )
                     )
                     for item in output_items:
@@ -1906,6 +1914,7 @@ async def responses_endpoint(request: Request):
                         processor=processor,
                         starts_in_thinking=starts_in_thinking,
                         prompt=formatted_prompt,
+                        finish_reason=finish_reason,
                     )
                 )
                 if finish_reason != "length" and output_finish_reason == "tool_calls":
@@ -2007,6 +2016,37 @@ async def responses_endpoint(request: Request):
                 logger.exception("Responses generation failed: %s", e)
                 mx.clear_cache()
                 gc.collect()
+                if isinstance(e, ToolCallParseError):
+                    # A failed response may retain decoded template text, but
+                    # must not expose the raw invalid call through a fallback.
+                    decoded = _parse_response_template(
+                        full_text, processor, prompt=formatted_prompt
+                    )
+                    output, content, _, _ = _response_output_items_from_text(
+                        full_text if decoded is not None else "",
+                        message_id,
+                        None,
+                        [],
+                        {},
+                        gen_args.thinking_start_token,
+                        gen_args.thinking_end_token,
+                        processor=processor,
+                        starts_in_thinking=starts_in_thinking,
+                        prompt=formatted_prompt,
+                    )
+                    return OpenAIResponse(
+                        id=response_id,
+                        object="response",
+                        created_at=int(generated_at),
+                        status="failed",
+                        model=openai_request.model,
+                        output=output,
+                        output_text=content,
+                        error=_tool_call_error(e),
+                        usage=OpenAIUsage.from_metrics(
+                            metrics, prompt_tokens, output_tokens
+                        ),
+                    )
                 raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
 
     except HTTPException as http_exc:
@@ -2402,15 +2442,21 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         # Parse tool calls from full output and emit final chunk
                         terminal_emitted = False
                         if tool_module is not None:
-                            tc = parse_tools(full_output)
-                            remaining_calls = tool_delta_state.finish(tc.calls)
+                            tc = parse_tools(full_output, finish_reason=finish_reason)
+                            remaining_calls = tool_delta_state.finish(
+                                tc.calls, incomplete=finish_reason == "length"
+                            )
                             if tc.calls:
                                 tool_calls_made = True
-                                finish_reason = "tool_calls"
+                                finish_reason = (
+                                    "length"
+                                    if finish_reason == "length"
+                                    else "tool_calls"
+                                )
                                 terminal_emitted = True
                                 choices = [
                                     ChatStreamChoice(
-                                        finish_reason="tool_calls",
+                                        finish_reason=finish_reason,
                                         delta=ChatMessage(
                                             role="assistant",
                                             tool_calls=remaining_calls or None,
@@ -2550,23 +2596,25 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             yield f"data: {chunk_data.model_dump_json()}\n\n"
 
                         tc = (
-                            parse_tools(output_text)
+                            parse_tools(output_text, finish_reason=finish_reason)
                             if tool_module is not None
                             else None
                         )
                         remaining_calls = tool_delta_state.finish(
-                            tc.calls if tc else []
+                            tc.calls if tc else [], incomplete=finish_reason == "length"
                         )
                         if tc is not None and tc.calls:
                             tool_calls_made = True
-                            finish_reason = "tool_calls"
+                            finish_reason = (
+                                "length" if finish_reason == "length" else "tool_calls"
+                            )
                             chunk_data = ChatStreamChunk(
                                 id=request_id,
                                 created=int(time.time()),
                                 model=request.model,
                                 choices=[
                                     ChatStreamChoice(
-                                        finish_reason="tool_calls",
+                                        finish_reason=finish_reason,
                                         delta=ChatMessage(
                                             role="assistant",
                                             tool_calls=remaining_calls or None,
@@ -2664,7 +2712,15 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         )
                         metrics_finalized = True
                     logger.exception("Chat completion stream generation failed: %s", e)
-                    error_data = json.dumps({"error": str(e)})
+                    error_data = json.dumps(
+                        {
+                            "error": (
+                                _tool_call_error(e)
+                                if isinstance(e, ToolCallParseError)
+                                else str(e)
+                            )
+                        }
+                    )
                     yield f"data: {error_data}\n\n"
 
                 finally:
@@ -2810,7 +2866,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 # Parse tool calls from generated output
                 parsed_tool_calls = None
                 if tool_module is not None:
-                    tc = parse_tools(full_text)
+                    tc = parse_tools(full_text, finish_reason=finish_reason)
                     if tc.calls:
                         parsed_tool_calls = tc.calls
                         clean_remaining = tc.remaining_text or ""
@@ -2831,6 +2887,10 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             )
                             or None
                         )
+
+                if parsed_tool_calls and finish_reason != "length":
+                    finish_reason = "tool_calls"
+                finish_reason = finish_reason or "stop"
 
                 response_logprobs = None
                 if request.logprobs and collected_logprobs:
@@ -2855,11 +2915,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                 choices = [
                     ChatChoice(
-                        finish_reason=(
-                            "tool_calls"
-                            if parsed_tool_calls
-                            else finish_reason or "stop"
-                        ),
+                        finish_reason=finish_reason,
                         message=ChatMessage(
                             role="assistant",
                             content=content if content else None,
@@ -2914,9 +2970,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     prompt_tps=metrics.prompt_tps,
                     generation_tps=metrics.generation_tps,
                     peak_memory_gb=metrics.peak_memory or None,
-                    finish_reason=(
-                        "tool_calls" if parsed_tool_calls else finish_reason or "stop"
-                    ),
+                    finish_reason=finish_reason,
                     image_count=len(images),
                     audio_count=len(audio),
                     structured_output=bool(gen_args.logits_processors),
@@ -2948,6 +3002,10 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 logger.exception("Chat completion generation failed: %s", e)
                 mx.clear_cache()
                 gc.collect()
+                if isinstance(e, ToolCallParseError):
+                    return JSONResponse(
+                        status_code=500, content={"error": _tool_call_error(e)}
+                    )
                 raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
 
     except HTTPException as http_exc:
