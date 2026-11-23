@@ -52,6 +52,7 @@ from .responses_state import (
     ThinkingStreamState,
     ToolCallStreamState,
     _normalize_response_input,
+    _parse_response_template,
     _response_chain_items,
     _response_items_to_chat,
     _response_output_items_from_text,
@@ -2776,19 +2777,24 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 mx.clear_cache()
                 gc.collect()
 
-                reasoning, content = _split_thinking(
-                    full_text,
-                    gen_args.thinking_start_token,
-                    gen_args.thinking_end_token,
-                    prompt_has_open_thinking(
-                        formatted_prompt,
-                        gen_args.enable_thinking,
+                template_response = _parse_response_template(
+                    full_text, processor, prompt=formatted_prompt
+                )
+                if template_response is not None:
+                    reasoning, content = template_response
+                else:
+                    reasoning, content = _split_thinking(
+                        full_text,
                         gen_args.thinking_start_token,
                         gen_args.thinking_end_token,
-                    ),
-                    processor=processor,
-                    prompt=formatted_prompt,
-                )
+                        prompt_has_open_thinking(
+                            formatted_prompt,
+                            gen_args.enable_thinking,
+                            gen_args.thinking_start_token,
+                            gen_args.thinking_end_token,
+                        ),
+                        prompt=formatted_prompt,
+                    )
 
                 # Count raw generated tokens minus thinking tag tokens
                 completion_tokens = output_tokens - _count_thinking_tag_tokens(
@@ -2807,11 +2813,18 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     tc = parse_tools(full_text)
                     if tc.calls:
                         parsed_tool_calls = tc.calls
-                        # Reasoning was already removed before tool parsing.
                         clean_remaining = tc.remaining_text or ""
+                        if template_response is not None:
+                            # Preserve successfully decoded template content;
+                            # message-wide call markers can erase it from the
+                            # raw extractor's remainder. Keep the original
+                            # remainder when template parsing falls back.
+                            clean_remaining = ToolCallStreamState(
+                                tool_module.tool_call_start, tool_module.tool_call_end
+                            ).feed(content, last=True)
                         content = (
                             strip_protocol_markers(
-                                clean_remaining,
+                                clean_remaining or "",
                                 tool_module,
                                 gen_args.thinking_start_token,
                                 gen_args.thinking_end_token,

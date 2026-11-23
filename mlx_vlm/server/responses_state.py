@@ -479,17 +479,15 @@ def _clean_reasoning(reasoning: str, start_marker: str) -> str:
     return reasoning.strip()
 
 
-def _split_thinking(
+def _parse_response_template(
     text: str,
-    thinking_start_token: Optional[str] = None,
-    thinking_end_token: Optional[str] = None,
-    starts_in_thinking: bool = False,
-    processor=None,
+    processor,
     *,
     prompt: str = "",
-) -> Tuple[Optional[str], str]:
+) -> Optional[Tuple[Optional[str], str]]:
+    """Return decoded reasoning/content, or None when template parsing falls back."""
     if not text:
-        return None, text
+        return None
 
     tokenizer = _response_template_tokenizer(processor)
     if tokenizer is not None and hasattr(tokenizer, "parse_response"):
@@ -514,6 +512,24 @@ def _split_thinking(
             logger.debug(
                 "Falling back from tokenizer response-template parser", exc_info=True
             )
+    return None
+
+
+def _split_thinking(
+    text: str,
+    thinking_start_token: Optional[str] = None,
+    thinking_end_token: Optional[str] = None,
+    starts_in_thinking: bool = False,
+    processor=None,
+    *,
+    prompt: str = "",
+) -> Tuple[Optional[str], str]:
+    if not text:
+        return None, text
+
+    parsed = _parse_response_template(text, processor, prompt=prompt)
+    if parsed is not None:
+        return parsed
 
     for start_marker, end_marker in ThinkingStreamState._build_open_close_markers(
         thinking_start_token, thinking_end_token
