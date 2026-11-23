@@ -2972,6 +2972,58 @@ def test_single_row_checkpoint(managers):
     assert batch._apc_manager.stats.exact_stores == 1
 
 
+@pytest.mark.parametrize("right_pad_per_row", [None, [0]], ids=["left", "right"])
+def test_prefill_releases_unused_logits_before_checkpoint(
+    managers, monkeypatch, right_pad_per_row
+):
+    cache = C.ArraysCache(1)
+    cache[0] = mx.arange(128, dtype=mx.float32).reshape(1, 1, -1)
+    mx.eval(cache.state)
+    state_bytes = cache[0].nbytes
+    manager = managers(budget=4 * state_bytes)
+    manager.exact_cache_guard_tokens = 32
+    live_logits = weakref.WeakValueDictionary()
+
+    class RecurrentModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = NS(embed_tokens=lambda ids: mx.zeros((*ids.shape, 1)))
+
+        def make_cache(self):
+            return [cache]
+
+        def __call__(self, inputs, cache, **kwargs):
+            previous = cache[0][0]
+            cache[0][0] = -previous
+            mx.eval(cache[0].state)
+            logits = mx.sin(previous)
+            live_logits["step"] = logits
+            return LanguageModelOutput(logits=logits)
+
+    model = RecurrentModel()
+    tokens = list(range(64))
+    batch = prompt_batch(
+        model,
+        manager,
+        [tokens],
+        [0],
+        [cache],
+        step=32,
+        right_pad_per_row=right_pad_per_row,
+    )
+    # The checkpoint and its reserve need two states' worth of headroom.
+    # Charge one state for the previous buffer while the lazy logits retain it.
+    with monkeypatch.context() as admission:
+        admission.setattr(
+            manager, "_memory_headroom", lambda: state_bytes * (1 if live_logits else 2)
+        )
+        assert batch.prompt_step() == 32
+    assert manager.stats.exact_stores == 1
+    restored, count = manager.lookup_exact_cache(tokens)
+    assert count == 32
+    assert mx.all(restored[0][0] == -mx.arange(128).reshape(1, 1, -1)).item()
+
+
 def test_generation_stream_spill(managers, monkeypatch):
     from mlx_vlm.generate.common import generation_stream
 

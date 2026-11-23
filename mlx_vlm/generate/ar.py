@@ -2404,6 +2404,9 @@ class PromptProcessingBatch:
                 self._finished_prompt_logits[self.uids[i]] = mx.contiguous(
                     mx.array(logits[i, -1])
                 )
+            del logits
+        # Unused lazy logits can retain previous KV buffers during admission.
+        del output
         eval_targets = [c.state for c in self.prompt_cache]
         eval_targets.extend(
             self._finished_prompt_logits[self.uids[i]] for i in finished_rows
