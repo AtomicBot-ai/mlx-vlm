@@ -97,7 +97,6 @@ def short_convolution(
     return outputs if write_window else outputs[0]
 
 
-# Adapted from mlx-dspark's fused_head_prep, Copyright (c) 2026 erahim3 (MIT).
 @lru_cache(maxsize=1)
 def _attention_head_kernel():
     return mx.fast.metal_kernel(
