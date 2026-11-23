@@ -249,25 +249,56 @@ def test_inkling2_short_convolution_native_fp32_rounding(
     actual.start_speculation(length)
     reference.start_speculation(length)
     calls = []
-    kernel = kernels.short_convolution
+    kernel = kernels._short_convolution
 
     def record(*args):
         calls.append(True)
         return kernel(*args)
 
-    monkeypatch.setattr(kernels, "short_convolution", record)
+    monkeypatch.setattr(kernels, "_short_convolution", record)
     output = conv(x, actual, mask)
-    if mx.metal.is_available() and mx.default_device() == mx.gpu:
-        assert calls
+    expected_calls = int(mx.metal.is_available() and mx.default_device() == mx.gpu)
     with monkeypatch.context() as patch:
         patch.setattr(mx.metal, "is_available", lambda: False)
         expected = conv(x, reference, mask)
+    assert len(calls) == expected_calls
     retained = [length] if batch == 1 else [0, 1, length - 1, length]
     actual.commit_speculation(retained)
     reference.commit_speculation(retained)
     equal(output, expected, atol=0, rtol=0)
     equal(actual.state, reference.state, atol=0, rtol=0)
     assert actual[0].dtype == mx.float32
+
+
+@parametrize("output_dtype", [mx.float32, mx.bfloat16])
+def test_inkling2_sconv_fuses_residual_and_preserves_rollback(
+    output_dtype, monkeypatch
+):
+    from mlx_vlm.models.inkling2.language import ShortConvolution
+
+    conv = ShortConvolution(128, 4, 0)
+    conv.set_dtype(mx.bfloat16)
+    conv.eval()
+    # The decoder can hand the convolution strided projections and FP32 residuals.
+    key = mx.random.key(73)
+    x = mx.random.normal((3, 4, 256), key=key).astype(mx.bfloat16)[..., ::2]
+    state = mx.random.normal((3, 3, 256), key=key)[..., 1::2]
+    residual = mx.random.normal((3, 8, 128), key=key)[:, ::2]
+    actual, reference = ArraysCache(1), ArraysCache(1)
+    for cache in (actual, reference):
+        cache[0] = state
+        cache.start_speculation(4)
+    out = conv(x, actual, residual=residual, output_dtype=output_dtype)
+    with monkeypatch.context() as patch:
+        patch.setattr(mx.metal, "is_available", lambda: False)
+        rounded = conv(x, reference)
+    expected = (rounded.astype(mx.float32) + residual).astype(output_dtype)
+    assert out.dtype == output_dtype
+    assert mx.array_equal(out, expected).item()
+    assert mx.array_equal(actual[0], reference[0]).item()
+    for cache in (actual, reference):
+        cache.commit_speculation([0, 2, 4])
+    assert mx.array_equal(actual[0], reference[0]).item()
 
 
 @parametrize("rank", [None, 0, 1])

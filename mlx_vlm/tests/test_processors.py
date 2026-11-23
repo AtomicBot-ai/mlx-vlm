@@ -1506,6 +1506,66 @@ class TestQwen3VLProcessor:
         assert output["pixel_values_videos"].shape == (512, 1176)
 
 
+class TestQwen2_5VLVideoTemporalSpacing:
+    def _processor(self):
+        p = _make_processor("qwen2_5_vl")
+        p.video_processor = _stub("qwen_video")
+        return p
+
+    def _videos(self):
+        return [np.zeros((4, 224, 224, 3), np.uint8)]
+
+    def test_second_per_grid_ts_from_fps(self):
+        p = self._processor()
+        result = p(text=["<|video_pad|>"], videos=self._videos(), fps=2.0)
+        assert result["second_per_grid_ts"].tolist() == [1.0]
+        assert "fps" not in p.tokenizer.last_kwargs
+
+    def test_second_per_grid_ts_per_video_fps(self):
+        p = self._processor()
+        result = p(text=["<|video_pad|>"], videos=self._videos(), fps=[4.0])
+        assert result["second_per_grid_ts"].tolist() == [0.5]
+
+    def test_second_per_grid_ts_defaults_to_processor_fps(self):
+        p = self._processor()
+        result = p(text=["<|video_pad|>"], videos=self._videos())
+        assert result["second_per_grid_ts"].tolist() == [1.0]
+
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            NS(sampled_fps=4.0),
+            {"fps": 8.0, "total_num_frames": 8, "frames_indices": [0, 2, 4, 6]},
+        ],
+    )
+    def test_second_per_grid_ts_from_video_metadata(self, metadata):
+        p = self._processor()
+        result = p(
+            text=["<|video_pad|>"],
+            videos=self._videos(),
+            video_metadata=[metadata],
+        )
+        assert result["second_per_grid_ts"].tolist() == [0.5]
+        assert "video_metadata" not in p.tokenizer.last_kwargs
+
+    @pytest.mark.parametrize("fps", [3.0, 4.0])
+    def test_prepare_inputs_preserves_sampled_fps(self, fps):
+        result = prepare_inputs(
+            self._processor(), prompts=["<|video_pad|>"], videos=self._videos(), fps=fps
+        )
+        assert result["second_per_grid_ts"].tolist() == pytest.approx([2 / fps])
+
+    def test_fps_count_mismatch_raises(self):
+        p = self._processor()
+        with pytest.raises(ValueError, match="length of fps"):
+            p(text=["<|video_pad|>"], videos=self._videos(), fps=[2.0, 2.0])
+
+    def test_non_positive_fps_raises(self):
+        p = self._processor()
+        with pytest.raises(ValueError, match="fps must be positive"):
+            p(text=["<|video_pad|>"], videos=self._videos(), fps=0.0)
+
+
 def test_pixtral_image_preprocess_resizes_to_patch_multiple_and_pads():
     image_processor = m.pixtral_ip.PixtralImageProcessor(**PROFILES["pixtral_image"])
     wide = Image.fromarray(np.zeros((31, 55, 3), dtype=np.uint8))

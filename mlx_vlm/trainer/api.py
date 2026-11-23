@@ -128,6 +128,8 @@ class Trainer:
         self.eval_dataset = self._prepare(eval_dataset)
         self.metrics = {}
         self.log_history = []
+        # Resumable training retains pending gradients across an interruption.
+        self.accumulation = None
 
     def _prepare(self, dataset):
         if dataset is None:
@@ -159,6 +161,7 @@ class Trainer:
             self.training_callback,
             self.seed,
             log_history=self.log_history,
+            accumulation=self.accumulation,
         )
         return self.metrics
 

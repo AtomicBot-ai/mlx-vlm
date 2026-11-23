@@ -218,6 +218,7 @@ class LanguageModel(nn.Module):
         image_grid_thw: Optional[mx.array] = None,
         video_grid_thw: Optional[mx.array] = None,
         attention_mask: Optional[mx.array] = None,
+        second_per_grid_ts: Optional[mx.array] = None,
     ):
         # Calculate RoPE index for image/video tokens
         batch_size, seq_length = input_ids.shape
@@ -274,11 +275,24 @@ class LanguageModel(nn.Module):
                         image_index += 1
                         remain_images -= 1
                         ed = ed_image
+                        time_interval = 1
                     else:
                         t, h, w = (
                             video_grid_thw[video_index][0],
                             video_grid_thw[video_index][1],
                             video_grid_thw[video_index][2],
+                        )
+                        # Video temporal positions are spaced by real time:
+                        # tokens_per_second * seconds per temporal grid. Still
+                        # images keep unit spacing (HF get_rope_index parity).
+                        second_per_grid_t = (
+                            second_per_grid_ts[video_index]
+                            if second_per_grid_ts is not None
+                            else 1
+                        )
+                        time_interval = (
+                            self.config.vision_config.tokens_per_second
+                            * second_per_grid_t
                         )
                         video_index += 1
                         remain_videos -= 1
@@ -298,13 +312,14 @@ class LanguageModel(nn.Module):
                     index = mx.broadcast_to(index, (3, text_len))
                     index = index + st_idx
                     llm_pos_ids_list.append(index)
-                    t_index = mx.arange(llm_grid_t).reshape(
-                        llm_grid_t, 1
-                    )  # Equivalent to .view(-1, 1)
+                    # Quantize each temporal coordinate before it can affect
+                    # the starting position of the following text or video.
+                    t_index = (mx.arange(llm_grid_t) * time_interval).astype(
+                        position_ids.dtype
+                    )
                     t_index = mx.broadcast_to(
-                        t_index, (llm_grid_t, llm_grid_h * llm_grid_w)
-                    )  # Equivalent to expand()
-                    t_index = t_index.flatten()  # Flattens to 1D
+                        t_index[:, None], (llm_grid_t, llm_grid_h * llm_grid_w)
+                    ).flatten()
 
                     h_index = mx.arange(llm_grid_h).reshape(
                         1, llm_grid_h, 1
@@ -416,6 +431,7 @@ class LanguageModel(nn.Module):
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
         rope_deltas_kw = kwargs.pop("rope_deltas", None)
+        second_per_grid_ts = kwargs.pop("second_per_grid_ts", None)
         # reset rope_deltas and position_ids when processing a new image/video
         if pixel_values is not None:
             self._rope_deltas = None
@@ -473,7 +489,11 @@ class LanguageModel(nn.Module):
                         ]
                 else:
                     position_ids, rope_deltas = self.get_rope_index(
-                        inputs, image_grid_thw, video_grid_thw, rope_mask
+                        inputs,
+                        image_grid_thw,
+                        video_grid_thw,
+                        rope_mask,
+                        second_per_grid_ts,
                     )
                     self._rope_deltas = rope_deltas
                     self._position_ids = position_ids

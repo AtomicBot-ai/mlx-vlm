@@ -294,7 +294,7 @@ def _paired_mxfp8_qmv():
     )
 
 
-def supports_paired_mxfp8_qmv(linear):
+def supports_paired_mxfp8_qmv(linear, *, input_alignment=256):
     from .switch_layers import QuantizedSwitchLinear
 
     return (
@@ -302,7 +302,7 @@ def supports_paired_mxfp8_qmv(linear):
         and linear.mode == "mxfp8"
         and linear.bits == 8
         and linear.group_size == 32
-        and linear.input_dims % 256 == 0
+        and linear.input_dims % input_alignment == 0
         and linear.output_dims % 8 == 0
         and linear.weight.dtype == mx.uint32
         and linear.scales.dtype == mx.uint8

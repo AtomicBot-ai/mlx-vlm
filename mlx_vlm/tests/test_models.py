@@ -7695,13 +7695,12 @@ class TestGemma4PerLayerConfig:
         assert (sliding.head_dim, sliding.n_kv_heads) == (8, 4)
 
 
-@pytest.fixture
-def inkling2_model(request):
+def make_inkling2_model(family):
     from mlx_vlm.models.inkling2 import Model, ModelConfig
 
     mx.random.seed(194)
     config = model_case("inkling2")["config"]
-    if getattr(request, "param", "small") == "mini":
+    if family == "mini":
         config.update(
             model_type="inkling2_loop",
             quantization_config={"quant_method": "modelopt", "quant_algo": "NVFP4"},
@@ -7734,6 +7733,11 @@ def inkling2_model(request):
             )
     model.eval()
     return model
+
+
+@pytest.fixture
+def inkling2_model(request):
+    return make_inkling2_model(getattr(request, "param", "small"))
 
 
 def _inkling2_native_weights(model):

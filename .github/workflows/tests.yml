@@ -87,6 +87,7 @@ jobs:
             extras: 'test,cpu'
             tests: >-
               tests/test_checkpoint_transfer.py
+              tests/test_evals.py
               tests/test_cli.py
               tests/test_generate.py
               tests/test_sampling_defaults.py
@@ -112,6 +113,8 @@ jobs:
               tests/test_training_batching.py
               tests/test_training_callbacks.py
               tests/test_training_cli.py
+              tests/test_train_runs.py
+              tests/test_training_skill.py
               tests/test_training_cross_entropy.py
               tests/test_training_data_loading.py
               tests/test_training_dataset_preparation.py
@@ -133,7 +136,7 @@ jobs:
             tests: >-
               tests/test_gated_delta.py
               tests/test_generation_stream.py
-              tests/test_inkling_kernel_gates.py
+              tests/test_inkling.py
               tests/test_interpolate.py
               tests/test_models.py
               tests/test_mrope_text_only_rope_deltas.py

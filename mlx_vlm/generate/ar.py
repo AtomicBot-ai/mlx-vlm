@@ -960,6 +960,8 @@ def _make_cache(
                     "disable KV quantization for continuous batching"
                 )
             return c.to_batch(left_padding)
+        if isinstance(c, cache.AttentionSinkKVCache) and c.max_size is not None:
+            return cache.BatchRotatingKVCache(c.max_size, left_padding)
         if isinstance(c, cache.KVCache):
             if kv_bits is not None and quantize:
                 return _make_quant_cache(left_padding)
@@ -2867,6 +2869,7 @@ class BatchGenerator:
             media={
                 "audio": prompt_kwargs.get("input_features"),
                 "video": prompt_kwargs.get("pixel_values_videos"),
+                "second_per_grid_ts": _apc.video_timing_key(prompt_kwargs),
                 "embeddings": prompt_kwargs.get("inputs_embeds"),
                 "masks": prompt_kwargs.get("attention_mask"),
             },
