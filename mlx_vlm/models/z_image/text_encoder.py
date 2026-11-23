@@ -12,6 +12,7 @@ class _ComputedRotaryEmbedding(nn.Module):
     def __init__(self, dim: int, base: float) -> None:
         super().__init__()
         self._inv_freq = 1.0 / (base ** (mx.arange(0, dim, 2, dtype=mx.float32) / dim))
+        mx.eval(self._inv_freq)
 
     def __call__(
         self, x: mx.array, position_ids: mx.array

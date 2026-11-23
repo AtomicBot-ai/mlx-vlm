@@ -32,17 +32,20 @@ class Ideogram4MRoPE(nn.Module):
         mrope_section: tuple[int, int, int],
     ) -> None:
         super().__init__()
-        inv = 1.0 / (base ** (mx.arange(0, head_dim, 2, dtype=mx.float32) / head_dim))
+        self._inv_freq = 1.0 / (
+            base ** (mx.arange(0, head_dim, 2, dtype=mx.float32) / head_dim)
+        )
         selector = [0] * (head_dim // 2)
         for axis, offset in ((1, 1), (2, 2)):
             for index in range(offset, mrope_section[axis] * 3, 3):
                 selector[index] = axis
-        self.inv_freq = inv
-        self.axis_selector = mx.array(selector, dtype=mx.int32)
+        self._axis_selector = mx.array(selector, dtype=mx.int32)
+        # These derived tables must be ready before the first call on a worker.
+        mx.eval(self._inv_freq, self._axis_selector)
 
     def __call__(self, position_ids: mx.array) -> tuple[mx.array, mx.array]:
-        selected_positions = mx.take(position_ids, self.axis_selector, axis=2)
-        freqs = selected_positions.astype(mx.float32) * self.inv_freq.reshape(1, 1, -1)
+        selected_positions = mx.take(position_ids, self._axis_selector, axis=2)
+        freqs = selected_positions.astype(mx.float32) * self._inv_freq.reshape(1, 1, -1)
         emb = mx.concatenate([freqs, freqs], axis=-1)
         return mx.cos(emb), mx.sin(emb)
 
