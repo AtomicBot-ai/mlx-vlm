@@ -394,6 +394,48 @@ class Attention(nn.Module):
         weight = mx.pad(projection.weight, ((start, width - start), (0, 0)))
         return (x @ weight.T)[..., start : start + width]
 
+    def _prepare_heads(self, x, k, v):
+        batch, length, _ = x.shape
+        cfg = self.config
+        q = self._project(self.q_proj, x).reshape(
+            batch, length, self.n_heads, self.head_dim
+        )
+        k = k.reshape(batch, length, self.n_kv, self.head_dim)
+        v = v.reshape(batch, length, self.n_kv, self.head_dim)
+        r = self._project(self.r_proj, x).reshape(
+            batch, length, self.n_heads, cfg.d_rel
+        )
+        if (
+            cfg.loop_config is not None
+            and not self.training
+            and self.sharding_group is None
+            and cfg.use_value_norm_no_gamma
+            and x.dtype == mx.bfloat16
+        ):
+            from .kernels import prepare_attention_heads
+
+            prepared = prepare_attention_heads(
+                q,
+                k,
+                v,
+                r,
+                self.q_scale,
+                self.rel_scale,
+                cfg.qk_l2_clip_threshold,
+                cfg.rel_l2_clip_threshold,
+                cfg.rms_norm_eps,
+            )
+            if prepared is not None:
+                return prepared
+        q = l2_clip(q, cfg.qk_l2_clip_threshold, self.q_scale)
+        k = l2_clip(k, cfg.qk_l2_clip_threshold)
+        if cfg.use_value_norm_no_gamma:
+            v = mx.fast.rms_norm(v.astype(mx.float32), None, cfg.rms_norm_eps).astype(
+                x.dtype
+            )
+        r = l2_clip(r, cfg.rel_l2_clip_threshold, self.rel_scale)
+        return q, k, v, r
+
     def __call__(self, x, key_input=None, value_input=None, cache=None, conv_mask=None):
         b, length, _ = x.shape
         cfg = self.config
@@ -408,26 +450,7 @@ class Attention(nn.Module):
         else:
             k = self.k_sconv(k, key_input, conv, conv_mask)
             v = self.v_sconv(v, value_input, conv, conv_mask)
-        q = l2_clip(
-            self._project(self.q_proj, x).reshape(
-                b, length, self.n_heads, self.head_dim
-            ),
-            cfg.qk_l2_clip_threshold,
-            self.q_scale,
-        )
-        k = l2_clip(
-            k.reshape(b, length, self.n_kv, self.head_dim), cfg.qk_l2_clip_threshold
-        )
-        v = v.reshape(b, length, self.n_kv, self.head_dim)
-        if cfg.use_value_norm_no_gamma:
-            v = mx.fast.rms_norm(v.astype(mx.float32), None, cfg.rms_norm_eps).astype(
-                x.dtype
-            )
-        r = l2_clip(
-            self._project(self.r_proj, x).reshape(b, length, self.n_heads, cfg.d_rel),
-            cfg.rel_l2_clip_threshold,
-            self.rel_scale,
-        )
+        q, k, v, r = self._prepare_heads(x, k, v)
         if not self.is_sliding and cfg.log_scaling_n_floor is not None:
             offset = kv.offset if kv is not None else 0
             positions = mx.arange(length) + mx.array(offset)[..., None] + 1

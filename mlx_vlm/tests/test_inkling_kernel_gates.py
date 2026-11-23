@@ -107,3 +107,105 @@ def test_moe_route_and_down_combine_skip_kernels(gpu_without_metal):
     out = moe(mx.random.normal((1, 1, 64)))
     mx.eval(out)
     assert out.shape == (1, 1, 64)
+
+
+@pytest.mark.parametrize("rows,scale", [(1, 0.25), (4, 5.0), (8, 1.0)])
+def test_inkling2_attention_head_kernel_matches_mlx_bits(rows, scale):
+    from mlx_vlm.models.inkling2.kernels import prepare_attention_heads
+    from mlx_vlm.models.inkling2.language import l2_clip
+
+    if not mx.metal.is_available() or mx.default_device() != mx.gpu:
+        pytest.skip("Requires Metal")
+
+    # Strided projections and per-head scales exercise the kernel's input layout.
+    def sample(shape, seed):
+        wide = (*shape[:-1], 2 * shape[-1])
+        return (scale * mx.random.normal(wide, key=mx.random.key(seed))).astype(
+            mx.bfloat16
+        )[..., ::2]
+
+    q = sample((1, rows, 6, 128), 0)
+    k, v = (sample((1, rows, 2, 128), seed) for seed in (1, 2))
+    r = sample((1, rows, 6, 16), 3)
+    if rows == 8:
+        # A NaN in a single lane must propagate through the whole head.
+        for projection in (q, k, v, r):
+            projection[0, -1, 0, 0] = float("nan")
+    qs, rs = sample((6, 128), 4), sample((6, 16), 5)
+    got = prepare_attention_heads(q, k, v, r, qs, rs, 22.627416997969522, 8.0, 1e-6)
+    expected = (
+        l2_clip(q, 22.627416997969522, qs),
+        l2_clip(k, 22.627416997969522),
+        mx.fast.rms_norm(v.astype(mx.float32), None, 1e-6).astype(mx.bfloat16),
+        l2_clip(r, 8.0, rs),
+    )
+    assert got is not None
+    for actual, reference in zip(got, expected):
+        assert actual.shape == reference.shape and actual.dtype == reference.dtype
+        assert mx.array_equal(actual.view(mx.uint16), reference.view(mx.uint16)).item()
+
+
+@pytest.mark.parametrize(
+    "device,metal,batch,rows,dim,rel,dtype",
+    [
+        (mx.cpu, True, 1, 1, 128, 16, mx.bfloat16),
+        (mx.gpu, False, 1, 1, 128, 16, mx.bfloat16),
+        (mx.gpu, True, 2, 4, 128, 16, mx.bfloat16),
+        (mx.gpu, True, 1, 9, 128, 16, mx.bfloat16),
+        (mx.gpu, True, 1, 4, 64, 16, mx.bfloat16),
+        (mx.gpu, True, 1, 4, 128, 8, mx.bfloat16),
+        (mx.gpu, True, 1, 4, 128, 16, mx.float16),
+    ],
+)
+def test_inkling2_attention_head_kernel_fallback(
+    monkeypatch, device, metal, batch, rows, dim, rel, dtype
+):
+    from mlx_vlm.models.inkling2 import kernels
+
+    monkeypatch.setattr(
+        kernels, "_attention_head_kernel", _forbid("attention head preparation")
+    )
+    monkeypatch.setattr(mx.metal, "is_available", lambda: metal)
+    monkeypatch.setattr(mx, "default_device", lambda: device)
+    q = mx.zeros((batch, rows, 1, dim), dtype)
+    r = mx.zeros((batch, rows, 1, rel), dtype)
+    assert (
+        kernels.prepare_attention_heads(q, q, q, r, q[0, 0], r[0, 0], 8.0, 4.0, 1e-6)
+        is None
+    )
+
+
+def test_inkling2_mini_attention_uses_head_kernel_only_in_inference(monkeypatch):
+    from mlx_vlm.models.inkling2 import kernels
+    from mlx_vlm.models.inkling2.config import LoopConfig, TextConfig
+    from mlx_vlm.models.inkling2.language import Attention
+
+    cfg = TextConfig(
+        hidden_size=32,
+        swa_num_attention_heads=2,
+        swa_num_key_value_heads=1,
+        local_layer_ids=[0],
+        n_layers_per_attn_res_block=1,
+        loop_config=LoopConfig(1, 2, 2, 4),
+    )
+    attn = Attention(cfg, 0)
+    attn.set_dtype(mx.bfloat16)
+    x = mx.zeros((1, 1, 32), mx.bfloat16)
+    k = mx.zeros((1, 1, 128), mx.bfloat16)
+    calls = []
+    factory = kernels._attention_head_kernel
+
+    def counted():
+        calls.append(True)
+        return factory()
+
+    monkeypatch.setattr(kernels, "_attention_head_kernel", counted)
+    attn.eval()
+    expected = attn._prepare_heads(x, k, k)
+    assert len(calls) == int(mx.metal.is_available() and mx.default_device() == mx.gpu)
+    monkeypatch.setattr(
+        kernels, "prepare_attention_heads", _forbid("inference-only head preparation")
+    )
+    attn.train()
+    for actual, ref in zip(attn._prepare_heads(x, k, k), expected):
+        assert mx.array_equal(actual, ref).item()
