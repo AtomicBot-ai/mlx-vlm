@@ -147,6 +147,18 @@ async def _with_keepalives(source):
                 await source.aclose()
 
 
+def _finish_tool_stream(
+    text, finish_reason, thinking_state, tool_call_state, tool_delta_state
+):
+    if finish_reason == "length":
+        complete_text = tool_delta_state.truncate_at_limit(text)
+        if complete_text is not None:
+            # Finalizing the template here would parse the open tool region as JSON.
+            return complete_text, None, None
+    reasoning, content = finish_content_streams(thinking_state, tool_call_state)
+    return text, reasoning, content
+
+
 def _has_non_empty_text(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
@@ -1511,9 +1523,8 @@ async def responses_endpoint(request: Request):
                             yield _response_sse_event(
                                 event.type, event.model_dump(exclude_none=True)
                             )
-                            thinking_delta = thinking_state.feed(
-                                raw_delta, last=bool(token.finish_reason)
-                            )
+                            last = token.finish_reason not in (None, "length")
+                            thinking_delta = thinking_state.feed(raw_delta, last=last)
                             if thinking_delta.reasoning:
                                 streamed_reasoning += thinking_delta.reasoning
                                 for event in stream_delta(
@@ -1527,9 +1538,7 @@ async def responses_endpoint(request: Request):
                             ):
                                 yield event
                             delta = thinking_delta.content
-                            delta = tool_call_state.feed(
-                                delta, last=bool(token.finish_reason)
-                            )
+                            delta = tool_call_state.feed(delta, last=last)
                             usage_stats = {
                                 "input_tokens": ctx.prompt_tokens,
                                 "output_tokens": output_tokens,
@@ -1578,9 +1587,8 @@ async def responses_endpoint(request: Request):
                                 event.type, event.model_dump(exclude_none=True)
                             )
                             chunk_finish = getattr(chunk, "finish_reason", None)
-                            thinking_delta = thinking_state.feed(
-                                raw_delta, last=bool(chunk_finish)
-                            )
+                            last = chunk_finish not in (None, "length")
+                            thinking_delta = thinking_state.feed(raw_delta, last=last)
                             if thinking_delta.reasoning:
                                 streamed_reasoning += thinking_delta.reasoning
                                 for event in stream_delta(
@@ -1594,7 +1602,7 @@ async def responses_endpoint(request: Request):
                             ):
                                 yield event
                             delta = thinking_delta.content
-                            delta = tool_call_state.feed(delta, last=bool(chunk_finish))
+                            delta = tool_call_state.feed(delta, last=last)
                             if chunk_finish is not None:
                                 finish_reason = chunk_finish
                             usage_stats = {
@@ -1607,8 +1615,12 @@ async def responses_endpoint(request: Request):
                                     yield event
                                 await asyncio.sleep(0.01)
 
-                    tail_reasoning, tail = finish_content_streams(
-                        thinking_state, tool_call_state
+                    parse_text, tail_reasoning, tail = _finish_tool_stream(
+                        full_text,
+                        finish_reason,
+                        thinking_state,
+                        tool_call_state,
+                        tool_delta_state,
                     )
                     if tail_reasoning:
                         streamed_reasoning += tail_reasoning
@@ -1622,7 +1634,7 @@ async def responses_endpoint(request: Request):
 
                     output_items, clean_text, _, output_finish_reason = (
                         _response_output_items_from_text(
-                            full_text,
+                            parse_text,
                             message_id,
                             tool_module,
                             chat_tools,
@@ -1633,9 +1645,23 @@ async def responses_endpoint(request: Request):
                             processor=processor,
                             starts_in_thinking=starts_in_thinking,
                             tool_delta_state=tool_delta_state,
+                            use_template_content=(
+                                tool_delta_state.parser_name == "inkling"
+                                and message_id in output_indices
+                            ),
                             prompt=formatted_prompt,
                         )
                     )
+                    pending = tool_delta_state.incomplete_call
+                    if pending and pending["id"] in function_item_ids:
+                        output_items.append(
+                            {
+                                "type": "function_call",
+                                "call_id": pending["id"],
+                                "status": "incomplete",
+                                **pending["function"],
+                            }
+                        )
                     for item in output_items:
                         if item.get("call_id") in function_item_ids:
                             item["id"] = function_item_ids[item["call_id"]]
@@ -1685,7 +1711,10 @@ async def responses_endpoint(request: Request):
                                 type="output_text", text=clean_text, annotations=[]
                             )
                             yield f"event: response.content_part.done\ndata: {ResponseContentPartDoneEvent(type='response.content_part.done', item_id=message_id, output_index=output_index, content_index=0, part=final_content_part).model_dump_json()}\n\n"
-                        elif item["type"] == "function_call":
+                        elif (
+                            item["type"] == "function_call"
+                            and item["status"] != "incomplete"
+                        ):
                             yield _response_sse_event(
                                 "response.function_call_arguments.done",
                                 {
@@ -2309,9 +2338,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             output_tokens = metrics.generated_tokens
 
                             # Detect thinking boundaries
-                            thinking_delta = thinking_state.feed(
-                                token.text, last=bool(token.finish_reason)
-                            )
+                            last = token.finish_reason not in (None, "length")
+                            thinking_delta = thinking_state.feed(token.text, last=last)
                             delta_reasoning = thinking_delta.reasoning
                             delta_content = thinking_delta.content
                             tool_deltas = tool_delta_state.feed(
@@ -2322,7 +2350,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                             # Suppress tool-call markup from content
                             delta_content = tool_call_state.feed(
-                                delta_content, last=bool(token.finish_reason)
+                                delta_content, last=last
                             )
 
                             chunk_logprobs = None
@@ -2375,8 +2403,12 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 finish_reason = token.finish_reason
                                 break
 
-                        tail_reasoning, tail = finish_content_streams(
-                            thinking_state, tool_call_state
+                        parse_text, tail_reasoning, tail = _finish_tool_stream(
+                            full_output,
+                            finish_reason,
+                            thinking_state,
+                            tool_call_state,
+                            tool_delta_state,
                         )
                         if tail or tail_reasoning:
                             chunk_data = ChatStreamChunk(
@@ -2401,15 +2433,16 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         # Parse tool calls from full output and emit final chunk
                         terminal_emitted = False
                         if tool_module is not None:
-                            tc = parse_tools(full_output)
+                            tc = parse_tools(parse_text)
                             remaining_calls = tool_delta_state.finish(tc.calls)
                             if tc.calls:
                                 tool_calls_made = True
-                                finish_reason = "tool_calls"
+                                if parse_text == full_output:
+                                    finish_reason = "tool_calls"
                                 terminal_emitted = True
                                 choices = [
                                     ChatStreamChoice(
-                                        finish_reason="tool_calls",
+                                        finish_reason=finish_reason,
                                         delta=ChatMessage(
                                             role="assistant",
                                             tool_calls=remaining_calls or None,
@@ -2490,16 +2523,15 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             if chunk_finish is not None:
                                 finish_reason = chunk_finish
 
-                            thinking_delta = thinking_state.feed(
-                                chunk.text, last=bool(chunk_finish)
-                            )
+                            last = chunk_finish not in (None, "length")
+                            thinking_delta = thinking_state.feed(chunk.text, last=last)
                             tool_deltas = tool_delta_state.feed(
                                 tool_thinking_state.feed(
                                     chunk.text, last=bool(chunk_finish)
                                 ).content
                             )
                             delta_content = tool_call_state.feed(
-                                thinking_delta.content, last=bool(chunk_finish)
+                                thinking_delta.content, last=last
                             )
                             if delta_content or thinking_delta.reasoning or tool_deltas:
                                 choices = [
@@ -2525,8 +2557,12 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 yield f"data: {chunk_data.model_dump_json()}\n\n"
                                 await asyncio.sleep(0.01)
 
-                        tail_reasoning, tail = finish_content_streams(
-                            thinking_state, tool_call_state
+                        parse_text, tail_reasoning, tail = _finish_tool_stream(
+                            output_text,
+                            finish_reason,
+                            thinking_state,
+                            tool_call_state,
+                            tool_delta_state,
                         )
                         if tail or tail_reasoning:
                             chunk_data = ChatStreamChunk(
@@ -2549,23 +2585,22 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             yield f"data: {chunk_data.model_dump_json()}\n\n"
 
                         tc = (
-                            parse_tools(output_text)
-                            if tool_module is not None
-                            else None
+                            parse_tools(parse_text) if tool_module is not None else None
                         )
                         remaining_calls = tool_delta_state.finish(
                             tc.calls if tc else []
                         )
                         if tc is not None and tc.calls:
                             tool_calls_made = True
-                            finish_reason = "tool_calls"
+                            if parse_text == output_text:
+                                finish_reason = "tool_calls"
                             chunk_data = ChatStreamChunk(
                                 id=request_id,
                                 created=int(time.time()),
                                 model=request.model,
                                 choices=[
                                     ChatStreamChoice(
-                                        finish_reason="tool_calls",
+                                        finish_reason=finish_reason,
                                         delta=ChatMessage(
                                             role="assistant",
                                             tool_calls=remaining_calls or None,

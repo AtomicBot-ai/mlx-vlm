@@ -4,10 +4,19 @@ import json
 import re
 import uuid
 
+from .parsers import inkling
+
 _DECODER = json.JSONDecoder()
 
 
-def _json_calls(text, name_key="name", args_key="arguments", *, require_arguments=True):
+def _json_calls(
+    text,
+    name_key="name",
+    args_key="arguments",
+    *,
+    require_arguments=True,
+    require_object_arguments=False,
+):
     """Read complete metadata and the argument value's received JSON prefix."""
     text = text.lstrip()
     offset = 1 if text.startswith("[") else 0
@@ -32,6 +41,12 @@ def _json_calls(text, name_key="name", args_key="arguments", *, require_argument
             offset += 1
             offset += len(text[offset:]) - len(text[offset:].lstrip())
             start = offset
+            if (
+                require_object_arguments
+                and key == args_key
+                and text[start : start + 1] != "{"
+            ):
+                return
             try:
                 value, offset = _DECODER.raw_decode(text, start)
             except ValueError:
@@ -151,11 +166,14 @@ def _gemma_call(text, module):
 
 def _inkling_calls(text):
     """Inkling writes NAME<|content_invoke_tool_json|>{"name": ..., "args": {...}}."""
-    _, invoke, payload = text.partition("<|content_invoke_tool_json|>")
-    if not invoke:
+    payload = inkling.tool_call_payload(text)
+    if payload is None or not payload.lstrip().startswith("{"):
         return []
-    # The parser defaults missing args to {}, like Cohere's parameters.
-    return list(_json_calls(payload, "name", "args", require_arguments=False))
+    # Inkling accepts a single object. Only the final parser can default missing args.
+    call = next(
+        _json_calls(payload, "name", "args", require_object_arguments=True), None
+    )
+    return [call] if call is not None else []
 
 
 class ToolCallDeltaState:
@@ -167,6 +185,7 @@ class ToolCallDeltaState:
         self.inside = False
         self.offset = 0
         self.calls = {}
+        self.incomplete_call = None
 
     def feed(self, text):
         if not self.tools or self.parser_name not in (
@@ -284,6 +303,23 @@ class ToolCallDeltaState:
         if fragment:
             return {"index": index, "function": {"arguments": fragment}}
         return None
+
+    def truncate_at_limit(self, text):
+        """Exclude an unclosed Inkling invocation from the final parse at a token limit."""
+        if self.parser_name != "inkling" or not self.inside:
+            return None
+        # The tool stream filters reasoning. Locate the open frame in the raw output.
+        start = text.find(
+            inkling.tool_call_start, text.rfind(inkling.tool_call_end) + 1
+        )
+        if (
+            start < 0
+            or inkling.tool_call_payload(text[start + len(inkling.tool_call_start) :])
+            is None
+        ):
+            return None
+        self.incomplete_call = self.calls.pop(self.offset, None)
+        return text[:start]
 
     def finish(self, calls):
         if len(calls) < len(self.calls):

@@ -14,18 +14,25 @@ each one to ``parse_tool_call``, which returns no call for the other kinds.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, List, Optional
 
 tool_call_start: str = "<|message_model|>"
 tool_call_end: str = "<|end_message|>"
 
-_INVOKE = "<|content_invoke_tool_json|>"
+_INVOKE_HEADER = re.compile(r"[^<]*<\|content_invoke_tool_json\|>")
+
+
+def tool_call_payload(text: str) -> Optional[str]:
+    """Return the body only when the first content marker declares a tool call."""
+    header = _INVOKE_HEADER.match(text)
+    return text[header.end() :] if header else None
 
 
 def parse_tool_call(text: str, tools: Optional[Any] = None) -> List[dict]:
     """Decode one message (markers already stripped) into ``[{name, arguments}]``, or ``[]`` when it is not a call."""
-    _, invoke, payload = text.partition(_INVOKE)
-    if not invoke:
+    payload = tool_call_payload(text)
+    if payload is None:
         return []
     call = json.loads(payload)
     if not isinstance(call, dict) or not isinstance(call.get("name"), str):
