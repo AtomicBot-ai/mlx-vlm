@@ -3750,10 +3750,17 @@ def test_inkling_tool_calls(client, stream):
     if stream:
         choices = [c["choices"][0] for c in _data(response) if c.get("choices")]
         deltas = [choice["delta"] for choice in choices]
+        # The call streams incrementally: the name, then argument fragments.
+        fragments = [c for delta in deltas for c in delta.get("tool_calls") or []]
+        assert len(fragments) > 1 and all(c["index"] == 0 for c in fragments)
+        function = dict(
+            name=fragments[0]["function"]["name"],
+            arguments="".join(c["function"].get("arguments", "") for c in fragments),
+        )
         message = dict(
             reasoning_content=_joined(deltas, "reasoning_content"),
             content=_joined(deltas, "content"),
-            tool_calls=choices[-1]["delta"]["tool_calls"],
+            tool_calls=[dict(function=function)],
         )
         finish_reason = choices[-1]["finish_reason"]
     else:

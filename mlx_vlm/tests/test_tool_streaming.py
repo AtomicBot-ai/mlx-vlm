@@ -42,11 +42,19 @@ def encoded_call(parser, content):
         )
     if parser == "qwen3_coder":
         return f"<tool_call><function=write_file><parameter=path>demo.py</parameter><parameter=content>\n{content}\n</parameter></function></tool_call>"
+    if parser == "inkling":
+        # The chat template's form: name first, then args, compact JSON.
+        body = {"name": "write_file", "args": args}
+        return (
+            "<|message_model|>write_file<|content_invoke_tool_json|>"
+            + json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+            + "<|end_message|>"
+        )
     return f'<|tool_call>call:write_file{{path:<|"|>demo.py<|"|>,content:<|"|>{content}<|"|>}}<tool_call|>'
 
 
 @pytest.mark.parametrize(
-    "parser", ["json_tools", "cohere2_moe", "qwen3_coder", "gemma4"]
+    "parser", ["json_tools", "cohere2_moe", "qwen3_coder", "gemma4", "inkling"]
 )
 @pytest.mark.parametrize("chunk_size", [1, 7, 31, 8192])
 def test_argument_prefixes_and_final_call_match(parser, chunk_size):
@@ -78,7 +86,7 @@ def test_argument_prefixes_and_final_call_match(parser, chunk_size):
 
 
 @pytest.mark.parametrize(
-    "parser", ["json_tools", "cohere2_moe", "qwen3_coder", "gemma4"]
+    "parser", ["json_tools", "cohere2_moe", "qwen3_coder", "gemma4", "inkling"]
 )
 def test_multiple_calls_keep_separate_ids(parser):
     module = load_tool_module(parser)
