@@ -2975,7 +2975,10 @@ def test_single_row_checkpoint(managers):
 @pytest.mark.skipif(
     not mx.metal.is_available(), reason="Uses Metal allocation accounting"
 )
-def test_prefill_releases_unused_logits_before_checkpoint(managers, monkeypatch):
+@pytest.mark.parametrize("right_pad_per_row", [None, [0]], ids=["left", "right"])
+def test_prefill_releases_unused_logits_before_checkpoint(
+    managers, monkeypatch, right_pad_per_row
+):
     cache = C.ArraysCache(1)
     cache[0] = mx.arange(2**21, dtype=mx.float32).reshape(1, 1, -1)
     mx.eval(cache.state)
@@ -2999,7 +3002,15 @@ def test_prefill_releases_unused_logits_before_checkpoint(managers, monkeypatch)
 
     model = RecurrentModel()
     tokens = list(range(64))
-    batch = prompt_batch(model, manager, [tokens], [0], [cache], step=32)
+    batch = prompt_batch(
+        model,
+        manager,
+        [tokens],
+        [0],
+        [cache],
+        step=32,
+        right_pad_per_row=right_pad_per_row,
+    )
     mx.synchronize()
     # Enough room for live state, the checkpoint and its reserve, but not
     # another full state kept alive solely by an unused lazy logits graph.
