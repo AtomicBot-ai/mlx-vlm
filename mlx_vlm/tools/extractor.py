@@ -22,6 +22,7 @@ def process_tool_calls(
 ) -> ParseResult:
     """Parse tool calls from model output using the given tool parser module."""
     called_tools = []
+    errors = []
     remaining = model_output
 
     if tool_module.tool_call_start in model_output:
@@ -49,6 +50,7 @@ def process_tool_calls(
                     parsed_calls = parsed if isinstance(parsed, list) else [parsed]
                 except Exception as exc:
                     logger.warning("Invalid tool call %r: %s", call, exc)
+                    errors.append(str(exc))
                     continue
                 for tool_call in parsed_calls:
                     try:
@@ -70,4 +72,16 @@ def process_tool_calls(
                         )
                     except Exception as exc:
                         logger.warning("Invalid tool call %r: %s", tool_call, exc)
-    return ParseResult(calls=called_tools, remaining_text=remaining)
+                        errors.append(str(exc))
+
+        # An unterminated region never becomes an executable call. Ask the
+        # parser to distinguish tool regions from other messages that share
+        # their delimiters (for example Inkling text and reasoning messages).
+        if tool_module.tool_call_end and tool_module.tool_call_start in remaining:
+            tail = remaining.rsplit(tool_module.tool_call_start, 1)[1]
+            try:
+                if tool_module.parse_tool_call(tail, tools):
+                    errors.append("Unterminated tool call.")
+            except Exception as exc:
+                errors.append(str(exc))
+    return ParseResult(calls=called_tools, remaining_text=remaining, errors=errors)

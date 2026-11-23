@@ -5,8 +5,10 @@ import re
 import uuid
 
 from .parsers import inkling
+from .types import ToolCallParseError
 
 _DECODER = json.JSONDecoder()
+_OBJECT_KEY_START = re.compile(r'\{\s*"')
 
 
 def _json_calls(
@@ -51,6 +53,11 @@ def _json_calls(
                 value, offset = _DECODER.raw_decode(text, start)
             except ValueError:
                 if name and key == args_key and text[start : start + 1] == "{":
+                    # A bare opening brace can still introduce an invalid first key.
+                    if require_object_arguments and not _OBJECT_KEY_START.match(
+                        text, start
+                    ):
+                        return
                     yield name, text[start:]
                 return
             if key in (name_key, "name") and isinstance(value, str):
@@ -232,8 +239,12 @@ class ToolCallDeltaState:
                 try:
                     parsed = self.module.parse_tool_call(body.strip(), self.tools)
                     parsed = [parsed] if isinstance(parsed, dict) else iter(parsed)
-                except (ValueError, KeyError, TypeError, SyntaxError):
+                except (ValueError, KeyError, TypeError, SyntaxError) as exc:
                     if len(self.calls) > self.offset:
+                        if self.parser_name == "inkling":
+                            raise ToolCallParseError(
+                                "An Inkling tool call became invalid after its arguments were streamed."
+                            ) from exc
                         raise
                     parsed = []
                 # Normalize per call, like the final extractor: an element of
@@ -318,11 +329,11 @@ class ToolCallDeltaState:
             is None
         ):
             return None
-        self.incomplete_call = self.calls.pop(self.offset, None)
+        self.incomplete_call = self.calls.get(self.offset)
         return text[:start]
 
-    def finish(self, calls):
-        if len(calls) < len(self.calls):
+    def finish(self, calls, *, incomplete=False):
+        if len(calls) < len(self.calls) and not incomplete:
             raise ValueError("Generation ended with an incomplete tool call.")
         deltas = []
         for index, call in enumerate(calls):

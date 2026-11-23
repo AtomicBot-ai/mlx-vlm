@@ -241,6 +241,24 @@ def _response_template_prefix(tokenizer, prompt: str) -> str:
     return prompt if template.start_anchor_re.search(prompt) else ""
 
 
+_SPLIT_FIELDS = ("content", "reasoning", "reasoning_content")
+_REGION_KEYS = ("open", "open_pattern", "close", "close_pattern", "repeats")
+
+
+def _reasoning_content_template(template: Any) -> Any:
+    """Keep malformed tool fields from breaking reasoning and content parsing."""
+    if not isinstance(template, dict):
+        return template
+    fields = {}
+    for name, field in template.get("fields", {}).items():
+        if name not in _SPLIT_FIELDS:
+            field = {key: field[key] for key in _REGION_KEYS if key in field}
+            # Named capture groups require a transform.
+            field["transform"] = "{content}"
+        fields[name] = field
+    return {**template, "fields": fields}
+
+
 def make_response_stream_state(
     processor,
     enable_thinking: bool = False,
@@ -254,7 +272,8 @@ def make_response_stream_state(
         try:
             return ResponseTemplateStreamState(
                 tokenizer.get_response_parser(
-                    prefix=_response_template_prefix(tokenizer, prompt)
+                    _reasoning_content_template(tokenizer.response_template),
+                    prefix=_response_template_prefix(tokenizer, prompt),
                 )
             )
         except (AttributeError, TypeError, ValueError):
@@ -479,28 +498,30 @@ def _clean_reasoning(reasoning: str, start_marker: str) -> str:
     return reasoning.strip()
 
 
-def _split_thinking(
+def _parse_response_template(
     text: str,
-    thinking_start_token: Optional[str] = None,
-    thinking_end_token: Optional[str] = None,
-    starts_in_thinking: bool = False,
-    processor=None,
+    processor,
     *,
     prompt: str = "",
-) -> Tuple[Optional[str], str]:
+) -> Optional[Tuple[Optional[str], str]]:
+    """Return decoded reasoning/content, or None when template parsing falls back."""
     if not text:
-        return None, text
+        return None
 
     tokenizer = _response_template_tokenizer(processor)
     if tokenizer is not None and hasattr(tokenizer, "parse_response"):
         try:
             parsed = tokenizer.parse_response(
-                text, prefix=_response_template_prefix(tokenizer, prompt)
+                text,
+                _reasoning_content_template(tokenizer.response_template),
+                prefix=_response_template_prefix(tokenizer, prompt),
             )
+            # A turn of tool calls alone is a decoded turn with no content.
             if isinstance(parsed, dict) and (
                 "content" in parsed
                 or "reasoning" in parsed
                 or "reasoning_content" in parsed
+                or parsed.get("tool_calls")
             ):
                 reasoning = parsed.get("reasoning_content") or parsed.get("reasoning")
                 content = parsed.get("content")
@@ -514,6 +535,24 @@ def _split_thinking(
             logger.debug(
                 "Falling back from tokenizer response-template parser", exc_info=True
             )
+    return None
+
+
+def _split_thinking(
+    text: str,
+    thinking_start_token: Optional[str] = None,
+    thinking_end_token: Optional[str] = None,
+    starts_in_thinking: bool = False,
+    processor=None,
+    *,
+    prompt: str = "",
+) -> Tuple[Optional[str], str]:
+    if not text:
+        return None, text
+
+    parsed = _parse_response_template(text, processor, prompt=prompt)
+    if parsed is not None:
+        return parsed
 
     for start_marker, end_marker in ThinkingStreamState._build_open_close_markers(
         thinking_start_token, thinking_end_token
@@ -551,6 +590,7 @@ def parse_assistant_tool_calls(
     starts_in_thinking=False,
     thinking_start_token=None,
     thinking_end_token=None,
+    finish_reason=None,
 ):
     """Parse executable calls from the same content seen by the streaming parser.
 
@@ -564,7 +604,9 @@ def parse_assistant_tool_calls(
         .feed(text, last=True)
         .content
     )
-    return process_tool_calls(content or "", tool_module, tools)
+    result = process_tool_calls(content or "", tool_module, tools)
+    result.raise_if_failed(finish_reason)
+    return result
 
 
 def _response_output_items_from_text(
@@ -582,6 +624,7 @@ def _response_output_items_from_text(
     *,
     prompt: str = "",
     use_template_content: bool = False,
+    finish_reason: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], str, Optional[str], str]:
     reasoning, content = _split_thinking(
         full_text,
@@ -600,9 +643,10 @@ def _response_output_items_from_text(
             starts_in_thinking=starts_in_thinking,
             thinking_start_token=thinking_start_token,
             thinking_end_token=thinking_end_token,
+            finish_reason=finish_reason,
         )
         if tool_delta_state is not None:
-            tool_delta_state.finish(tc.calls)
+            tool_delta_state.finish(tc.calls, incomplete=finish_reason == "length")
         if tc.calls:
             items = [
                 _tool_call_to_response_item(call, tool_registry) for call in tc.calls

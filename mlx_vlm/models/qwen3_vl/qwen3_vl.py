@@ -236,6 +236,10 @@ class Model(nn.Module):
         return logits
 
     def sanitize(self, weights):
+        # Some callers invoke this unbound (self=None).
+        if self is not None and self.config.text_config.tie_word_embeddings:
+            weights.pop("lm_head.weight", None)
+
         sanitized_weights = {}
         for key, value in weights.items():
             if "model" in key:

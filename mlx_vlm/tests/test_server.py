@@ -213,24 +213,17 @@ _MUSE_RESPONSE_TEMPLATE = {
 }
 
 
-class _MuseResponseTemplateTokenizer:
-    response_template = _MUSE_RESPONSE_TEMPLATE
+class _ResponseTemplateTokenizer:
+    def __init__(self, template):
+        self.response_template = copy.deepcopy(template)
 
-    def parse_response(self, response, prefix=None):
-        return parse_response(response, self.response_template, prefix=prefix)
+    def parse_response(self, response, schema=None, *, prefix=None):
+        return parse_response(response, schema or self.response_template, prefix=prefix)
 
-    def get_response_parser(self, prefix=None):
-        return ResponseParser(self.response_template, prefix=prefix)
-
-
-class _HarmonyResponseTemplateTokenizer:
-    response_template = HARMONY_RESPONSE_TEMPLATE
-
-    def parse_response(self, response, prefix=None):
-        return parse_response(response, self.response_template, prefix=prefix)
-
-    def get_response_parser(self, prefix=None):
-        return ResponseParser(self.response_template, prefix=prefix)
+    def get_response_parser(self, response_template=None, *, prefix=None):
+        return ResponseParser(
+            response_template or self.response_template, prefix=prefix
+        )
 
 
 # The response template shipped in Inkling 2's tokenizer_config.json.
@@ -270,19 +263,11 @@ _INKLING_RESPONSE_TEMPLATE = {
 }
 
 
-class _InklingResponseTemplateTokenizer:
-    response_template = _INKLING_RESPONSE_TEMPLATE
-
-    def parse_response(self, response, prefix=None):
-        return parse_response(response, self.response_template, prefix=prefix)
-
-    def get_response_parser(self, prefix=None):
-        return ResponseParser(self.response_template, prefix=prefix)
-
-
 def _harmony_processor():
     """A processor prepared exactly as the gpt-oss loader prepares it."""
-    return _attach_harmony_template(NS(tokenizer=_HarmonyResponseTemplateTokenizer()))
+    return _attach_harmony_template(
+        NS(tokenizer=_ResponseTemplateTokenizer(HARMONY_RESPONSE_TEMPLATE))
+    )
 
 
 def _msg(content="Hello", role="user", **extra):
@@ -467,6 +452,49 @@ def _chat_events(response, reason):
         chunk for chunk in choices if chunk["choices"][0]["finish_reason"] == reason
     )
     return choices, usage, finish
+
+
+def _chat_tool_result(
+    response, stream, finish_reason="tool_calls", *, expected_partial=None
+):
+    assert response.status_code == 200, response.text
+    if stream:
+        choices = [
+            event["choices"][0] for event in _data(response) if event.get("choices")
+        ]
+        deltas = [choice["delta"] for choice in choices]
+        message = {
+            field: _joined(deltas, field) for field in ("content", "reasoning_content")
+        }
+        functions = {}
+        for delta in deltas:
+            for call in delta.get("tool_calls") or []:
+                function = functions.setdefault(
+                    call["index"], {"name": "", "arguments": ""}
+                )
+                for field in function:
+                    function[field] += call["function"].get(field, "")
+        assert list(functions) == list(range(len(functions)))
+        functions = list(functions.values())
+        finishes = [
+            choice["finish_reason"] for choice in choices if choice.get("finish_reason")
+        ]
+    else:
+        choice = response.json()["choices"][0]
+        message = choice["message"]
+        functions = [call["function"] for call in message["tool_calls"]]
+        finishes = [choice["finish_reason"]]
+    if expected_partial is not None:
+        assert functions.pop() == expected_partial
+    assert finishes == [finish_reason]
+    return NS(
+        content=message.get("content") or "",
+        reasoning_content=message.get("reasoning_content") or "",
+        calls=[
+            (function["name"], json.loads(function["arguments"]))
+            for function in functions
+        ],
+    )
 
 
 def _assert_fields(actual, **expected):
@@ -3703,7 +3731,9 @@ def test_response_template_tool_calls(client, api):
     token = _token(_MUSE_CALL, finish_reason="stop", prompt_tps=20, cached_tokens=2)
     with _endpoint(
         config=config,
-        processor=NS(config=config, tokenizer=_MuseResponseTemplateTokenizer()),
+        processor=NS(
+            config=config, tokenizer=_ResponseTemplateTokenizer(_MUSE_RESPONSE_TEMPLATE)
+        ),
         result=_result(_MUSE_CALL, prompt_tokens=7, generation_tokens=6),
         generator=_streaming([token], 10) if api == "chat" else None,
         parser=load_tool_module("atem"),
@@ -3733,47 +3763,64 @@ def test_response_template_tool_calls(client, api):
     assert "to=self" not in response.text and "<atem:" not in response.text
 
 
+@pytest.mark.parametrize("continuous", [False, True])
 @pytest.mark.parametrize("stream", [False, True])
-def test_inkling_tool_calls(client, stream):
-    config = NS(model_type="inkling2")
-    chunks = [_INKLING_CALL[i : i + 9] for i in range(0, len(_INKLING_CALL), 9)]
+@pytest.mark.parametrize("position", ["before", "after", "between", "none"])
+@pytest.mark.parametrize(
+    "parser,template,parts",
+    [
+        (
+            "inkling",
+            _INKLING_RESPONSE_TEMPLATE,
+            [
+                "<|message_model|>" + part
+                for part in _INKLING_CALL.split("<|message_model|>")[1:]
+            ],
+        ),
+        (
+            "atem",
+            _MUSE_RESPONSE_TEMPLATE,
+            [
+                _MUSE_CALL.split("<|start|>", 1)[0],
+                "<|start|>assistant to=user<|message|>Checking.<|eom|>",
+                "<|start|>" + _MUSE_CALL.split("<|start|>", 1)[1] + "<|eom|>",
+            ],
+        ),
+    ],
+    ids=["inkling", "muse"],
+)
+def test_response_template_tool_text(
+    client, stream, continuous, position, parser, template, parts
+):
+    thinking, content, call = parts
+    segments = {
+        "before": [thinking, content, call],
+        "after": [thinking, call, content],
+        "between": [thinking, call, content, call],
+        "none": [thinking, call],
+    }[position]
+    output = "".join(segments)
+    chunks = [output[i : i + 9] for i in range(0, len(output), 9)]
     tokens = [*map(_token, chunks), _token(finish_reason="stop")]
     with _endpoint(
-        config=config,
-        processor=NS(config=config, tokenizer=_InklingResponseTemplateTokenizer()),
-        result=_result(_INKLING_CALL),
-        generator=_streaming(tokens) if stream else None,
-        parser=load_tool_module("inkling"),
+        processor=NS(tokenizer=_ResponseTemplateTokenizer(template)),
+        result=_result(output),
+        chunks=[
+            _result(token.text, finish_reason=token.finish_reason) for token in tokens
+        ],
+        generator=_streaming(tokens) if continuous else None,
+        parser=load_tool_module(parser),
     ):
         response = _post(client, tools=[_tool()], stream=stream)
-    assert response.status_code == 200
-    if stream:
-        choices = [c["choices"][0] for c in _data(response) if c.get("choices")]
-        deltas = [choice["delta"] for choice in choices]
-        # The call streams incrementally: the name, then argument fragments.
-        fragments = [c for delta in deltas for c in delta.get("tool_calls") or []]
-        assert len(fragments) > 1 and all(c["index"] == 0 for c in fragments)
-        function = dict(
-            name=fragments[0]["function"]["name"],
-            arguments="".join(c["function"].get("arguments", "") for c in fragments),
-        )
-        message = dict(
-            reasoning_content=_joined(deltas, "reasoning_content"),
-            content=_joined(deltas, "content"),
-            tool_calls=[dict(function=function)],
-        )
-        finish_reason = choices[-1]["finish_reason"]
-    else:
-        choice = response.json()["choices"][0]
-        message, finish_reason = choice["message"], choice["finish_reason"]
-    (call,) = message["tool_calls"]
-    assert finish_reason == "tool_calls"
-    assert call["function"]["name"] == "get_weather"
-    assert json.loads(call["function"]["arguments"]) == {"city": "Warsaw"}
-    assert message["reasoning_content"] == "I need the weather tool."
-    # Neither the thinking nor the call's recipient header reaches content. A
-    # non-streamed response slices out every message beside a call.
-    assert message["content"] == ("Checking." if stream else None)
+    if stream and parser == "inkling":
+        fragments = [c for d in _deltas(response) for c in d.get("tool_calls") or []]
+        assert len(fragments) > len({c["index"] for c in fragments})
+    result = _chat_tool_result(response, stream)
+    assert result.calls == [("get_weather", {"city": "Warsaw"})] * (
+        2 if position == "between" else 1
+    )
+    assert result.reasoning_content == "I need the weather tool."
+    assert result.content == ("" if position == "none" else "Checking.")
     assert "<|" not in response.text
 
 
@@ -3786,7 +3833,10 @@ def _stream_inkling(client, api, chunks, finish_reason, continuous=True):
     ]
     with _endpoint(
         config=config,
-        processor=NS(config=config, tokenizer=_InklingResponseTemplateTokenizer()),
+        processor=NS(
+            config=config,
+            tokenizer=_ResponseTemplateTokenizer(_INKLING_RESPONSE_TEMPLATE),
+        ),
         parser=load_tool_module("inkling"),
         chunks=chunks,
         generator=_streaming(chunks) if continuous else None,
@@ -3864,6 +3914,40 @@ def test_inkling_length_after_a_completed_call(client, api):
         assert [c["id"] for m in messages for c in m.get("tool_calls") or []] == [
             completed["call_id"]
         ]
+
+
+@pytest.mark.parametrize("api", ["chat", "responses"])
+@pytest.mark.parametrize(
+    "prefix, tail, emits_args",
+    [("", "[]}", False), ('{"city":"War', 'saw",}}', True)],
+    ids=["array-arguments", "invalid-after-deltas"],
+)
+def test_inkling_malformed_call_reports_error(client, api, prefix, tail, emits_args):
+    chunks = [
+        "<|message_model|>get_weather<|content_invoke_tool_json|>",
+        '{"name":"get_weather","args":' + prefix,
+        tail + "<|end_message|>",
+    ]
+    events = _data(_stream_inkling(client, api, chunks, "stop"))
+    if api == "chat":
+        choices = [e["choices"][0] for e in events if e.get("choices")]
+        assert any(x["delta"].get("tool_calls") for x in choices) == emits_args
+        assert all(x["finish_reason"] is None for x in choices)
+        assert events[-1]["error"]["code"] == "tool_call_parse_error"
+    else:
+        assert (
+            any(
+                e["type"] == "response.output_item.added"
+                and e["item"]["type"] == "function_call"
+                for e in events
+            )
+            == emits_args
+        )
+        assert not any(
+            e["type"] == "response.function_call_arguments.done" for e in events
+        )
+        assert events[-1]["type"] == "response.failed"
+        assert events[-1]["response"]["error"]["code"] == "tool_call_parse_error"
 
 
 @pytest.mark.parametrize("api", ["chat", "responses"])
@@ -4123,7 +4207,10 @@ def test_anthropic_response_template_discards_tool_calls_after_stop(client):
         "messages",
         endpoint=dict(
             config=config,
-            processor=NS(config=config, tokenizer=_MuseResponseTemplateTokenizer()),
+            processor=NS(
+                config=config,
+                tokenizer=_ResponseTemplateTokenizer(_MUSE_RESPONSE_TEMPLATE),
+            ),
             parser=load_tool_module("atem"),
         ),
         tools=[_tool(api="messages")],
@@ -7473,18 +7560,19 @@ def test_thinking_stream_markers(family, enabled):
     ],
 )
 def test_response_template_prefilled_thinking(prefix, text, expected):
-    tokenizer = _MuseResponseTemplateTokenizer()
-    tokenizer.response_template = {
-        "start_anchor_pattern": r"<\|im_start\|>assistant\n",
-        "fields": {
-            "reasoning_content": {
-                "open_pattern": r"<think>\n?",
-                "close_pattern": r"</think>\s*",
-                "content": "text",
+    tokenizer = _ResponseTemplateTokenizer(
+        {
+            "start_anchor_pattern": r"<\|im_start\|>assistant\n",
+            "fields": {
+                "reasoning_content": {
+                    "open_pattern": r"<think>\n?",
+                    "close_pattern": r"</think>\s*",
+                    "content": "text",
+                },
+                "content": {"close_pattern": r"<\|im_end\|>\s*", "content": "text"},
             },
-            "content": {"close_pattern": r"<\|im_end\|>\s*", "content": "text"},
-        },
-    }
+        }
+    )
     prompt = (
         "<|im_start|>assistant\n<think>Old.</think>Old answer.<|im_end|>\n"
         "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n" + prefix
@@ -7510,8 +7598,9 @@ def test_response_template_prefilled_thinking(prefix, text, expected):
     ],
 )
 def test_response_template_missing_anchor(client, api, stream, batched, anchor):
-    tokenizer = _MuseResponseTemplateTokenizer()
-    tokenizer.response_template = {**anchor, "fields": {"content": {"content": "text"}}}
+    tokenizer = _ResponseTemplateTokenizer(
+        {**anchor, "fields": {"content": {"content": "text"}}}
+    )
     result = _result("4.", finish_reason="stop")
     worker = _streaming([_token("4.", finish_reason="stop")]) if batched else None
     with _endpoint(
@@ -7537,9 +7626,338 @@ def test_response_template_missing_anchor(client, api, stream, batched, anchor):
             assert _joined(body["content"], "text") == "4."
 
 
+@pytest.fixture(params=["inkling", "muse"])
+def template_tool_case(request):
+    if request.param == "inkling":
+        thinking, content, call = [
+            "<|message_model|>" + part
+            for part in _INKLING_CALL.split("<|message_model|>")[1:]
+        ]
+        return NS(
+            parser="inkling",
+            template=_INKLING_RESPONSE_TEMPLATE,
+            thinking=thinking,
+            content=content,
+            call=call,
+            malformed=call.replace('{"city":"Warsaw"}', "{city}"),
+            truncated=call.split("Warsaw")[0] + "War",
+        )
+    thinking, call = _MUSE_CALL.split("<|start|>", 1)
+    call = "<|start|>" + call + "<|eom|>"
+    return NS(
+        parser="atem",
+        template=_MUSE_RESPONSE_TEMPLATE,
+        thinking=thinking,
+        content="<|start|>assistant to=user<|message|>Checking.<|eom|>",
+        call=call,
+        malformed=call.replace('name="get_weather"', ""),
+        truncated=call.split("Warsaw")[0] + "War",
+    )
+
+
+def _assert_tool_parse_error(response, api, stream):
+    assert response.status_code == (200 if stream or api == "responses" else 500)
+    if stream:
+        events = _data(response)
+        if api == "responses":
+            failures = [
+                e["response"] for e in events if e.get("type") == "response.failed"
+            ]
+            assert len(failures) == 1
+            body = failures[0]
+            assert not any(
+                e.get("type") in ("response.completed", "response.incomplete")
+                for e in events
+            )
+        else:
+            failures = [e for e in events if "error" in e]
+            assert len(failures) == 1
+            body = failures[0]
+            assert not any(
+                c.get("finish_reason") for e in events for c in e.get("choices", [])
+            )
+            assert not any(
+                e.get("type") in ("message_stop", "message_delta") for e in events
+            )
+    else:
+        body = response.json()
+    if api == "responses":
+        assert body["status"] == "failed"
+    error = body["error"]
+    assert error["message"].endswith(
+        "The model generated tool calls, but none could be parsed."
+    )
+    if api == "messages":
+        assert error["type"] == "api_error"
+    else:
+        assert error["code"] == "tool_call_parse_error"
+
+
+@pytest.mark.parametrize("api", ["chat", "responses", "messages"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("batched", [False, True])
+@pytest.mark.parametrize("alone", [False, True], ids=["after-text", "alone"])
+@pytest.mark.parametrize(
+    "failure,finish",
+    [
+        (
+            "cut-off",
+            dict(chat="length", responses="incomplete", messages="max_tokens"),
+        ),
+        (
+            "malformed",
+            dict(chat="stop", responses="completed", messages="end_turn"),
+        ),
+        ("unterminated", dict(chat="stop", responses="completed", messages="end_turn")),
+    ],
+    ids=["cut-off", "malformed", "unterminated"],
+)
+def test_response_template_undecodable_tool_call(
+    client, api, stream, batched, alone, failure, finish, template_tool_case
+):
+    case = template_tool_case
+    output = ("" if alone else case.thinking + case.content) + (
+        case.truncated if failure in ("cut-off", "unterminated") else case.malformed
+    )
+    chunks = [output[i : i + 9] for i in range(0, len(output), 9)]
+    tokens = [*map(_token, chunks), _token(finish_reason=finish["chat"])]
+    payload = dict(tools=[_tool(api=api)], stream=stream)
+    if api == "messages":
+        payload.update(thinking=dict(type="enabled", budget_tokens=4), max_tokens=8)
+    with _endpoint(
+        processor=NS(tokenizer=_ResponseTemplateTokenizer(case.template)),
+        result=_result(output, finish_reason=finish["chat"]),
+        chunks=[
+            _result(token.text, finish_reason=token.finish_reason) for token in tokens
+        ],
+        generator=_streaming(tokens) if batched else None,
+        parser=load_tool_module(case.parser),
+    ):
+        response = _post(client, api, **payload)
+    if failure != "cut-off":
+        _assert_tool_parse_error(response, api, stream)
+        if stream:
+            assert _thinking_text(response, api) == (
+                ("", "") if alone else ("I need the weather tool.", "Checking.")
+            )
+        elif api == "responses":
+            assert response.json()["output_text"] == ("" if alone else "Checking.")
+        return
+    assert response.status_code == 200, response.text
+    assert "<|" not in response.text
+    if stream and case.parser == "inkling" and api in ("chat", "responses"):
+        events = _data(response)
+        if api == "chat":
+            partial = [
+                c["function"]
+                for e in events
+                for x in e.get("choices") or []
+                for c in x["delta"].get("tool_calls") or []
+            ]
+            assert _joined(partial, "arguments") == '{"city":"War'
+        else:
+            partial = [
+                e
+                for e in events
+                if e["type"] == "response.function_call_arguments.delta"
+            ]
+            assert _joined(partial, "delta") == '{"city":"War'
+    else:
+        assert "city" not in response.text
+    if stream:
+        reasoning, content = _thinking_text(response, api)
+        if api == "chat":
+            (finished,) = [
+                choice["finish_reason"]
+                for event in _data(response)
+                for choice in event.get("choices") or []
+                if choice.get("finish_reason")
+            ]
+        elif api == "responses":
+            finished = _completed_response(response)["status"]
+        else:
+            finished = _anthropic_stream_stop(response)[0]
+    else:
+        body = response.json()
+        if api == "chat":
+            choice = body["choices"][0]
+            reasoning = choice["message"]["reasoning_content"]
+            content, finished = choice["message"]["content"], choice["finish_reason"]
+        elif api == "responses":
+            reasoning = _joined(
+                [
+                    part
+                    for item in body["output"]
+                    if item["type"] == "reasoning"
+                    for part in item["summary"]
+                ],
+                "text",
+            )
+            content, finished = body["output_text"], body["status"]
+        else:
+            reasoning = _joined(body["content"], "thinking")
+            content, finished = _joined(body["content"], "text"), body["stop_reason"]
+    assert (reasoning or "", content or "") == (
+        ("", "") if alone else ("I need the weather tool.", "Checking.")
+    )
+    assert finished == finish[api]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("alone", [False, True], ids=["after-text", "alone"])
+def test_response_template_tool_call_without_arguments(client, stream, alone):
+    # The tool parser reads a call that has no `args`; the template's transform
+    # does not, and the call must not take the turn's text with it.
+    start = _INKLING_CALL.index("<|message_model|>get_weather") if alone else 0
+    output = _INKLING_CALL[start:].replace(',"args":{"city":"Warsaw"}', "")
+    with _endpoint(
+        processor=NS(tokenizer=_ResponseTemplateTokenizer(_INKLING_RESPONSE_TEMPLATE)),
+        result=_result(output),
+        generator=_streaming([_token(output), _token(finish_reason="stop")]),
+        parser=load_tool_module("inkling"),
+    ):
+        response = _post(client, tools=[_tool()], stream=stream)
+    result = _chat_tool_result(response, stream)
+    assert result.calls == [("get_weather", {})]
+    assert (result.reasoning_content, result.content) == (
+        ("", "") if alone else ("I need the weather tool.", "Checking.")
+    )
+    assert "<|" not in response.text
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_response_template_tool_call_without_tools(client, stream):
+    # A call written for a request that sent no tools is not content, whether
+    # or not the response is streamed.
+    call = _INKLING_CALL[_INKLING_CALL.index("<|message_model|>get_weather") :]
+    with _endpoint(
+        processor=NS(tokenizer=_ResponseTemplateTokenizer(_INKLING_RESPONSE_TEMPLATE)),
+        result=_result(call),
+        generator=_streaming([_token(call), _token(finish_reason="stop")]),
+    ):
+        response = _post(client, stream=stream)
+    assert response.status_code == 200, response.text
+    assert "get_weather" not in response.text
+
+
+@pytest.mark.parametrize("api", ["chat", "responses", "messages"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("batched", [False, True])
+@pytest.mark.parametrize("truncated", [False, True])
+def test_response_template_keeps_valid_calls_beside_errors(
+    client, api, stream, batched, template_tool_case, truncated
+):
+    case = template_tool_case
+    output = case.thinking + case.malformed + case.call + case.malformed + case.content
+    if truncated:
+        output = case.thinking + case.content + case.call + case.truncated
+    finish_reason = "length" if truncated else "stop"
+    chunks = [output[i : i + 7] for i in range(0, len(output), 7)]
+    tokens = [*map(_token, chunks), _token(finish_reason=finish_reason)]
+    payload = dict(stream=stream, tools=[_tool(api=api)])
+    if api == "messages":
+        payload.update(thinking=dict(type="enabled", budget_tokens=4), max_tokens=8)
+    with _endpoint(
+        processor=NS(tokenizer=_ResponseTemplateTokenizer(case.template)),
+        result=_result(output, finish_reason=finish_reason),
+        chunks=[_result(t.text, finish_reason=t.finish_reason) for t in tokens],
+        generator=_streaming(tokens) if batched else None,
+        parser=load_tool_module(case.parser),
+    ):
+        response = _post(client, api, **payload)
+    assert response.status_code == 200, response.text
+    if api == "chat":
+        result = _chat_tool_result(
+            response,
+            stream,
+            "length" if truncated else "tool_calls",
+            expected_partial=(
+                {"name": "get_weather", "arguments": '{"city":"War'}
+                if stream and truncated and case.parser == "inkling"
+                else None
+            ),
+        )
+        assert result.calls == [("get_weather", {"city": "Warsaw"})]
+        assert (result.reasoning_content, result.content) == (
+            "I need the weather tool.",
+            "Checking.",
+        )
+    elif api == "responses":
+        body = (
+            next(
+                e["response"]
+                for e in _data(response)
+                if e.get("type") in ("response.completed", "response.incomplete")
+            )
+            if stream
+            else response.json()
+        )
+        assert body["status"] == ("incomplete" if truncated else "completed")
+        calls = [item for item in body["output"] if item["type"] == "function_call"]
+        if stream and truncated and case.parser == "inkling":
+            partial = calls.pop()
+            assert partial["status"] == "incomplete"
+            assert partial["arguments"] == '{"city":"War'
+        assert [(c["name"], json.loads(c["arguments"])) for c in calls] == [
+            ("get_weather", {"city": "Warsaw"})
+        ]
+        if stream:
+            assert _thinking_text(response, api) == (
+                "I need the weather tool.",
+                "Checking.",
+            )
+    elif stream:
+        events = _data(response)
+        blocks = [
+            e["content_block"]
+            for e in events
+            if e.get("type") == "content_block_start"
+            and e["content_block"]["type"] == "tool_use"
+        ]
+        assert len(blocks) == 1 and blocks[0]["name"] == "get_weather"
+        args = _joined(
+            [e["delta"] for e in events if e.get("type") == "content_block_delta"],
+            "partial_json",
+        )
+        assert json.loads(args) == {"city": "Warsaw"}
+        assert _thinking_text(response, api) == (
+            "I need the weather tool.",
+            "Checking.",
+        )
+        assert _anthropic_stream_stop(response)[0] == (
+            "max_tokens" if truncated else "tool_use"
+        )
+    else:
+        body = response.json()
+        calls = [c for c in body["content"] if c["type"] == "tool_use"]
+        assert [(c["name"], c["input"]) for c in calls] == [
+            ("get_weather", {"city": "Warsaw"})
+        ]
+        assert _joined(body["content"], "thinking") == "I need the weather tool."
+        assert _joined(body["content"], "text") == "Checking."
+        assert body["stop_reason"] == ("max_tokens" if truncated else "tool_use")
+
+
+@pytest.mark.parametrize("api", ["chat", "responses", "messages"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("batched", [False, True])
+def test_tool_parse_failure_without_response_template(client, api, stream, batched):
+    output = "Hello.<tool_call>{broken}</tool_call>"
+    tokens = [_token(output), _token(finish_reason="stop")]
+    with _endpoint(
+        result=_result(output, finish_reason="stop"),
+        chunks=[_result(t.text, finish_reason=t.finish_reason) for t in tokens],
+        generator=_streaming(tokens) if batched else None,
+        parser=_JSON_TOOLS,
+    ):
+        response = _post(client, api, stream=stream, tools=[_tool(api=api)])
+    _assert_tool_parse_error(response, api, stream)
+    assert "{broken}" not in response.text and "<tool_call>" not in response.text
+
+
 def test_response_template_thinking_stream():
     state = server.make_response_stream_state(
-        NS(tokenizer=_MuseResponseTemplateTokenizer()),
+        NS(tokenizer=_ResponseTemplateTokenizer(_MUSE_RESPONSE_TEMPLATE)),
         thinking_start_token="unused-start",
         thinking_end_token="unused-end",
     )
@@ -8882,23 +9300,61 @@ def test_tool_stream_matches_non_streamed_content(parser, text):
 _WEATHER_CALL = '<tool_call>{"name": "get_weather", "arguments": {}}</tool_call>'
 
 
-def test_chat_fallback_stream_parses_tool_calls(client):
+@pytest.fixture(params=[False, True], ids=["no-template", "broken-template"])
+def fallback_processor(request):
+    if not request.param:
+        return None
+    tokenizer = _ResponseTemplateTokenizer({"fields": {}})
+    tokenizer.parse_response = Mock(side_effect=ValueError("invalid template"))
+    tokenizer.get_response_parser = Mock(side_effect=ValueError("invalid template"))
+    return NS(tokenizer=tokenizer)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_chat_fallback_parses_tool_calls(client, stream, fallback_processor):
     # Without a response generator the stream_generate fallback streamed the
     # raw tool-call markup as content and never emitted tool_calls.
     result = _result(f"Checking.{_WEATHER_CALL}", finish_reason="stop")
-    with _endpoint(chunks=[result], parser=_JSON_TOOLS):
-        response = _post(client, stream=True, tools=[_tool()])
-    deltas = _deltas(response)
-    assert _joined(deltas, "content") == "Checking."
-    calls = [call for delta in deltas for call in delta.get("tool_calls") or []]
-    assert [call["function"]["name"] for call in calls] == ["get_weather"]
-    reasons = [
-        choice["finish_reason"]
-        for chunk in _data(response)
-        for choice in chunk.get("choices") or []
-        if choice.get("finish_reason")
-    ]
-    assert reasons == ["tool_calls"]
+    with _endpoint(
+        result=result, chunks=[result], parser=_JSON_TOOLS, processor=fallback_processor
+    ):
+        response = _post(client, stream=stream, tools=[_tool()])
+    parsed = _chat_tool_result(response, stream)
+    assert parsed.content == "Checking."
+    assert parsed.calls == [("get_weather", {})]
+
+
+@pytest.mark.parametrize("continuous", [False, True])
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        (
+            f"Use the closing tag </think> in XML. {_WEATHER_CALL}Done.",
+            "Use the closing tag  in XML.  Done.",
+        ),
+        (
+            f"<mm:think>First</mm:think>Before{_WEATHER_CALL}<think>Second</think>After",
+            "Before SecondAfter",
+        ),
+    ],
+    ids=["literal-close-marker", "mixed-thinking-markers"],
+)
+def test_chat_nonstream_tool_cleanup_preserves_fallback_content(
+    client, continuous, fallback_processor, text, expected
+):
+    result = _result(text, finish_reason="stop")
+    with _endpoint(
+        result=result,
+        generator=(
+            _streaming([_token(text, finish_reason="stop")]) if continuous else None
+        ),
+        parser=_JSON_TOOLS,
+        processor=fallback_processor,
+    ):
+        response = _post(client, tools=[_tool()])
+    parsed = _chat_tool_result(response, stream=False)
+    assert parsed.content == expected
+    assert parsed.calls == [("get_weather", {})]
 
 
 @pytest.mark.parametrize("api", ["chat", "responses", "messages"])
@@ -9004,13 +9460,19 @@ def test_anthropic_unfinished_call_matches_stream(
 
     with _endpoint(parser=_JSON_TOOLS, **endpoint_options()):
         response = _post(client, "messages", tools=[_tool(api="messages")])
-    assert response.status_code == 200, response.text
-    blocks = response.json()["content"]
-    assert "".join(b["text"] for b in blocks if b["type"] == "text") == expected
-    assert sum(b["type"] == "tool_use" for b in blocks) == int(completed_call)
+    failed = not completed_call and finish_reason != "length"
+    if failed:
+        _assert_tool_parse_error(response, "messages", False)
+    else:
+        assert response.status_code == 200, response.text
+        blocks = response.json()["content"]
+        assert "".join(b["text"] for b in blocks if b["type"] == "text") == expected
+        assert sum(b["type"] == "tool_use" for b in blocks) == int(completed_call)
 
     with _endpoint(parser=_JSON_TOOLS, **endpoint_options()):
         response = _post(client, "messages", stream=True, tools=[_tool(api="messages")])
+    if failed:
+        _assert_tool_parse_error(response, "messages", True)
     assert _joined(_deltas(response, "messages"), "text") == expected
     tool_blocks = [
         item["content_block"]
@@ -10477,22 +10939,7 @@ def test_tool_streaming_filters_calls_consistently(
         assert all(call["type"] == "function_call" for call in calls)
         actual = [(call["name"], json.loads(call["arguments"])) for call in calls]
     else:
-        choices = [event["choices"][0] for event in events if event.get("choices")]
-        assert [
-            choice["finish_reason"] for choice in choices if choice.get("finish_reason")
-        ] == ["tool_calls"]
-        received = {}
-        for choice in choices:
-            for delta in choice["delta"].get("tool_calls") or []:
-                call = received.setdefault(delta["index"], {"arguments": ""})
-                function = delta["function"]
-                if "name" in function:
-                    call["name"] = function["name"]
-                call["arguments"] += function.get("arguments", "")
-        assert list(received) == list(range(len(expected)))
-        actual = [
-            (call["name"], json.loads(call["arguments"])) for call in received.values()
-        ]
+        actual = _chat_tool_result(response, stream=True).calls
     assert actual == expected
 
 

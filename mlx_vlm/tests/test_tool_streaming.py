@@ -6,6 +6,7 @@ import pytest
 
 from mlx_vlm.tools import load_tool_module, process_tool_calls
 from mlx_vlm.tools.streaming import ToolCallDeltaState
+from mlx_vlm.tools.types import ToolCallParseError
 
 TOOLS = [
     {
@@ -397,3 +398,44 @@ def test_xml_strings_preserve_final_parser_semantics(value):
         state.feed(char)
     expected = process_tool_calls(text, module, TOOLS).calls
     assert state.finish(expected) == []
+
+
+@pytest.mark.parametrize("valid", [False, True])
+@pytest.mark.parametrize("closed", [False, True])
+def test_extraction_records_errors_without_losing_valid_calls(valid, closed):
+    module = load_tool_module("json_tools")
+    bad = '<tool_call>{"name":"write_file","arguments":{broken}'
+    if closed:
+        bad += "</tool_call>"
+    good = encoded_call("json_tools", "ok") if valid else ""
+    result = process_tool_calls(good + bad, module, TOOLS)
+    assert len(result.errors) == 1
+    assert len(result.calls) == int(valid)
+    if valid:
+        assert json.loads(result.calls[0]["function"]["arguments"])["content"] == "ok"
+        result.raise_if_failed("stop")
+    else:
+        with pytest.raises(ToolCallParseError):
+            result.raise_if_failed("stop")
+    result.raise_if_failed("length")
+
+
+def test_ordinary_inkling_message_is_not_a_failed_call():
+    module = load_tool_module("inkling")
+    for text in (
+        "",
+        "<|message_model|><|content_text|>Hello",
+        "<|message_model|><|content_thinking|>Thinking",
+    ):
+        result = process_tool_calls(text, module, TOOLS)
+        assert not result.errors and not result.calls
+        result.raise_if_failed("stop")
+
+
+def test_token_limit_preserves_incomplete_stream_status():
+    module = load_tool_module("json_tools")
+    state = ToolCallDeltaState(module, TOOLS)
+    assert state.feed(
+        '<tool_call>{"name":"write_file","arguments":{"content":"unfinished'
+    )
+    assert state.finish([], incomplete=True) == []
