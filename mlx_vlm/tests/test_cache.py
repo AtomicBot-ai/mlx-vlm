@@ -2972,19 +2972,17 @@ def test_single_row_checkpoint(managers):
     assert batch._apc_manager.stats.exact_stores == 1
 
 
-@pytest.mark.skipif(
-    not mx.metal.is_available(), reason="Uses Metal allocation accounting"
-)
 @pytest.mark.parametrize("right_pad_per_row", [None, [0]], ids=["left", "right"])
 def test_prefill_releases_unused_logits_before_checkpoint(
     managers, monkeypatch, right_pad_per_row
 ):
     cache = C.ArraysCache(1)
-    cache[0] = mx.arange(2**21, dtype=mx.float32).reshape(1, 1, -1)
+    cache[0] = mx.arange(128, dtype=mx.float32).reshape(1, 1, -1)
     mx.eval(cache.state)
     state_bytes = cache[0].nbytes
     manager = managers(budget=4 * state_bytes)
     manager.exact_cache_guard_tokens = 32
+    live_logits = weakref.WeakValueDictionary()
 
     class RecurrentModel(nn.Module):
         def __init__(self):
@@ -2998,7 +2996,9 @@ def test_prefill_releases_unused_logits_before_checkpoint(
             previous = cache[0][0]
             cache[0][0] = -previous
             mx.eval(cache[0].state)
-            return LanguageModelOutput(logits=mx.sin(previous))
+            logits = mx.sin(previous)
+            live_logits["step"] = logits
+            return LanguageModelOutput(logits=logits)
 
     model = RecurrentModel()
     tokens = list(range(64))
@@ -3011,17 +3011,17 @@ def test_prefill_releases_unused_logits_before_checkpoint(
         step=32,
         right_pad_per_row=right_pad_per_row,
     )
-    mx.synchronize()
-    # Enough room for live state, the checkpoint and its reserve, but not
-    # another full state kept alive solely by an unused lazy logits graph.
-    budget = mx.get_active_memory() + 5 * state_bytes // 2
-    monkeypatch.setattr(
-        manager, "_memory_headroom", lambda: budget - mx.get_active_memory()
-    )
-    assert batch.prompt_step() == 32
+    # The checkpoint and its reserve need two states' worth of headroom.
+    # Charge one state for the previous buffer while the lazy logits retain it.
+    with monkeypatch.context() as admission:
+        admission.setattr(
+            manager, "_memory_headroom", lambda: state_bytes * (1 if live_logits else 2)
+        )
+        assert batch.prompt_step() == 32
+    assert manager.stats.exact_stores == 1
     restored, count = manager.lookup_exact_cache(tokens)
     assert count == 32
-    assert mx.all(restored[0][0] == -mx.arange(2**21).reshape(1, 1, -1)).item()
+    assert mx.all(restored[0][0] == -mx.arange(128).reshape(1, 1, -1)).item()
 
 
 def test_generation_stream_spill(managers, monkeypatch):
