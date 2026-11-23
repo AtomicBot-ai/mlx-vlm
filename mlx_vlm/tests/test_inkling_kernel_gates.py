@@ -51,6 +51,49 @@ def test_short_conv_decode_skips_kernel(gpu_without_metal):
     assert out.shape == (1, 1, channels)
 
 
+@pytest.mark.parametrize("masked", [False, True])
+@pytest.mark.parametrize(
+    "metal_available", [False, True], ids=["gpu-no-metal", "cpu-on-metal"]
+)
+def test_inkling2_sconv_skips_metal_kernels(monkeypatch, metal_available, masked):
+    from mlx_vlm.models.cache import ArraysCache
+    from mlx_vlm.models.inkling2 import kernels, language
+
+    monkeypatch.setattr(kernels, "_short_convolution", _forbid("short convolution"))
+    monkeypatch.setattr(
+        language, "_conv_history_kernel", _forbid("convolution history")
+    )
+    monkeypatch.setattr(mx.metal, "is_available", lambda: metal_available)
+    with mx.stream(mx.cpu):
+        if not metal_available:
+            # Emulate a non-Metal GPU backend while evaluating the fallback on CPU.
+            monkeypatch.setattr(mx, "default_device", lambda: mx.gpu)
+        channels = 128
+        conv = language.ShortConvolution(channels, 4, 0)
+        conv.conv.weight = mx.zeros((channels, 4, 1), mx.bfloat16)
+        conv.eval()
+        x = mx.broadcast_to(mx.arange(1, 5)[None, :, None], (1, 4, channels)).astype(
+            mx.bfloat16
+        )
+        mask = mx.array([[False, True, True, True]]) if masked else None
+        cache = ArraysCache(1)
+        state = mx.zeros((1, 3, channels))
+        cache[0] = state
+        assert kernels.short_convolution(state, conv.conv.weight, x, mask, 4) is None
+        cache.start_speculation(4)
+        residual = mx.ones(x.shape)
+        out = conv(x, cache, mask, residual=residual, output_dtype=mx.float32)
+        cache.commit_speculation(2)
+        expected = (x.astype(mx.float32) / 5**0.5).astype(mx.bfloat16).astype(
+            mx.float32
+        ) + residual
+        assert mx.array_equal(out, expected).item()
+        kept = mx.array([0, 0 if masked else 1, 2], mx.float32)
+        assert mx.array_equal(
+            cache[0], mx.broadcast_to(kept[None, :, None], state.shape)
+        ).item()
+
+
 def test_moe_route_and_down_combine_skip_kernels(gpu_without_metal):
     config = TextConfig(
         hidden_size=64,

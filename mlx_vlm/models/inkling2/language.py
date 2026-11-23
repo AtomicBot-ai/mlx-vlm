@@ -172,10 +172,10 @@ def _update_conv_cache(cache, index, state, inputs, mask):
 
 
 class ShortConvolution(InklingShortConvolution):
-    def __call__(self, x, cache=None, mask=None):
-        # Keep the convolution, residual, and scaling in FP32. The checkpoint
-        # stores BF16 taps, but rounding the convolution before adding the
-        # residual changes both reference parity and prefill/decode consistency.
+    def __call__(self, x, cache=None, mask=None, residual=None, output_dtype=None):
+        # The convolution includes its own input skip and scaling in FP32.
+        # Round that result to the input dtype before adding any layer residual.
+        output_dtype = x.dtype if output_dtype is None else output_dtype
         state = cache[self.conv_idx] if cache is not None else None
         if state is None:
             state = mx.zeros((x.shape[0], self.kernel_size - 1, x.shape[-1]))
@@ -186,16 +186,32 @@ class ShortConvolution(InklingShortConvolution):
             and x.shape[0] <= 4
             and x.shape[1] <= 8
             and x.shape[-1] % 128 == 0
-            and mx.metal.is_available()
-            and mx.default_device() == mx.gpu
         ):
             from .kernels import short_convolution
 
-            # Temporal selection promotes selected BF16 values into FP32 state.
-            # Invalid positions never enter that state. The convolution itself
-            # reads masked inputs directly, without materializing a concat.
-            _update_conv_cache(cache, self.conv_idx, state, x, mask)
-            return short_convolution(state, self.conv.weight, x, mask, self.kernel_size)
+            write_window = (
+                cache is not None and mask is None and state.dtype == mx.float32
+            )
+            result = short_convolution(
+                state,
+                self.conv.weight,
+                x,
+                mask,
+                self.kernel_size,
+                residual,
+                output_dtype,
+                write_window,
+            )
+            if result is not None:
+                if write_window:
+                    result, window = result
+                    width = self.kernel_size - 1
+                    if getattr(cache, "is_speculating", False):
+                        cache.record_speculative_window(self.conv_idx, window, width)
+                    cache[self.conv_idx] = window[:, -width:]
+                else:
+                    _update_conv_cache(cache, self.conv_idx, state, x, mask)
+                return result
         xf = x.astype(mx.float32)
         inputs = xf if mask is None else mx.where(mask[..., None], xf, 0)
         context = mx.concatenate([state, inputs], axis=1)
@@ -203,7 +219,10 @@ class ShortConvolution(InklingShortConvolution):
         out = mx.conv1d(
             context, self.conv.weight.astype(mx.float32), groups=x.shape[-1]
         )
-        return ((out + xf) / math.sqrt(self.kernel_size + 1)).astype(x.dtype)
+        out = ((out + xf) / math.sqrt(self.kernel_size + 1)).astype(x.dtype)
+        if residual is not None:
+            out = out.astype(mx.float32) + residual.astype(mx.float32)
+        return out.astype(output_dtype)
 
 
 class DynamicShortConvolution(nn.Module):
@@ -628,17 +647,21 @@ class DecoderLayer(nn.Module):
             )
             parts = [norm(part).astype(x.dtype) for norm, part in zip(norms, parts)]
             attn = self.self_attn(*parts, cache=cache, conv_mask=mask)
-        residual = self.attn_sconv(attn, conv, mask).astype(mx.float32)
+        residual = self.attn_sconv(
+            attn,
+            conv,
+            mask,
+            residual=None if self.is_block_boundary else x,
+            output_dtype=mx.float32,
+        )
         if self.is_block_boundary:
             blocks.append(x)
-        else:
-            residual = residual + x.astype(mx.float32)
         hidden = self.mlp_input(blocks, residual)[..., 0, :]
         if messages is not None:
             hidden = self.controllers["mlp"](hidden, messages[..., 3, :])
         hidden = self.mlp(self.post_attention_layernorm(hidden).astype(x.dtype))
-        out = (residual + self.mlp_sconv(hidden, conv, mask).astype(mx.float32)).astype(
-            x.dtype
+        out = self.mlp_sconv(
+            hidden, conv, mask, residual=residual, output_dtype=x.dtype
         )
         if conv is not None:
             conv.advance(x.shape[1])
