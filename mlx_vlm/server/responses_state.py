@@ -590,6 +590,7 @@ def parse_assistant_tool_calls(
     starts_in_thinking=False,
     thinking_start_token=None,
     thinking_end_token=None,
+    finish_reason=None,
 ):
     """Parse executable calls from the same content seen by the streaming parser.
 
@@ -603,7 +604,9 @@ def parse_assistant_tool_calls(
         .feed(text, last=True)
         .content
     )
-    return process_tool_calls(content or "", tool_module, tools)
+    result = process_tool_calls(content or "", tool_module, tools)
+    result.raise_if_failed(finish_reason)
+    return result
 
 
 def _response_output_items_from_text(
@@ -620,6 +623,7 @@ def _response_output_items_from_text(
     tool_delta_state=None,
     *,
     prompt: str = "",
+    finish_reason: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], str, Optional[str], str]:
     reasoning, content = _split_thinking(
         full_text,
@@ -638,9 +642,10 @@ def _response_output_items_from_text(
             starts_in_thinking=starts_in_thinking,
             thinking_start_token=thinking_start_token,
             thinking_end_token=thinking_end_token,
+            finish_reason=finish_reason,
         )
         if tool_delta_state is not None:
-            tool_delta_state.finish(tc.calls)
+            tool_delta_state.finish(tc.calls, incomplete=finish_reason == "length")
         if tc.calls:
             items = [
                 _tool_call_to_response_item(call, tool_registry) for call in tc.calls
