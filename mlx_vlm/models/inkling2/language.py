@@ -539,7 +539,7 @@ class SparseMoE(nn.Module):
             activation=SoftcappedSwiGLU(config),
         )
 
-    def __call__(self, x):
+    def __call__(self, x, speculative_verify=False):
         indices, weights = _route(
             x,
             self.gate_weight,
@@ -548,6 +548,12 @@ class SparseMoE(nn.Module):
             self.route_scale,
         )
         if self.sharding_group is None:
+            if speculative_verify and not self.training and 1 < x.shape[1] <= 8:
+                from .grouped_experts import grouped_expert_projections
+
+                out = grouped_expert_projections(self.switch_mlp, x, indices)
+                if out is not None:
+                    return _combine_routes(out, weights)
             if (
                 not self.training
                 and x.shape[0] <= 4
@@ -638,7 +644,7 @@ class DecoderLayer(nn.Module):
                 name: MessageController(config) for name in ("attn", "k", "v", "mlp")
             }
 
-    def __call__(self, x, blocks, cache=None, messages=None):
+    def __call__(self, x, blocks, cache=None, messages=None, speculative_verify=False):
         conv = cache[1] if cache is not None else None
         mask = _cache_padding_mask(conv, x.shape[1])
         mixed = (
@@ -682,7 +688,10 @@ class DecoderLayer(nn.Module):
         hidden = self.mlp_input(blocks, residual)[..., 0, :]
         if messages is not None:
             hidden = self.controllers["mlp"](hidden, messages[..., 3, :])
-        hidden = self.mlp(self.post_attention_layernorm(hidden).astype(x.dtype))
+        hidden = self.mlp(
+            self.post_attention_layernorm(hidden).astype(x.dtype),
+            speculative_verify=speculative_verify,
+        )
         out = self.mlp_sconv(
             hidden, conv, mask, residual=residual, output_dtype=x.dtype
         )
@@ -753,7 +762,13 @@ class TextModel(nn.Module):
             # DSpark taps the partial block entering the layer, not its output.
             if visit in requested:
                 captures[visit] = x
-            x = self.layers[index](x, blocks, cache[visit] if cache else None, messages)
+            x = self.layers[index](
+                x,
+                blocks,
+                cache[visit] if cache else None,
+                messages,
+                speculative_verify=speculative_verify and self.loop is not None,
+            )
             if speculative_verify and (visit + 1) % 4 == 0:
                 mx.async_eval(x)
         h = self.final_input(blocks, x)[..., 0, :]
