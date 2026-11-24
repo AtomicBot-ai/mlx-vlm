@@ -36,6 +36,7 @@ Issues = "https://github.com/Neywa-Labs/mlx-vlm/issues"
 "mlx_vlm.moe_offload" = "mlx_vlm.moe_offload:main"
 "mlx_vlm.server" = "mlx_vlm.server:main"
 "mlx_vlm.train" = "mlx_vlm.train:main"
+"mlx_vlm.train_runs" = "mlx_vlm.train_runs:main"
 
 [tool.setuptools.packages.find]
 include = ["mlx_vlm*"]

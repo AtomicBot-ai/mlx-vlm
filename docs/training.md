@@ -309,6 +309,116 @@ The CLI constructs the optimizer separately using `--optimizer` (default
 `adamw`), `--learning-rate` (default `1e-5`), and `--weight-decay` (default
 `0.0`). These CLI options are not fields of the training argument dataclasses.
 
+Adam/AdamW are tuned with `--beta1`, `--beta2`, `--optimizer-eps` and
+`--bias-correction`. `--grad-clip N` (a training argument) clips the global
+gradient norm after accumulation and averaging, just before each update.
+
+`--lr-schedule` takes a name or a JSON/YAML object and `--warmup-steps` adds a
+linear ramp from `--warmup-init`:
+
+```bash
+--lr-schedule '{"name": "cosine_decay", "warmup": 10, "warmup_init": 1e-7, "arguments": [2e-4, 800, 2e-6]}'
+--lr-schedule cosine_decay --warmup-steps 10 --min-learning-rate 2e-6
+```
+
+A bare `cosine_decay` decays from `--learning-rate` to `--min-learning-rate`
+over the updates left after warmup. Schedule steps count optimizer updates,
+not microsteps (`iters / gradient_accumulation_steps`, rounded up), including
+`--epochs`-derived `iters`. Reported `learning_rate` follows the schedule.
+
+## Self-describing CLI and run manager
+
+The CLI reads its tasks, algorithms and options from the trainer registry and
+the config dataclasses. Registering a new algorithm or modality is enough for
+it to appear in every command below; nothing here lists them by hand.
+
+```sh
+python -m mlx_vlm.train --describe          # JSON: tasks, algorithms, options
+python -m mlx_vlm.train --model <model> --iters 200 --dry-run   # validate only
+python -m mlx_vlm.train --model <model> --progress-file progress.jsonl
+```
+
+`--describe` reports each option's flag, type, default, choices and help, and
+takes an algorithm's description from the first docstring line of its config
+class. `--progress-file` appends one JSON object per report (`start`, `train`,
+`validation`, then `end` or `capped`).
+
+Usage caps keep a run within a budget:
+
+| Flag | Effect |
+|---|---|
+| `--max-iters N` | Refuse a run longer than `N` iterations, including `--epochs`-derived ones. |
+| `--max-minutes M` | Save the weights and stop after `M` minutes of wall time. |
+| `--max-memory-gb G` | Set MLX's memory limit to `G` and save and stop once active memory passes it. |
+
+Time and memory are checked at each training report, so a run ends within
+`steps_per_report` iterations of passing a cap. A capped run exits with status
+0 and keeps its weights.
+
+`mlx_vlm.train_runs` runs training in the background for a host application
+(for example a Nativ extension). Every command prints one JSON document:
+
+```sh
+python -m mlx_vlm.train_runs describe
+python -m mlx_vlm.train_runs validate-model <model>
+python -m mlx_vlm.train_runs inspect-dataset --options '{"data": "data"}'
+python -m mlx_vlm.train_runs check --options '{"model": "<model>", "algorithm": "sft"}'
+python -m mlx_vlm.train_runs start --options-file options.json --name my-run
+python -m mlx_vlm.train_runs status          # newest run; or pass a run id or name
+python -m mlx_vlm.train_runs log --lines 50
+python -m mlx_vlm.train_runs history       # every metric as [iteration, value] points
+python -m mlx_vlm.train_runs list
+python -m mlx_vlm.train_runs stop            # saves weights and trainer state first
+python -m mlx_vlm.train_runs continue        # carry on an ended run in a new run
+python -m mlx_vlm.train_runs config          # the options a run was started with
+python -m mlx_vlm.train_runs sample          # latest generated output (GRPO)
+python -m mlx_vlm.train_runs delete <run>    # remove an ended run and its files
+python -m mlx_vlm.train_runs limits
+```
+
+Options are a JSON object keyed by the option names from `describe`, and are
+validated by the training parser itself. Each run is a detached
+`mlx_vlm.train` process with its own folder under `~/.mlx-vlm/runs/<run_id>/`
+(`--runs-dir` or `MLX_VLM_RUNS_DIR`) holding `config.json`, `run.json`,
+`train.log`, `progress.jsonl` and `adapters/`. State is on disk, so runs
+survive a restart of the host. A run ends as `completed`, `capped`, `stopped`
+or `failed`. Set `export_qat_path` in the options to also save a merged,
+standalone model when training completes. Relative export paths resolve from
+the caller's directory. A stopped or capped run saves its training checkpoint
+and defers the export until a continuation finishes.
+
+`stop` asks the run to end at its next report: it saves its weights and a
+`trainer_state.safetensors` (optimizer state, random state and position)
+beside them. `continue` then starts a new run that restores all of it and
+trains the iterations that were left, so the two parts together match one
+uninterrupted run, including the learning-rate schedule. A run that reached a
+usage cap continues the same way. A run that failed or was killed saved no
+state and continues from its last saved weights with a fresh optimizer. The
+same works from the CLI with `--resume-adapter-file` plus `--resume-state`.
+Validation and checkpoint intervals are counted from where the new run starts.
+New trainer-state files also preserve pending gradients and their microbatch
+count when a run stops between optimizer updates. Older files saved mid-window
+start a fresh accumulation window because they lack those gradients.
+
+Caps are set by whoever launches the manager, as flags before the command or
+as environment variables, and are passed on to every run:
+
+| Flag | Environment variable | Default |
+|---|---|---|
+| `--max-concurrent-runs` | `MLX_VLM_TRAIN_MAX_CONCURRENT_RUNS` | 1 |
+| `--max-iters` | `MLX_VLM_TRAIN_MAX_ITERS` | unlimited |
+| `--max-minutes` | `MLX_VLM_TRAIN_MAX_MINUTES` | unlimited |
+| `--max-memory-gb` | `MLX_VLM_TRAIN_MAX_MEMORY_GB` | unlimited |
+| `--max-runs-per-day` | `MLX_VLM_TRAIN_MAX_RUNS_PER_DAY` | unlimited |
+
+A `limits.json` file in the runs folder sets the same caps for every client
+of that folder, for example `{"max_iters": 2000, "max_minutes": 60}`; `null`
+means unlimited. A flag or environment variable can tighten a cap from the
+file but cannot loosen it.
+
+`MLX_VLM_TRAIN_PYTHON` selects the Python that runs training when it differs
+from the one running the manager.
+
 ## Row formats
 
 SFT rows contain chat messages and optional images:
@@ -370,8 +480,11 @@ They use their original argument classes. The public `ORPOTrainingArgs` now
 configures the notebook/shared engine API; import
 `mlx_vlm.trainer.vlm.orpo.trainer.ORPOTrainingArgs` (also exposed as
 `mlx_vlm.trainer.vlm.LegacyORPOTrainingArgs`) for the older `ORPOTrainer` /
-`train_orpo` recipe. `TrainingArgs` continues to configure the older SFT recipe;
-use `VLMTrainingArgs` with the new `Trainer`.
+`train_orpo` recipe.
+
+`train(..., args=TrainingArgs(...))` and `SFTTrainer.fit()` run on the shared
+engine and keep their historical batch format, loss arguments, checkpoint names,
+and `None` return value.
 
 ## GRPO with optional vision inputs
 
@@ -484,3 +597,65 @@ Custom callbacks can be defined in `--reward-functions-file rewards.py`, selecte
 with `--reward-functions first_reward,second_reward`, and weighted with
 `--reward-weights '[0.8, 0.2]'`. The CLI loads a separate base reference when
 `--beta` is positive; override it with `--reference-model` if needed.
+
+### Quantization-aware full training
+
+Use weight-only affine QAT through the same preparation and Trainer path:
+
+```python
+model = prepare_model_for_training(
+    model, train_type="full", qat=True, quantization_bits=4,
+    quantization_group_size=64,
+)
+```
+
+The equivalent CLI options are `--train-type full --qat --quantization-bits 4`.
+QAT simulates quantization on eligible standard Linear weights with straight-through
+gradients; embeddings and Linear layers whose input width is incompatible with
+the group size remain floating point. It supports 4/8 bits and groups of 32/64/128.
+Checkpoints contain floating-point master weights in the existing full checkpoint
+format. Resume with `qat=True` (or `--qat`). This uses full-training memory.
+
+Export packed inference weights after training with one call:
+
+```python
+from mlx_vlm import export_model
+
+export_model(model, processor, "qat-inference", model_path=MODEL_ID)
+# Load directly for inference:
+model, processor = load("qat-inference")
+```
+
+The output must be a new directory. `export_model` automatically packs QAT layers
+at their trained bit/group settings, preserves other layers, fuses LoRA/DoRA
+adapters when present, and saves the config and processor assets. It derives
+quantization metadata from the exported layers. The live training model is
+restored after saving. The result is a standalone inference model.
+
+An attached MTP head is saved separately in the export's `mtp/` directory using
+its training weights. Load the target with `load(export_path)` and the head with
+`load_drafter(str(export_path / "mtp"), kind="mtp")`.
+
+For non-QAT training the same function keeps the current float/packed layout.
+Force quantization of compatible float layers with:
+
+```python
+export_model(
+    model, processor, "quantized-inference", model_path=MODEL_ID,
+    quantize=True, bits=4, group_size=64,
+)
+```
+
+With `quantize=True`, ordinary float layers default to 4 bits/group 64; QAT layers
+keep their trained settings unless `bits`/`group_size` are explicitly supplied.
+`quantize=False` saves QAT master weights without adding quantization; existing
+packed layers remain packed. Forced quantization skips incompatible float layers.
+Full QAT checkpoints now record their QAT settings, so preparation restores them
+automatically on resume. Older checkpoints need explicit QAT settings.
+Saved settings are also restored when `qat=True` or `--qat` is supplied. Explicit
+bit/group settings must match the checkpoint; omit them to restore its settings.
+
+All QAT notebooks end with `export_model(...)`. CLI training supports
+`--export-model-path inference` (the old `--export-qat-path` remains an alias).
+Add `--export-quantize` to force quantization. Float training checkpoints remain
+separate for resuming. `export_qat_model` remains a compatibility wrapper.

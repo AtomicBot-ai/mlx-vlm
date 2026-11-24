@@ -1,7 +1,10 @@
 """One MLX training loop for all modalities and objectives."""
 
 import time
+from dataclasses import dataclass
+from functools import partial
 from itertools import islice
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -21,6 +24,14 @@ from mlx_vlm.trainer.common.utils import (
     apply_gradient_step,
     save_trainable_weights,
 )
+
+
+@dataclass
+class GradientAccumulation:
+    """Sum of gradients for the microbatches since the last optimizer update."""
+
+    gradients: Any = None
+    microsteps: int = 0
 
 
 def evaluate(
@@ -73,12 +84,17 @@ def train(
     seed: int | None = None,
     *,
     log_history: list[dict] | None = None,
+    accumulation: GradientAccumulation | None = None,
+    optimizer_update=None,
+    evaluate_before_step: bool = False,
 ) -> dict:
     """Optimize microbatches; return the final training metrics.
 
     Evaluate the graph once per microstep, release temporary gradients before
     evaluation, and synchronize Python metrics only at reporting intervals.
     ``iters`` counts microsteps; optimizer schedules count actual updates.
+    The functional SFT API supplies its optimizer's bound update method and
+    requests validation before the first, scheduled, and last microsteps.
     """
     args.validate()
     if len(train_dataset) == 0:
@@ -95,7 +111,8 @@ def train(
         task.checkpoint(model)
     if seed is not None:
         mx.random.seed(seed)
-    optimizer.init(model.trainable_parameters())
+    if optimizer_update is None:
+        optimizer.init(model.trainable_parameters())
     state = [model.state, optimizer.state, mx.random.state]
     value_and_grad = (
         task.value_and_grad_factory(model, args.compile)
@@ -113,40 +130,92 @@ def train(
             update=update,
             accumulation_steps=args.gradient_accumulation_steps,
             loss_args=extra,
+            grad_clip=args.grad_clip,
+            optimizer_update=optimizer_update,
         )
 
     if args.compile and task.value_and_grad_factory is None:
-        step = mx.compile(step, inputs=state + task.state, outputs=state)
+        if world.size() > 1 and mx.metal.is_available():
+            # Finish the CPU collective eagerly on every optimizer update.
+            loss_state = [model.state, mx.random.state]
+            compute = mx.compile(
+                partial(value_and_grad, model),
+                inputs=loss_state + task.state,
+                outputs=loss_state,
+            )
+
+            def value_and_grad(model, batch, *extra):
+                return compute(batch, *extra)
+
+        else:
+            step = mx.compile(step, inputs=state + task.state, outputs=state)
     iterator = iter(task.batches(train_dataset, train=True, seed=seed))
     save = task.save_weights or save_trainable_weights
     model.train()
-    gradients = None
+    if accumulation is None:
+        accumulation = GradientAccumulation()
     accumulator = MetricAccumulator()
     elapsed, data_elapsed, report_steps, trained, optimizer_step = 0.0, 0.0, 0, 0, 0
     compute_total, data_total, reported_updates = 0.0, 0.0, 0
     cumulative_counts = {}
     started = time.perf_counter()
     metrics = {"iteration": 0, "optimizer_step": 0}
+
+    def report_validation(iteration):
+        info = {
+            "iteration": iteration,
+            **evaluate(model, val_dataset, task, args, return_metrics=True),
+        }
+        metrics.update(info)
+        if rank == 0:
+            tqdm.write(format_metric_report(info, "Validation"))
+            if log_history is not None:
+                log_history.append(info.copy())
+            if training_callback is not None:
+                training_callback.on_val_loss_report(info.copy())
+
     progress = tqdm(range(1, args.iters + 1), desc="Training", disable=rank != 0)
     for iteration in progress:
         data_start = time.perf_counter()
         batch = next(iterator)
         extra = task.loss_args(batch) if task.loss_args is not None else ()
         data_elapsed += time.perf_counter() - data_start
+        validation_due = (
+            val_dataset is not None
+            and args.steps_per_eval is not None
+            and (
+                (evaluate_before_step and iteration == 1)
+                or iteration % args.steps_per_eval == 0
+                or iteration == args.iters
+            )
+        )
+        if validation_due and evaluate_before_step:
+            report_validation(iteration)
         start = time.perf_counter()
-        update = iteration % args.gradient_accumulation_steps == 0
-        loss, batch_metrics, gradients = step(batch, gradients, update, *extra)
+        microsteps = accumulation.microsteps + 1
+        update = microsteps == args.gradient_accumulation_steps
+        loss, batch_metrics, accumulation.gradients = step(
+            batch, accumulation.gradients, update, *extra
+        )
+        accumulation.microsteps = 0 if update else microsteps
         optimizer_step += int(update)
         accumulator.add(loss, batch_metrics)
         del loss, batch_metrics, batch, extra
-        mx.eval(state, accumulator.state(), gradients)
+        mx.eval(state, accumulator.state(), accumulation.gradients)
         report_steps += 1
         if iteration == args.iters:
-            partial = apply_final_accumulated_gradients(
-                model, optimizer, gradients, iteration, args.gradient_accumulation_steps
+            partial_steps = apply_final_accumulated_gradients(
+                model,
+                optimizer,
+                accumulation.gradients,
+                accumulation.microsteps,
+                args.gradient_accumulation_steps,
+                args.grad_clip,
+                optimizer_update=optimizer_update,
             )
-            optimizer_step += int(partial > 0)
-            gradients = None
+            optimizer_step += int(partial_steps > 0)
+            accumulation.gradients = None
+            accumulation.microsteps = 0
         elapsed += time.perf_counter() - start
         if iteration % args.steps_per_report == 0 or iteration == args.iters:
             values = accumulator.compute()
@@ -217,27 +286,16 @@ def train(
                 tqdm.write(format_metric_report(metrics, "Training"))
                 if log_history is not None:
                     log_history.append(metrics.copy())
-                if training_callback is not None:
-                    training_callback.on_train_loss_report(metrics.copy())
+            if training_callback is not None and (
+                rank == 0
+                or getattr(training_callback, "train_report_on_all_ranks", False)
+            ):
+                training_callback.on_train_loss_report(metrics.copy())
             accumulator = MetricAccumulator()
             elapsed, data_elapsed, report_steps = 0.0, 0.0, 0
             reported_updates = optimizer_step
-        if (
-            val_dataset is not None
-            and args.steps_per_eval is not None
-            and (iteration % args.steps_per_eval == 0 or iteration == args.iters)
-        ):
-            info = {
-                "iteration": iteration,
-                **evaluate(model, val_dataset, task, args, return_metrics=True),
-            }
-            metrics.update(info)
-            if rank == 0:
-                tqdm.write(format_metric_report(info, "Validation"))
-                if log_history is not None:
-                    log_history.append(info.copy())
-                if training_callback is not None:
-                    training_callback.on_val_loss_report(info.copy())
+        if validation_due and not evaluate_before_step:
+            report_validation(iteration)
         if iteration % args.steps_per_save == 0 and rank == 0:
             save(model, args.adapter_file, iteration=iteration)
         if (

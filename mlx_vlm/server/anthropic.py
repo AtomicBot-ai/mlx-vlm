@@ -430,12 +430,12 @@ def _anthropic_stop_reason(
     tool_calls: bool = False,
     stop_sequence: Optional[str] = None,
 ) -> str:
+    if finish_reason == "length":
+        return "max_tokens"
     if tool_calls:
         return "tool_use"
     if stop_sequence is not None:
         return "stop_sequence"
-    if finish_reason == "length":
-        return "max_tokens"
     if finish_reason == "tool_calls":
         return "tool_use"
     return "end_turn"
@@ -546,7 +546,9 @@ async def anthropic_messages_endpoint(http_request: Request):
             if "adapter_path" in request.model_fields_set
             else _INHERIT_ADAPTER
         )
-        model, processor, config = get_cached_model(request.model, adapter_path)
+        model, processor, config = await asyncio.to_thread(
+            get_cached_model, request.model, adapter_path
+        )
 
         try:
             processed_messages, images, tools, tool_choice = (
@@ -911,7 +913,9 @@ async def anthropic_messages_endpoint(http_request: Request):
 
                     parsed_tool_calls = None
                     if tool_module is not None and tools:
-                        tc = parse_tools(tool_output_before_stop())
+                        tc = parse_tools(
+                            tool_output_before_stop(), finish_reason=finish_reason
+                        )
                         if tc.calls:
                             parsed_tool_calls = tc.calls
 
@@ -1125,7 +1129,7 @@ async def anthropic_messages_endpoint(http_request: Request):
             )
             parsed_tool_calls = None
             if tool_module is not None and tools:
-                tc = parse_tools(full_text)
+                tc = parse_tools(full_text, finish_reason=finish_reason)
                 if tc.calls:
                     parsed_tool_calls = tc.calls
                     # Structured templates already removed tool/routing regions
@@ -1246,7 +1250,9 @@ async def anthropic_count_tokens_endpoint(http_request: Request):
     try:
         body = _normalize_anthropic_system_messages(await http_request.json())
         request = _anthropic_request_with_derived_fields(AnthropicRequest(**body))
-        model, processor, config = get_cached_model(request.model)
+        model, processor, config = await asyncio.to_thread(
+            get_cached_model, request.model
+        )
         try:
             processed_messages, images, tools, tool_choice = (
                 _anthropic_messages_to_internal(request)

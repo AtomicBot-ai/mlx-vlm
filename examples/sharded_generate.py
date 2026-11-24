@@ -21,6 +21,7 @@ import mlx.core as mx
 
 from mlx_vlm.generate import stream_generate
 from mlx_vlm.prompt_utils import apply_chat_template
+from mlx_vlm.speculative.drafters import load_drafter
 from mlx_vlm.utils import sharded_load
 
 if __name__ == "__main__":
@@ -60,8 +61,24 @@ if __name__ == "__main__":
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
     )
+    parser.add_argument(
+        "--draft-model",
+        help="Drafter checkpoint, or the target path for a bundled MTP/DSpark head.",
+    )
+    parser.add_argument("--draft-block-size", type=int, default=None)
+    parser.add_argument(
+        "--seed", type=int, default=0, help="Shared sampling seed for all ranks."
+    )
+    parser.add_argument(
+        "--cache-limit",
+        type=int,
+        default=None,
+        help="MLX allocation cache limit in bytes; use 0 to release loading buffers.",
+    )
     args = parser.parse_args()
 
+    if args.cache_limit is not None:
+        mx.set_cache_limit(args.cache_limit)
     group = mx.distributed.init(strict=args.backend != "any", backend=args.backend)
     rank = group.rank()
     pipeline_group = group if args.pipeline else None
@@ -72,6 +89,12 @@ if __name__ == "__main__":
             print(*args, **kwargs)
 
     model, processor = sharded_load(args.model, tensor_group, pipeline_group)
+    draft_options = {}
+    if args.draft_model:
+        draft, kind = load_drafter(args.draft_model)
+        draft_options = dict(
+            draft_model=draft, draft_kind=kind, draft_block_size=args.draft_block_size
+        )
 
     prompt = apply_chat_template(
         processor,
@@ -82,7 +105,13 @@ if __name__ == "__main__":
     )
 
     for response in stream_generate(
-        model, processor, prompt=prompt, image=args.image, max_tokens=args.max_tokens
+        model,
+        processor,
+        prompt=prompt,
+        image=args.image,
+        max_tokens=args.max_tokens,
+        seed=args.seed,
+        **draft_options,
     ):
         rprint(response.text, end="", flush=True)
 

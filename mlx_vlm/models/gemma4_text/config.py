@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 from ..base import BaseModelConfig
+from ..gemma4.config import apply_per_layer_config
 
 
 @dataclass
@@ -36,6 +37,7 @@ class ModelConfig(BaseModelConfig):
     top_k_experts: Optional[int] = None
     moe_intermediate_size: Optional[int] = None
     layer_types: Optional[List[str]] = None
+    per_layer_config: Optional[Dict] = None
     tie_word_embeddings: bool = True
 
     def __post_init__(self):
@@ -59,3 +61,4 @@ class ModelConfig(BaseModelConfig):
             self.layer_types = (pattern * (self.num_hidden_layers // len(pattern) + 1))[
                 : self.num_hidden_layers
             ]
+        apply_per_layer_config(self)

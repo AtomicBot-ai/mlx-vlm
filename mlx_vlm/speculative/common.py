@@ -4,11 +4,12 @@ from typing import Any, Callable, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from .. import _generation_stream
 from ..models.base import LanguageModelOutput
 from ..models.linear import DECODE_BLOCK_SIZE
 from .cache_state import start_speculative_cache
 
-generation_stream = mx.new_thread_local_stream(mx.default_device())
+generation_stream = _generation_stream.generation_stream
 
 
 def _apply_thinking_budget(

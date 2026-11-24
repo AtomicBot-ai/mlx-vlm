@@ -418,7 +418,9 @@ class DFlashBatch:
             )
 
         def draft_rows():
-            draft_batch = getattr(self.draft, "draft_batch", None)
+            draft_batch = (
+                getattr(self.draft, "draft_batch_greedy", None) if self.greedy else None
+            ) or getattr(self.draft, "draft_batch", None)
             if callable(draft_batch):
                 return draft_batch(
                     self.bonus,
@@ -748,7 +750,9 @@ def _dflash_rounds_batch(
     finished = [False] * B
     active_idx = list(range(B))  # maps active-slot → original-index
     hidden_by_orig = [hidden[i : i + 1] for i in range(B)]
-    draft_batch = getattr(draft_model, "draft_batch", None)
+    draft_batch = (
+        getattr(draft_model, "draft_batch_greedy", None) if greedy_sampling else None
+    ) or getattr(draft_model, "draft_batch", None)
     if callable(draft_batch):
         offsets = getattr(prompt_cache[0], "offset", None)
         if isinstance(offsets, mx.array) and offsets.size == B:

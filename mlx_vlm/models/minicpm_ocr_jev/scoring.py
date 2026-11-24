@@ -17,9 +17,11 @@ USER_TAIL = (
 
 
 def build_prompt(ocr_text):
+    # The value head pools the last token of this empty assistant/think turn.
     return (
-        f"<|im_start|>user\n{VISION_PLACEHOLDER}OCR文本：\n{ocr_text}\n"
-        f"{VISION_PLACEHOLDER}{USER_TAIL}<|im_end|>\n"
+        f"<|im_start|>user\n{VISION_PLACEHOLDER}\nOCR文本：\n{ocr_text}\n"
+        f"{VISION_PLACEHOLDER}\n{USER_TAIL}<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n"
     )
 
 

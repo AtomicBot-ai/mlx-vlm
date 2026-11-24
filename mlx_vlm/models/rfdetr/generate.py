@@ -198,7 +198,10 @@ def _box_iou(boxes1: np.ndarray, boxes2: np.ndarray) -> np.ndarray:
 
 
 def _resize_masks(masks: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
-    """Resize mask logits to target size and binarize with smooth edges.
+    """Resize mask logits to target size and binarize.
+
+    Bilinear with half-pixel centers, matching the reference postprocess
+    (``F.interpolate(mode="bilinear", align_corners=False)`` then ``> 0``).
 
     Args:
         masks: (N, mH, mW) mask logits
@@ -211,9 +214,8 @@ def _resize_masks(masks: np.ndarray, target_h: int, target_w: int) -> np.ndarray
     N = masks.shape[0]
     out = np.empty((N, target_h, target_w), dtype=np.uint8)
     for i in range(N):
-        # Cubic interpolation for smoother upscale of logits
         resized = cv2.resize(
-            masks[i], (target_w, target_h), interpolation=cv2.INTER_CUBIC
+            masks[i], (target_w, target_h), interpolation=cv2.INTER_LINEAR
         )
         out[i] = (resized > 0).astype(np.uint8)
     return out

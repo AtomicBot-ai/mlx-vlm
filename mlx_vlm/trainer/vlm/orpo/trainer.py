@@ -5,10 +5,9 @@ from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_map
 
-from ..sft.runtime import _completion_mask, vlm_batch_metrics
-from ..sft.trainer import TrainingArgs
+from ..cross_entropy.runtime import _completion_mask, vlm_batch_metrics
+from ..cross_entropy.trainer import TrainingArgs
 
 
 @dataclass
@@ -101,8 +100,11 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
 def _legacy_task(args, loss_fn, train_on_completions, assistant_id):
     """Adapt historical batches and score-based losses to the common engine."""
     from ...common.task import TrainingTask
-    from ..sft.mtp import add_mtp_loss
-    from ..sft.runtime import _enable_vlm_gradient_checkpointing, _save_vlm_weights
+    from ..cross_entropy.runtime import (
+        _enable_vlm_gradient_checkpointing,
+        _save_vlm_weights,
+    )
+    from ..mtp import add_mtp_loss
 
     def objective(model, batch):
         chosen, rejected = batch["chosen"], batch["rejected"]
@@ -221,20 +223,6 @@ def train_orpo(
         )
     shared_args = _shared_args(args)
     task = _legacy_task(shared_args, loss_fn, train_on_completions, assistant_id)
-    if args.grad_clip is not None:
-
-        def gradients(policy, compile):
-            compute = nn.value_and_grad(policy, task.loss)
-
-            def clipped(*values):
-                result, grad = compute(*values)
-                return result, tree_map(
-                    lambda g: mx.clip(g, -args.grad_clip, args.grad_clip), grad
-                )
-
-            return clipped
-
-        task.value_and_grad_factory = gradients
     return train(
         model,
         optimizer,

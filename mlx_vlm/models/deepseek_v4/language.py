@@ -26,7 +26,14 @@ def make_quantization_config(model):
     mxfp4 = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
     mxfp8 = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
 
-    flat_modules = tree_flatten(model.leaf_modules(), is_leaf=nn.Module.is_module)
+    language_model = getattr(model, "language_model", model)
+    prefix = "language_model." if language_model is not model else ""
+    flat_modules = [
+        (prefix + name, module)
+        for name, module in tree_flatten(
+            language_model.leaf_modules(), is_leaf=nn.Module.is_module
+        )
+    ]
     experts = {
         k: mxfp4
         for k, _ in flat_modules

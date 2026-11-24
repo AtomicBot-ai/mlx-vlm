@@ -47,6 +47,7 @@ class QwenImagePipeline:
             1, self.z_dim, 1, 1, 1
         )
         self.latents_std = mx.array(cfg["latents_std"]).reshape(1, self.z_dim, 1, 1, 1)
+        mx.eval(self.latents_mean, self.latents_std)
         self.quantization_config = _read_quant(self.model_path / "transformer")
         scheduler_path = self.model_path / "scheduler" / "scheduler_config.json"
         scheduler_config = (

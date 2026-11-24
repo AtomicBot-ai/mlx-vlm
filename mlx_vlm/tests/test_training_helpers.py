@@ -4,6 +4,7 @@ import argparse
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -86,6 +87,44 @@ class TrainingHelpersTest(unittest.TestCase):
         )
         self.assertIsNone(gradients)
         self.assertAlmostEqual(model.weight.item(), 9.0)
+
+    def test_distributed_metal_update_clips_after_cpu_reduction(self):
+        group = Mock()
+        group.size.return_value = 2
+        gradient = {"a": mx.array([2.0]), "b": mx.array([4.0], mx.float16)}
+        reduced = {"a": mx.array([6.0]), "b": mx.array([8.0], mx.float16)}
+        events = []
+
+        def average(grads, **options):
+            self.assertIs(grads, gradient)
+            self.assertIs(options["group"], group)
+            self.assertEqual(options["communication_stream"], mx.cpu)
+            self.assertEqual(options["all_reduce_size"], 0)
+            events.append("reduce")
+            return reduced
+
+        def materialize(grads):
+            self.assertIs(grads, reduced)
+            events.append("eval")
+
+        def update(_, grads):
+            # Average two microsteps to [3, 4], then clip the global norm to 2.5.
+            self.assertAlmostEqual(grads["a"].item(), 1.5, places=5)
+            self.assertAlmostEqual(grads["b"].item(), 2.0, places=3)
+            events.append("update")
+
+        with (
+            patch.object(mx.distributed, "init", return_value=group),
+            patch.object(mx.metal, "is_available", return_value=True),
+            patch(
+                "mlx_vlm.trainer.common.utils.average_gradients", side_effect=average
+            ),
+            patch.object(mx, "eval", side_effect=materialize),
+        ):
+            apply_accumulated_gradients(
+                None, None, gradient, steps=2, grad_clip=2.5, optimizer_update=update
+            )
+        self.assertEqual(events, ["reduce", "eval", "update"])
 
     def test_final_partial_gradient_helper(self):
         model = nn.Linear(1, 1, bias=False)

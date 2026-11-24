@@ -14,9 +14,13 @@ KNOWN_DRAFTER_KINDS = {"dflash", "mtp", "eagle3"}
 # Drafter HF ``model_type`` → required round-loop kind. Anything not listed
 # here falls back to ``DEFAULT_DRAFTER_KIND`` when the caller didn't pass one.
 DRAFTER_KIND_BY_MODEL_TYPE = {
+    "bailing_hybrid_mtp": "mtp",
+    "mellum_mtp": "mtp",
     "nemotron_h_mtp": "mtp",
     "deepseek_v4_mtp": "mtp",
+    "ernie5_5_mtp": "mtp",
     "deepseek_v4_dspark": "dflash",
+    "deepseek_v41_dspark": "dflash",
     "mistral_large4_dspark": "dflash",
     "dspark": "dflash",
     "gemma4_dspark": "dflash",
@@ -28,6 +32,7 @@ DRAFTER_KIND_BY_MODEL_TYPE = {
     "glm_moe_dsa_mtp": "mtp",
     "hy_v4_mtp": "mtp",
     "inkling_mtp": "mtp",
+    "inkling2_dspark": "dflash",
     "qwen3_5_mtp": "mtp",
     "qwen4_exp_mtp": "mtp",
     "laguna": "dflash",

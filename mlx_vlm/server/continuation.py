@@ -102,7 +102,7 @@ class Checkpoints:
             if record.session is not None:
                 record.session.pause(record.lease)
 
-    def resume(self, checkpoint, tenant, path):
+    def resume(self, checkpoint, tenant, path, *, record_id=None):
         with self.lock:
             old = self.records.get(checkpoint.get("id"))
             if (
@@ -115,6 +115,13 @@ class Checkpoints:
                     "This response checkpoint is no longer available. Regenerate the response to continue."
                 )
             cursor = checkpoint.get("cursor")
+            if record_id is not None and old.session is not None:
+                # HTTP consumers can lag differently; the synchronized decoder
+                # history is the source of truth, never regenerated text.
+                with old.session.condition:
+                    old.parts = [
+                        getattr(token, "text", "") for token in old.session.history
+                    ]
             if not isinstance(cursor, int) or not 0 <= cursor <= len(old.parts):
                 raise ValueError("Invalid response checkpoint.")
             size = len(old.initial_prefix) + sum(map(len, old.parts[:cursor]))
@@ -135,7 +142,7 @@ class Checkpoints:
             lease = old.session.claim()
             record = copy.copy(old)
             record.lease = lease
-            record.id = uuid.uuid4().hex
+            record.id = record_id or uuid.uuid4().hex
             record.parts = old.parts[:cursor]
             record.touched = time.monotonic()
             record.active = True
@@ -340,12 +347,18 @@ class ContinuationMiddleware:
                     {"error": {"message": str(error)}}, status_code=400
                 )(scope, receive, send)
             tenant = self.read_tenant(connection)
+            from .distributed_schedule import request_scope
+
+            distributed_scope = request_scope.get()
+            record_id = distributed_scope.request_id if distributed_scope else None
             checkpoint = (
                 options.continuation.model_dump() if options.continuation else None
             )
             if checkpoint is not None:
                 try:
-                    record = CHECKPOINTS.resume(checkpoint, tenant, path)
+                    record = CHECKPOINTS.resume(
+                        checkpoint, tenant, path, record_id=record_id
+                    )
                 except (ValueError, TypeError, AttributeError) as error:
                     return await JSONResponse(
                         {"error": {"message": str(error)}}, status_code=409
@@ -360,6 +373,8 @@ class ContinuationMiddleware:
                     body["context_management"] = []
                     raw_body = json.dumps(body).encode()
                 record = Generation(copy.deepcopy(body), tenant, path, active=True)
+                if record_id is not None:
+                    record.id = record_id
                 CHECKPOINTS.add(record)
             state = StreamState(record, checkpoint)
         delivered_body = False
@@ -529,6 +544,11 @@ class ContinuationTokens:
                     token=prefix_token.token,
                     logprobs=prefix_token.logprobs,
                     finish_reason=None,
+                    **(
+                        {"prompt_progress": None}
+                        if hasattr(previous.value, "prompt_progress")
+                        else {}
+                    ),
                 ),
                 previous.decode_progress,
                 0,

@@ -14,7 +14,7 @@ Drop it when upstream honors suppress_tokens.
 Guarded by atomic/tests/test_patches.py::test_suppress_tokens_*.
 
 diff --git a/mlx_vlm/server/generation.py b/mlx_vlm/server/generation.py
-index 59fe84e3..d0f437ca 100644
+index 991d481..eb3caab 100644
 --- a/mlx_vlm/server/generation.py
 +++ b/mlx_vlm/server/generation.py
 @@ -1,3 +1,4 @@
@@ -31,8 +31,8 @@ index 59fe84e3..d0f437ca 100644
  
  import mlx.core as mx
  from fastapi import HTTPException
-@@ -64,6 +65,39 @@ METRICS_HISTORY_LIMIT = 100
- METRICS_RECENT_LIMIT = 32
+@@ -66,6 +67,39 @@ METRICS_RECENT_LIMIT = 32
+ _DRAFT_BLOCK_SIZE_FROM_ENV = object()
  
  
 +# Logit offset large enough to drive a suppressed token's softmax probability to
@@ -71,7 +71,7 @@ index 59fe84e3..d0f437ca 100644
  class PromptTooLongError(ValueError):
      """Raised when a request exceeds the configured server context budget."""
  
-@@ -1049,6 +1083,10 @@ class ResponseGenerator:
+@@ -1092,6 +1126,10 @@ class ResponseGenerator:
      higher throughput — same pattern as mlx-lm's server.
      """
  
@@ -82,7 +82,7 @@ index 59fe84e3..d0f437ca 100644
      def __init__(
          self,
          model_path: str,
-@@ -1074,6 +1112,7 @@ class ResponseGenerator:
+@@ -1121,6 +1159,7 @@ class ResponseGenerator:
          self.processor = None
          self.config = None
          self.stop_tokens = set()
@@ -90,7 +90,7 @@ index 59fe84e3..d0f437ca 100644
          self.vision_cache = vision_cache
          self.draft_model_path = draft_model_path
          self.draft_kind_override = draft_kind
-@@ -1213,6 +1252,9 @@ class ResponseGenerator:
+@@ -1259,6 +1298,9 @@ class ResponseGenerator:
          self.processor = processor
          self.config = config
          self.stop_tokens = stop_tokens
@@ -100,7 +100,7 @@ index 59fe84e3..d0f437ca 100644
          self.draft_model = draft_model
          self.draft_kind = draft_kind
          self.tokenizer = (
-@@ -1584,8 +1626,17 @@ class ResponseGenerator:
+@@ -1685,8 +1727,17 @@ class ResponseGenerator:
      def _make_logits_processors(
          self, args: GenerationArguments, input_ids: Optional[mx.array] = None
      ) -> List[Callable[[mx.array, mx.array], mx.array]]:

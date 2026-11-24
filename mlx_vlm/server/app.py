@@ -1,13 +1,14 @@
 import asyncio
 import gc
+import json
 import logging
 import os
 import secrets
 import sys
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock, RLock
 from types import SimpleNamespace
 from typing import Annotated, List, Literal, Optional, Tuple
 
@@ -17,12 +18,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from huggingface_hub import scan_cache_dir
 from huggingface_hub.errors import CacheNotFound, RepositoryNotFoundError
 from starlette.requests import HTTPConnection
+from starlette.responses import JSONResponse, Response
 
 from .. import apc as _apc
 from ..generate.edit_image import load_image_edit_model
 from ..generate.image import is_image_generation_model, load_image_generation_model
 from ..generate.image_defaults import ImageSamplingDefaults, resolve_image_defaults
 from ..generate.three_d import load_3d_model
+from ..load_progress import LoadingProgress, ModelLoadCancelled
 from ..reranker import RerankerKind, reranker_kind
 from ..structured import build_json_schema_logits_processor
 from ..tools import _infer_tool_parser_from_processor
@@ -41,6 +44,7 @@ from .generation import (
     ResponseGenerator,
     ServerMetricsStore,
     _build_metrics_envelope,
+    _get_draft_block_size_from_env,
     get_configured_context_limit,
     get_kv_group_size,
     get_kv_quant_scheme,
@@ -49,6 +53,7 @@ from .generation import (
     get_quantized_kv_split_bits,
     get_quantized_kv_start,
     get_top_logprobs_k,
+    load_local_drafter,
 )
 from .meshes import register_routes as register_mesh_routes
 from .model_discovery import MODEL_PATHS_ENV, discover_models, model_reasoning_efforts
@@ -87,6 +92,20 @@ def _require_management_api_key(request: HTTPConnection) -> None:
             detail="Invalid API key",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+
+def _require_preload_finished(status_code=503):
+    if runtime.preload_in_progress:
+        raise HTTPException(
+            status_code,
+            {"code": "model_loading", "message": "Startup preloading is in progress"},
+            headers={"Retry-After": "1"},
+        )
+
+
+async def _require_inference_ready(request: HTTPConnection):
+    if request.scope["type"] == "websocket" or request.method not in {"GET", "HEAD"}:
+        _require_preload_finished()
 
 
 def _cache_group_for_cache(cache: dict) -> str:
@@ -170,6 +189,11 @@ def _server_runtime_snapshot() -> dict:
             audio_queue_depth = 0
     return {
         "loaded_model": default_cache.get("model_path", None),
+        "model_ready": (
+            default_cache.get("model_path") is not None
+            and runtime.response_generator is not None
+            and not runtime.preload_in_progress
+        ),
         "loaded_adapter": default_cache.get("adapter_path", None),
         "loaded_models": {
             group: {
@@ -190,6 +214,8 @@ def _server_runtime_snapshot() -> dict:
         "request_queue_depth": queue_depth,
         "audio_queue_depth": audio_queue_depth,
         "preload_failures": dict(runtime.preload_failures),
+        "preload_in_progress": runtime.preload_in_progress,
+        "model_load_progress": runtime.model_load_progress,
         "apc": (
             {"enabled": False}
             if runtime.apc_manager is None
@@ -427,18 +453,24 @@ def load_audio_model(model_path: str):
 
 @asynccontextmanager
 async def lifespan(app):
+    from .distributed_launch import managed_workers
+
+    async with managed_workers(runtime.distributed_coordinator):
+        async with _application_lifespan(app):
+
+            try:
+                yield
+            finally:
+                if runtime.cluster_manager is not None:
+                    await runtime.cluster_manager.close()
+
+
+@asynccontextmanager
+async def _application_lifespan(app):
     model_path = os.environ.pop("MLX_VLM_PRELOAD_MODEL", None)
     adapter_path = os.environ.pop("MLX_VLM_PRELOAD_ADAPTER", None)
-    if model_path:
-        logger.info("Pre-loading language model: %s", model_path)
-        get_cached_model(model_path, adapter_path, model_kind="text_generation")
-        kv_bits = os.environ.get("KV_BITS")
-        kv_scheme = os.environ.get("KV_QUANT_SCHEME", "uniform")
-        if kv_bits:
-            logger.info("KV cache quantization: bits=%s scheme=%s", kv_bits, kv_scheme)
-        logger.info("Language model ready, continuous batching enabled.")
-
     preload_models = (
+        (model_path, adapter_path, "text_generation", "language model"),
         (
             os.environ.pop("MLX_VLM_PRELOAD_MESH_MODEL", None),
             None,
@@ -483,43 +515,83 @@ async def lifespan(app):
         ),
     )
     runtime.preload_failures.clear()
-    for preload_model_path, preload_adapter_path, model_kind, label in preload_models:
-        if not preload_model_path:
-            continue
-        logger.info("Pre-loading %s: %s", label, preload_model_path)
-        try:
-            get_cached_model(
-                preload_model_path,
-                preload_adapter_path,
-                model_kind=model_kind,
-            )
-        except Exception as e:
-            reason = getattr(e, "detail", None) or str(e)
-            runtime.preload_failures[model_kind] = {
-                "model": preload_model_path,
-                "label": label,
-                "error": str(reason),
-            }
-            logger.error(
-                "Failed to pre-load %s %r: %s. Continuing without it.",
-                label,
-                preload_model_path,
-                reason,
-            )
-            continue
-        logger.info("%s ready.", label.capitalize())
-    async with checkpoint_cleanup():
-        try:
+    runtime.preload_in_progress = any(item[0] for item in preload_models)
+    if model_path:
+        # Seed a snapshot before yielding startup, even if the loader is not scheduled yet.
+        progress = LoadingProgress(model_path)
+        progress("starting", adapter_path=adapter_path)
+        runtime.model_load_progress = progress.snapshot
+    stopping = Event()
+    preload_task = asyncio.create_task(_preload_models(preload_models, stopping))
+    try:
+        async with checkpoint_cleanup():
             yield
+    finally:
+        stopping.set()
+        try:
+            # The loading observer aborts at the next safe boundary. Join its
+            # cleanup before clearing caches, even if shutdown itself is cancelled.
+            try:
+                await asyncio.shield(preload_task)
+            except asyncio.CancelledError:
+                await preload_task
+                raise
         finally:
-            if runtime.mesh_jobs is not None:
-                await asyncio.to_thread(runtime.mesh_jobs.shutdown)
-            if runtime.audio_queue is not None:
-                runtime.audio_queue.stop_and_join()
-                runtime.audio_queue = None
-            if runtime.realtime_engine is not None:
-                runtime.realtime_engine.stop_and_join()
-                runtime.realtime_engine = None
+            await asyncio.to_thread(unload_model_sync)
+
+
+async def _preload_models(models, stopping):
+    try:
+        for model_path, adapter_path, model_kind, label in models:
+            if stopping.is_set():
+                break
+            if not model_path:
+                continue
+            logger.info("Pre-loading %s: %s", label, model_path)
+            try:
+                # Distributed collectives must keep rank decisions synchronized;
+                # their lifecycle is owned by the distributed coordinator.
+                cancel_kwargs = (
+                    {"cancel_event": stopping}
+                    if model_kind == "text_generation"
+                    and runtime.distributed_worker is None
+                    else {}
+                )
+                await asyncio.to_thread(
+                    get_cached_model,
+                    model_path,
+                    adapter_path,
+                    model_kind=model_kind,
+                    **cancel_kwargs,
+                )
+            except ModelLoadCancelled:
+                logger.info("Startup preload cancelled: %s", model_path)
+                break
+            except Exception as e:
+                reason = getattr(e, "detail", None) or str(e)
+                if model_kind == "text_generation":
+                    runtime.model_load_progress = {
+                        **(runtime.model_load_progress or {}),
+                        "stage": "failed",
+                        "stage_percent": None,
+                        "updated_at": time.time(),
+                    }
+                runtime.preload_failures[model_kind] = {
+                    "model": model_path,
+                    "label": label,
+                    "error": str(reason),
+                }
+                logger.error("Failed to pre-load %s %r: %s", label, model_path, reason)
+                continue
+            logger.info("%s ready.", label.capitalize())
+            if model_kind == "text_generation" and os.environ.get("KV_BITS"):
+                logger.info(
+                    "KV cache quantization: bits=%s scheme=%s",
+                    os.environ["KV_BITS"],
+                    os.environ.get("KV_QUANT_SCHEME", "uniform"),
+                )
+    finally:
+        runtime.preload_in_progress = False
 
 
 app = FastAPI(
@@ -529,7 +601,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 inference_router = APIRouter(
-    dependencies=[Depends(_require_management_api_key)],
+    dependencies=[
+        Depends(_require_management_api_key),
+        Depends(_require_inference_ready),
+    ],
 )
 
 app.add_middleware(
@@ -538,7 +613,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["X-MLX-Continuation"],
+    expose_headers=["X-MLX-Continuation", "X-MLX-Finish-Reason"],
 )
 app.add_middleware(
     ContinuationMiddleware,
@@ -621,17 +696,71 @@ def _audio_cache_group(model_kind: str) -> str:
     return "audio"
 
 
+_model_load_lock = RLock()
+
+
 def get_cached_model(
     model_path: str,
     adapter_path=_INHERIT_ADAPTER,
     *,
     model_kind: str = "auto",
     revision: str | None = None,
+    cancel_event: Optional[Event] = None,
+):
+    # Text loading runs off the HTTP loop; concurrent callers reuse one loader.
+    # Dedicated audio/image workers retain their own initialization lifecycle.
+    with (
+        _model_load_lock
+        if runtime.distributed_worker is not None
+        or model_kind in ("auto", "text_generation")
+        else nullcontext()
+    ):
+        return _get_cached_model(
+            model_path,
+            adapter_path,
+            model_kind=model_kind,
+            revision=revision,
+            cancel_event=cancel_event,
+        )
+
+
+def _draft_generator_options(draft):
+    """Resolve serving policy before handing draft loading to the GPU thread."""
+    worker = runtime.distributed_worker
+    if worker is not None:
+        return dict(
+            draft_model_path=draft.model if draft is not None else None,
+            draft_kind=draft.kind if draft is not None else None,
+            draft_block_size=draft.block_size if draft is not None else None,
+            draft_loader=worker.load_drafter if draft is not None else None,
+        )
+    cfg = runtime.config
+    return dict(
+        draft_model_path=cfg.draft_model or os.environ.get("MLX_VLM_DRAFT_MODEL"),
+        draft_kind=cfg.draft_kind or os.environ.get("MLX_VLM_DRAFT_KIND"),
+        draft_block_size=_get_draft_block_size_from_env(),
+        draft_loader=load_local_drafter,
+    )
+
+
+def _get_cached_model(
+    model_path: str,
+    adapter_path=_INHERIT_ADAPTER,
+    *,
+    model_kind: str = "auto",
+    revision: str | None = None,
+    cancel_event: Optional[Event] = None,
 ):
     """
     Factory function to get or load the appropriate model resources from cache or by loading.
     Also creates/updates the ResponseGenerator for continuous batching.
     """
+
+    def check_cancelled():
+        if cancel_event is not None and cancel_event.is_set():
+            raise ModelLoadCancelled("Server is shutting down")
+
+    check_cancelled()
     load_as_edit = model_kind == "image_edit"
     load_as_audio = _audio_model_kind(model_kind)
     load_as_embedding = model_kind == "embedding"
@@ -678,6 +807,13 @@ def get_cached_model(
         effective_model_kind,
         runtime.config.fingerprint(kinds={effective_model_kind}),
     )
+    draft = None
+    if runtime.distributed_worker is not None:
+        from .distributed_schedule import request_scope
+
+        scope = request_scope.get()
+        draft = scope.draft if scope is not None else None
+        cache_key += (draft.model_dump_json() if draft is not None else None,)
     if revision is not None:
         cache_key += (revision,)
     cached_cache = registry.for_kind(cache_group)
@@ -1014,27 +1150,42 @@ def get_cached_model(
         overrides=cfg.apc_overrides(),
     )
 
-    response_generator = ResponseGenerator(
-        model_path=model_path,
-        adapter_path=adapter_path,
-        vision_cache=vision_cache,
-        kv_bits=kv_bits,
-        kv_key_bits=kv_key_bits,
-        kv_value_bits=kv_value_bits,
-        kv_key_scheme=kv_key_scheme,
-        kv_value_scheme=kv_value_scheme,
-        kv_group_size=kv_group_size,
-        kv_quant_scheme=kv_quant_scheme,
-        quantized_kv_start=quantized_kv_start,
-        top_logprobs_k=get_top_logprobs_k(),
-        apc_manager=runtime.apc_manager,
-        draft_model_path=cfg.draft_model,
-        draft_kind=cfg.draft_kind,
-    )
+    def publish_loading(event):
+        if event["stage"] not in ("failed", "cancelled", "ready"):
+            check_cancelled()
+        runtime.model_load_progress = {**event, "adapter_path": adapter_path}
+
+    progress = LoadingProgress(model_path, publish_loading)
+    response_generator = None
     try:
+        progress("starting")
+        draft_options = _draft_generator_options(draft)
+        response_generator = ResponseGenerator(
+            model_path=model_path,
+            adapter_path=adapter_path,
+            vision_cache=vision_cache,
+            kv_bits=kv_bits,
+            kv_key_bits=kv_key_bits,
+            kv_value_bits=kv_value_bits,
+            kv_key_scheme=kv_key_scheme,
+            kv_value_scheme=kv_value_scheme,
+            kv_group_size=kv_group_size,
+            kv_quant_scheme=kv_quant_scheme,
+            quantized_kv_start=quantized_kv_start,
+            top_logprobs_k=get_top_logprobs_k(),
+            apc_manager=runtime.apc_manager,
+            **draft_options,
+            load_progress_callback=progress.update,
+        )
         model, processor, config = response_generator.wait_until_ready()
-    except Exception:
-        response_generator.stop_and_join()
+        check_cancelled()
+    except Exception as error:
+        progress("cancelled" if isinstance(error, ModelLoadCancelled) else "failed")
+        if response_generator is not None:
+            response_generator.stop_and_join()
+        elif runtime.apc_manager is not None:
+            runtime.apc_manager.close()
+        runtime.apc_manager = None
         vision_cache.clear()
         raise
 
@@ -1060,6 +1211,7 @@ def get_cached_model(
     registry.set(cache_group, cache)
     runtime.response_generator = response_generator
     runtime.apc_manager = cache["apc_manager"]
+    progress("ready")
 
     return model, processor, config
 
@@ -1094,6 +1246,7 @@ def unload_model_sync():
 
     runtime.response_generator = None
     runtime.apc_manager = None
+    runtime.model_load_progress = None
     gc.collect()
     mx.clear_cache()
     if unloaded_any:
@@ -1222,6 +1375,117 @@ async def add_server_header(request: Request, call_next):
     return response
 
 
+@app.middleware("http")
+async def route_distributed_request(request: Request, call_next):
+    from .distributed import CANCEL_ROUTE, REQUEST_HEADER, ROUTES
+
+    path = request.url.path
+    worker = runtime.distributed_worker
+    if path == "/internal/distributed/session":
+        return await call_next(request)
+    if path == CANCEL_ROUTE and request.method == "POST" and worker is not None:
+        try:
+            _require_management_api_key(request)
+            body = await request.json()
+            request_id = body.get("request_id") if isinstance(body, dict) else None
+            if (
+                not isinstance(request_id, str)
+                or len(request_id) != 32
+                or any(c not in "0123456789abcdef" for c in request_id)
+            ):
+                raise HTTPException(422, "Invalid distributed request ID")
+            worker.remember_cancellations([request_id])
+            from . import continuation
+
+            with continuation.CHECKPOINTS.lock:
+                record = continuation.CHECKPOINTS.records.get(request_id)
+            if (
+                record is not None
+                and record.session is not None
+                and record.lease == record.session.lease
+            ):
+                record.session.dispose("Distributed request cancelled")
+            return JSONResponse({"cancelled": request_id}, 202)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return JSONResponse({"detail": "Invalid cancellation body"}, 422)
+        except HTTPException as error:
+            return JSONResponse({"detail": error.detail}, error.status_code)
+    if request.method != "POST":
+        if worker is not None and request.method not in {"GET", "HEAD", "OPTIONS"}:
+            return JSONResponse(
+                {"detail": "Distributed worker settings are fixed at startup"}, 400
+            )
+        return await call_next(request)
+    if path not in ROUTES:
+        if worker is not None:
+            return JSONResponse(
+                {"detail": "This endpoint is unavailable on a distributed worker"}, 400
+            )
+        return await call_next(request)
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return await call_next(request)
+    if not isinstance(body, dict):
+        return await call_next(request)
+    requested = body.get("distributed", False)
+    if not isinstance(requested, bool):
+        return JSONResponse({"detail": "distributed must be a boolean"}, 422)
+    if not requested:
+        if worker is not None:
+            return JSONResponse(
+                {"detail": "Send requests through the distributed coordinator"}, 400
+            )
+        return await call_next(request)
+    try:
+        # Authenticate before downloading, transferring or loading anything.
+        _require_management_api_key(request)
+        _require_preload_finished()
+        if worker is not None:
+            from .distributed_schedule import RequestScope, request_scope
+
+            request_id = request.headers.get(REQUEST_HEADER, "")
+            if len(request_id) != 32 or any(
+                c not in "0123456789abcdef" for c in request_id
+            ):
+                raise HTTPException(
+                    400, "Send requests through the distributed coordinator"
+                )
+            from pydantic import ValidationError
+
+            from .cluster_types import SpeculativeDraft
+
+            try:
+                draft = (
+                    SpeculativeDraft.model_validate(body["_distributed_draft"])
+                    if body.get("_distributed_draft") is not None
+                    else None
+                )
+            except ValidationError as error:
+                raise HTTPException(
+                    422, "Invalid coordinated draft configuration"
+                ) from error
+            token = request_scope.set(RequestScope(request_id, draft=draft))
+            try:
+                return await call_next(request)
+            finally:
+                request_scope.reset(token)
+        coordinator = runtime.distributed_coordinator
+        if coordinator is None:
+            raise HTTPException(
+                503, "Configure --distributed-config to use distributed=true"
+            )
+        result = await coordinator.relay(path, body, _read_tenant_id(request))
+        if isinstance(result, Response):
+            return result
+        payload, status = result
+        return JSONResponse(payload, status_code=status)
+    except HTTPException as exc:
+        return JSONResponse(
+            {"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers
+        )
+
+
 @app.get("/health")
 async def health_check(request: Request):
     """
@@ -1229,9 +1493,13 @@ async def health_check(request: Request):
     """
     _require_management_api_key(request)
     runtime = _server_runtime_snapshot()
-    return {
+    result = {
         "status": "healthy",
         "loaded_model": runtime["loaded_model"],
+        "model_ready": runtime["model_ready"],
+        "preload_in_progress": runtime["preload_in_progress"],
+        "preload_failures": runtime["preload_failures"],
+        "model_load_progress": runtime["model_load_progress"],
         "loaded_adapter": runtime["loaded_adapter"],
         "loaded_models": runtime["loaded_models"],
         "loaded_context_size": runtime["loaded_context_size"],
@@ -1241,6 +1509,11 @@ async def health_check(request: Request):
         "continuous_batching_enabled": runtime["continuous_batching_enabled"],
         "apc_enabled": runtime["apc"]["enabled"],
     }
+    from .runtime import runtime as server_runtime
+
+    if server_runtime.distributed_worker is not None:
+        result["distributed_worker"] = server_runtime.distributed_worker.info()
+    return result
 
 
 @app.get("/metrics")
@@ -1317,6 +1590,7 @@ async def get_runtime_settings(request: Request):
 @app.patch("/settings", include_in_schema=False)
 async def update_runtime_settings(request: Request):
     _require_management_api_key(request)
+    _require_preload_finished(409)
     payload = await request.json()
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="body must be a JSON object")
@@ -1341,21 +1615,33 @@ async def unload_model_endpoint(request: Request):
     Unload the currently loaded model from memory.
     """
     _require_management_api_key(request)
-    snapshot = _server_runtime_snapshot()
-    unloaded_info = {
-        "model_name": snapshot["loaded_model"],
-        "adapter_name": snapshot["loaded_adapter"],
-        "models": snapshot["loaded_models"],
-    }
+    # Loading now yields the HTTP loop. Do not unload a half-initialized model.
+    _require_preload_finished(409)
+    if not _model_load_lock.acquire(blocking=False):
+        raise HTTPException(
+            409, {"code": "model_loading", "message": "Retry after loading finishes"}
+        )
+    try:
+        snapshot = _server_runtime_snapshot()
+        unloaded_info = {
+            "model_name": snapshot["loaded_model"],
+            "adapter_name": snapshot["loaded_adapter"],
+            "models": snapshot["loaded_models"],
+        }
 
-    if not unload_model_sync():  # Use the synchronous unload function
-        return {"status": "no_model_loaded", "message": "No model is currently loaded"}
+        if not unload_model_sync():  # Use the synchronous unload function
+            return {
+                "status": "no_model_loaded",
+                "message": "No model is currently loaded",
+            }
 
-    return {
-        "status": "success",
-        "message": "Model unloaded successfully",
-        "unloaded": unloaded_info,
-    }
+        return {
+            "status": "success",
+            "message": "Model unloaded successfully",
+            "unloaded": unloaded_info,
+        }
+    finally:
+        _model_load_lock.release()
 
 
 def main():
@@ -1366,3 +1652,38 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def _require_cluster_api_key(request: HTTPConnection) -> None:
+    # Mutation and worker identity must never silently become unauthenticated.
+    if _server_api_key() is None:
+        raise HTTPException(
+            503, "Set MLX_VLM_SERVER_API_KEY to enable cluster management"
+        )
+    _require_management_api_key(request)
+
+
+from .cluster import router as _cluster_router
+
+app.include_router(_cluster_router(_require_cluster_api_key))
+
+from .distributed_sessions import router as _session_router
+
+app.include_router(_session_router(_require_cluster_api_key))
+
+
+_cluster_openapi = app.openapi
+
+
+def _openapi_with_stream_events():
+    schema = _cluster_openapi()
+    from .cluster_types import ClusterEvent, GenerationProgress, PromptProgress
+
+    for event in (ClusterEvent, GenerationProgress, PromptProgress):
+        schema["components"]["schemas"][event.__name__] = event.model_json_schema(
+            ref_template="#/components/schemas/{model}"
+        )
+    return schema
+
+
+app.openapi = _openapi_with_stream_events

@@ -66,7 +66,11 @@ class Model(nn.Module):
         )
 
         position_ids, rope_deltas = self.language_model.get_rope_index(
-            input_ids, image_grid_thw, video_grid_thw, mask
+            input_ids,
+            image_grid_thw,
+            video_grid_thw,
+            mask,
+            kwargs.get("second_per_grid_ts", None),
         )
 
         return InputEmbeddingsFeatures(

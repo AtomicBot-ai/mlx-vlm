@@ -18,7 +18,7 @@ class DoRALinear(nn.Module):
         # on linear and quantized linear
         output_dims, input_dims = linear.weight.shape
         if isinstance(linear, nn.QuantizedLinear):
-            input_dims *= 32 // linear.bits
+            input_dims = input_dims * 32 // linear.bits
         dora_lin = DoRALinear(
             input_dims=input_dims,
             output_dims=output_dims,
@@ -137,8 +137,7 @@ class DoRAEmbedding(nn.Module):
     ):
         num_embeddings, dims = embedding.weight.shape
 
-        # TODO support quantized weights in DoRALinear
-        if isinstance(embedding, nn.QuantizedLinear):
+        if isinstance(embedding, nn.QuantizedEmbedding):
             raise ValueError("DoRAEmbedding does not yet support quantization.")
         dora_embedding = DoRAEmbedding(
             num_embeddings=num_embeddings,

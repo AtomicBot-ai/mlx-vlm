@@ -5,7 +5,6 @@ configuration, model preparation, and optimization lifecycle live in ``common``.
 """
 
 import json
-import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Union
@@ -74,12 +73,11 @@ def get_learning_rate(
     learning_rate: float,
     min_learning_rate: float,
 ):
-    if step < warmup_steps:
-        return learning_rate * (step / warmup_steps)
+    from mlx_vlm.trainer.common.utils import get_learning_rate as _get_learning_rate
 
-    progress = (step - warmup_steps) / (iters - warmup_steps)
-    cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
-    return min_learning_rate + (learning_rate - min_learning_rate) * cosine_decay
+    return _get_learning_rate(
+        iters, step, warmup_steps, learning_rate, min_learning_rate
+    )
 
 
 def get_module_by_name(model, name):

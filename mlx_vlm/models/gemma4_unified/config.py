@@ -3,6 +3,7 @@ from typing import Dict, List, Optional
 
 from ..base import BaseModelConfig
 from ..gemma4.config import TextConfig as Gemma4TextConfig
+from ..gemma4.config import apply_per_layer_config
 
 
 @dataclass
@@ -78,6 +79,7 @@ class TextConfig(Gemma4TextConfig):
             self.layer_types = (pattern * (self.num_hidden_layers // len(pattern) + 1))[
                 : self.num_hidden_layers
             ]
+        apply_per_layer_config(self)
 
 
 @dataclass
