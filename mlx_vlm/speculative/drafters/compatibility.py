@@ -32,11 +32,13 @@ def validate_dflash_target(config, target_model, algorithm: str) -> None:
         if layers is not None
         else _config_value(target_config, "num_hidden_layers")
     )
-    if layer_count != config.num_target_layers:
+    if config.num_target_layers is not None and layer_count != config.num_target_layers:
         raise ValueError(
             f"{algorithm} target layer-count mismatch: "
             f"draft={config.num_target_layers}, target={layer_count}."
         )
+    if layer_count is None or any(i >= layer_count for i in config.target_layer_ids):
+        raise ValueError(f"{algorithm} target layer indices exceed the target depth.")
     vocab_size = _config_value(target_config, "vocab_size")
     if vocab_size != config.vocab_size:
         raise ValueError(

@@ -58,6 +58,8 @@ class InferenceSession:
         self.source = source
         self.producer_lock = Lock()
         self.owner = None
+        self.distributed_state = "running"
+        self.distributed_ack = "running"
         self._generation_seconds = 0.0
         self._step_started_at = None
         self._first_token_at = None

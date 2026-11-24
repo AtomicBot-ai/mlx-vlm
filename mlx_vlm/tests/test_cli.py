@@ -94,14 +94,84 @@ import mlx_vlm
 def test_cli_boolean_and_thinking_flags(entrypoint, default):
     parser = _capture_parser(entrypoint)
     assert parser.parse_args([]).verbose is default
+    assert parser.parse_args([]).enable_thinking is None
     assert parser.parse_args([]).thinking_mode is None
     for flag, expected in [("--verbose", True), ("--no-verbose", False)]:
         assert parser.parse_args([flag]).verbose is expected
+    for flag, expected in [
+        ("--enable-thinking", True),
+        ("--no-enable-thinking", False),
+    ]:
+        assert parser.parse_args([flag]).enable_thinking is expected
     for mode in ("enabled", "disabled", "adaptive"):
         assert parser.parse_args(["--thinking-mode", mode]).thinking_mode == mode
     with pytest.raises(SystemExit) as error:
         parser.parse_args(["--thinking-mode", "invalid"])
     assert error.value.code == 2
+
+
+@pytest.mark.parametrize(
+    "flag,value",
+    [(None, None), ("--enable-thinking", True), ("--no-enable-thinking", False)],
+)
+def test_text_cli_preserves_thinking_default(flag, value):
+    args = _args(*([flag] if flag else []))
+    with _text_cli(args) as mocks:
+        dispatch.main()
+    for called in (mocks.apply_chat_template, mocks.generate):
+        kwargs = called.call_args.kwargs
+        if value is None:
+            assert "enable_thinking" not in kwargs
+        else:
+            assert kwargs["enable_thinking"] is value
+
+
+@pytest.mark.parametrize(
+    "flag,value",
+    [(None, None), ("--enable-thinking", True), ("--no-enable-thinking", False)],
+)
+def test_chat_cli_preserves_thinking_default(flag, value):
+    with (
+        patch.object(sys, "argv", ["mlx_vlm.chat", *([flag] if flag else [])]),
+        patch.object(chat, "MLXVisionChat") as session,
+    ):
+        chat.main()
+    kwargs = session.call_args.kwargs
+    if value is None:
+        assert "enable_thinking" not in kwargs
+    else:
+        assert kwargs["enable_thinking"] is value
+
+
+@pytest.mark.parametrize("value", [None, True, False])
+def test_vision_chat_preserves_thinking_default(value):
+    kwargs = {} if value is None else {"enable_thinking": value}
+    with (
+        patch.object(
+            chat, "load", return_value=(NS(config=NS(model_type="demo")), NS())
+        ),
+        patch.object(chat, "Console"),
+        patch.object(chat, "rprint"),
+        patch.object(chat.MLXVisionChat, "print_help"),
+        patch.object(chat, "apply_chat_template", return_value="prompt") as template,
+        patch.object(chat, "stream_generate", return_value=[]) as generate,
+    ):
+        session = chat.MLXVisionChat(**kwargs)
+        session.generate_response()
+    for called in (template, generate):
+        if value is None:
+            assert "enable_thinking" not in called.call_args.kwargs
+        else:
+            assert called.call_args.kwargs["enable_thinking"] is value
+
+
+def test_server_prefill_budget_respects_worker_environment(monkeypatch):
+    from mlx_vlm.server.cli import main
+
+    monkeypatch.setenv("PREFILL_STEP_SIZE", "128")
+    parser = _capture_parser(main)
+    assert parser.parse_args([]).prefill_step_size == 128
+    assert parser.parse_args(["--prefill-step-size", "256"]).prefill_step_size == 256
 
 
 def test_cli_reasoning_effort_parsing():

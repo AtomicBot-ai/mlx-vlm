@@ -560,6 +560,96 @@ python -m mlx_vlm.server
 
 See `README.md` for a complete `curl` example.
 
+### Model loading progress
+
+Library clients can observe the native loader without wrapping tensor evaluation:
+
+```python
+from mlx_vlm import load
+
+model, processor = load("/path/to/model", progress_callback=print)
+```
+
+The callback runs synchronously on the loading thread; keep it short or enqueue
+snapshots for the UI. Each snapshot includes `model`, `stage`, `elapsed_seconds`
+(monotonic elapsed time) and `updated_at` (Unix seconds). Optional stage counts are:
+
+| Stage | Measurement |
+| --- | --- |
+| `loading_checkpoint` | `completed_files`, `total_files`: parsed checkpoint files, not resident weight bytes |
+| `evaluating_layers` | `completed_layers`, `total_layers`: layers whose `mx.eval` has finished |
+| `evaluating_remaining_parameters` | Evaluation of remaining parameters, including multimodal modules |
+
+`stage_percent` is `100 * completed / total`, rounded to two decimal places,
+for checkpoint-file parsing and layer evaluation. It is `null` when the stage
+has no measurable total (including zero layers). This percentage describes only
+the current stage: 100% of layers evaluated does not mean the model is ready.
+File counts are not weighted by size, and neither count estimates total loading
+time. Clients should show an indeterminate indicator for stages with `null`.
+
+Other stages identify work without inventing a percentage: `resolving_model`,
+`converting_weights`, `sanitizing_weights`, `installing_weights`, `loading_adapter`
+and `loading_processor`. `loaded` ends library loading; it includes `lazy`, since
+`lazy=True` still defers parameter evaluation. A loading exception emits `failed`
+and is re-raised. A callback can raise `mlx_vlm.load_progress.ModelLoadCancelled`
+to abort at a loader boundary; `load()` emits `cancelled` and re-raises it.
+Without a callback, ordinary whole-model evaluation is unchanged.
+
+For the server's text/multimodal chat loader, poll authenticated `GET /health`
+while the first Chat Completions, Responses or Messages request loads the model.
+A token-count request to `/v1/responses/input_tokens` can also warm it up.
+With `--model`, startup preloading runs in the background, so HTTP can serve
+the same progress while the model loads. The same snapshot is available under
+`server.model_load_progress` in `/metrics`.
+
+```json
+{
+  "model_ready": false,
+  "preload_in_progress": true,
+  "preload_failures": {},
+  "model_load_progress": {
+    "model": "/path/to/model",
+    "adapter_path": null,
+    "stage": "evaluating_layers",
+    "completed_layers": 12,
+    "total_layers": 32,
+    "stage_percent": 37.5,
+    "elapsed_seconds": 4.2,
+    "updated_at": 1794614400.0
+  }
+}
+```
+
+Server stages also include `starting`, `initializing_generator` and `loading_draft`.
+Only `ready` means the generator and cache are ready to serve. The latest snapshot
+remains after readiness or failure; cache hits do not restart it, and `/unload`
+clears it. Unload during initialization returns HTTP 409 with code `model_loading`;
+retry after loading finishes. This is a current snapshot, not an event history or
+loading-cancellation API. Separate image-generation/audio loaders are not covered.
+Distributed workers reuse these measurements and retain their `sharding` and
+`synchronizing` stages through the existing cluster progress API.
+
+During startup preloading, `/health` remains HTTP 200 for liveness, while
+`model_ready` stays false. Local inference and warmup requests return HTTP 503
+with `detail.code: "model_loading"` and `Retry-After: 1`; they do not start another
+loader. `/unload` and settings changes return HTTP 409 until preloading finishes.
+Clients can poll `/health` or `/metrics`, then send their normal inference request
+once `model_ready` is true. This flag describes the local text model; distributed
+readiness remains part of the cluster API.
+
+Configured preloads run sequentially. Failures are recorded in `preload_failures`
+by model kind, including the model path and error, and the HTTP server remains
+available. A failed text load leaves `model_ready: false`; a later inference or
+warmup request can retry loading or choose a different model. The failure record
+describes the startup attempt. Without `--model`, on-demand loading still works.
+Graceful shutdown cancels local text preloading through its existing progress
+callbacks, stopping before the next checkpoint file, layer evaluation or loading
+stage. It releases partial weights, skips remaining preloads and unloads cached
+models; cancellation is not reported as a preload failure. A native operation or
+download already executing must return before cancellation can be observed.
+Separate image/audio loaders without these callbacks still drain their current
+load. Distributed collective shutdown remains coordinated across ranks.
+
 ### Live settings (`/v1/settings`)
 
 Read and change a curated set of server settings at runtime, without a

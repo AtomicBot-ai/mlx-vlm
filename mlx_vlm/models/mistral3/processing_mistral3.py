@@ -203,6 +203,12 @@ class Mistral3Processor(ProcessorMixin):
 
         proc_cfg = _load_json_config("processor_config.json")
         model_cfg = _load_json_config("config.json")
+        if not model_cfg and is_local and (model_path / "params.json").is_file():
+            model_cfg = _load_json_config("params.json")
+            if {"dim", "n_layers", "moe", "dsa"} <= model_cfg.keys():
+                from ..mistral_large4.config import config_from_params
+
+                model_cfg = config_from_params(model_cfg)
         preproc_cfg = _load_json_config("preprocessor_config.json")
 
         proc_kwargs = {}

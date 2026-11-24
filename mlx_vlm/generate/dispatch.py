@@ -1,5 +1,6 @@
 import argparse
 import codecs
+import inspect
 import json
 import logging
 import sys
@@ -12,6 +13,7 @@ import mlx.nn as nn
 from transformers import PreTrainedTokenizer
 
 from .. import apc as _apc
+from .._generation_stream import on_generation_stream
 from ..kv_quant import from_legacy as kv_quant_from_legacy
 from ..models import cache
 from ..prompt_utils import apply_chat_template
@@ -204,7 +206,7 @@ def parse_arguments():
         default=None,
         help=(
             "Prompt expansion model path or Hugging Face repo. Overrides the "
-            "Flux3 upsampler, or enables Ideogram 4 JSON caption expansion."
+            "Flux3 or MiniMax-H3-Image upsampler, or enables Ideogram 4 JSON caption expansion."
         ),
     )
     parser.add_argument(
@@ -612,10 +614,12 @@ def parse_arguments():
     )
     parser.add_argument(
         "--enable-thinking",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help=(
-            "Enable thinking in the chat template. Templates that use "
-            "thinking_mode receive thinking_mode='enabled'."
+            "Enable or disable thinking in the chat template. When omitted, "
+            "use the model's template default. Templates that use thinking_mode "
+            "receive 'enabled' or 'disabled'."
         ),
     )
     parser.add_argument(
@@ -733,6 +737,11 @@ def _prime_cached_prefix_rope_state(
     it when continuing from a non-empty KV cache. If APC trims the prompt to
     only the uncached suffix, the suffix alone is not enough to recompute the
     original prompt's RoPE delta, so derive it from the full prompt first.
+
+    Models that scale video temporal positions by real time (Qwen2.5-VL) take
+    ``second_per_grid_ts``; forward it when the signature accepts it so the
+    primed positions match the prefill that would have run on the full prompt.
+    Other mRoPE models keep their existing positional signature.
     """
     lm = getattr(model, "language_model", None)
     get_rope_index = getattr(lm, "get_rope_index", None)
@@ -741,11 +750,19 @@ def _prime_cached_prefix_rope_state(
     if not (hasattr(lm, "_rope_deltas") or hasattr(lm, "_position_ids")):
         return True
     try:
+        rope_kwargs: Dict[str, Any] = {}
+        seconds = kwargs.get("second_per_grid_ts")
+        if (
+            seconds is not None
+            and "second_per_grid_ts" in inspect.signature(get_rope_index).parameters
+        ):
+            rope_kwargs["second_per_grid_ts"] = seconds
         position_ids, rope_deltas = get_rope_index(
             full_input_ids,
             kwargs.get("image_grid_thw", None),
             kwargs.get("video_grid_thw", None),
             mask,
+            **rope_kwargs,
         )
     except Exception as e:
         logger.warning(
@@ -811,6 +828,7 @@ def _prefix_cache_trim_amount(kv_cache: List[Any], prefix_len: int) -> Optional[
 from .ar import generate_step
 
 
+@on_generation_stream
 def stream_generate(
     model: nn.Module,
     processor: ProcessorLike | PreTrainedTokenizer,
@@ -854,7 +872,8 @@ def stream_generate(
     thinking_start_token = kwargs.pop(
         "thinking_start_token", DEFAULT_THINKING_START_TOKEN
     )
-    enable_thinking = kwargs.pop("enable_thinking", False)
+    # With no override, track thinking only when a delimiter actually opens it.
+    enable_thinking = kwargs.pop("enable_thinking", None) is not False
 
     # Skip special tokens
     skip_special_tokens = kwargs.pop("skip_special_tokens", False)
@@ -952,6 +971,10 @@ def stream_generate(
         else:
             apc_coordinator.prepare_prefill(len(full_input_ids_list))
 
+    video_timing = ()
+    if apc_manager is not None or prompt_cache_state is not None:
+        video_timing = _apc.video_timing_key(kwargs)
+
     if apc_manager is not None:
         image_hash = _apc.hash_image_payload(pixel_values=pixel_values, image_ref=image)
         audio_features = kwargs.get("input_features")
@@ -962,6 +985,7 @@ def stream_generate(
             media={
                 "audio": audio_features if audio_features is not None else audio,
                 "video": video_features if video_features is not None else video,
+                "second_per_grid_ts": video_timing,
                 "embeddings": custom_inputs_embeds,
                 "masks": custom_mask,
             },
@@ -970,7 +994,9 @@ def stream_generate(
         )
 
     if prompt_cache_state is not None and prompt_cache_state.cache is not None:
-        prefix_len = prompt_cache_state.find_prefix_length(full_input_ids_list)
+        prefix_len = prompt_cache_state.find_prefix_length(
+            full_input_ids_list, video_timing=video_timing
+        )
         kv_cache = prompt_cache_state.cache
         # None => a cache can't be trimmed back to the shared prefix (wrapped
         # rotating window); reusing it would corrupt state, so cold-prefill instead.
@@ -1039,9 +1065,16 @@ def stream_generate(
         thinking_start_token_id = tokenizer.encode(
             thinking_start_token, add_special_tokens=False
         )[-1]
-        prompt_preopens_thinking = (
-            thinking_start_token_id in input_ids.flatten().tolist()
-        )
+        thinking_end_token_id = tokenizer.encode(
+            thinking_end_token, add_special_tokens=False
+        )[-1]
+        prompt_preopens_thinking = False
+        for token_id in reversed(full_input_ids_list):
+            if token_id == thinking_start_token_id:
+                prompt_preopens_thinking = True
+                break
+            if token_id == thinking_end_token_id:
+                break
         tokenizer.thinking_budget_criteria = ThinkingBudgetCriteria(
             tokenizer=tokenizer,
             thinking_budget=thinking_budget,
@@ -1183,7 +1216,7 @@ def stream_generate(
             all_ids = full_input_ids_list + [
                 t.item() if hasattr(t, "item") else t for t in generated_tokens
             ]
-            prompt_cache_state.update(all_ids, tracked_cache)
+            prompt_cache_state.update(all_ids, tracked_cache, video_timing=video_timing)
 
         # APC: harvest new blocks from the post-generation KV state.
         if apc_coordinator is not None and not apc_coordinator.is_checkpoint:
@@ -1507,7 +1540,9 @@ def main():
     num_images = len(args.image) if args.image is not None else 0
     num_audios = len(args.audio) if args.audio is not None else 0
 
-    chat_template_kwargs = {"enable_thinking": args.enable_thinking}
+    chat_template_kwargs = {}
+    if args.enable_thinking is not None:
+        chat_template_kwargs["enable_thinking"] = args.enable_thinking
     if output_modality == "audio":
         chat_template_kwargs["use_tts_template"] = True
     if args.thinking_mode is not None:
@@ -1556,7 +1591,8 @@ def main():
         kwargs.update(args.gen_kwargs)
 
     # Add thinking kwargs
-    kwargs["enable_thinking"] = args.enable_thinking
+    if args.enable_thinking is not None:
+        kwargs["enable_thinking"] = args.enable_thinking
     if args.thinking_budget is not None:
         kwargs["thinking_budget"] = args.thinking_budget
         kwargs["thinking_end_token"] = args.thinking_end_token

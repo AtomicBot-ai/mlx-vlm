@@ -5,7 +5,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import InputEmbeddingsFeatures, LanguageModelOutput
-from .config import ModelConfig
+from .config import ModelConfig, validate_sharding
 from .language import LanguageModel
 from .vision import Aligner, ViT
 
@@ -247,6 +247,11 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.language_model.layers
+
+    def shard(self, group=None):
+        group = group or mx.distributed.init()
+        validate_sharding(self.config.to_dict(), group.size())
+        self.language_model.shard(group)
 
     def make_cache(self):
         return self.language_model.make_cache()

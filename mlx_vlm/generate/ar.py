@@ -17,6 +17,7 @@ import mlx.nn as nn
 from tqdm import tqdm
 
 from .. import apc as _apc
+from .._generation_stream import on_generation_stream
 from ..kv_quant import from_legacy as kv_quant_from_legacy
 from ..models import cache
 from ..prompt_utils import apply_chat_template
@@ -168,6 +169,7 @@ def normalize_resize_shape(values):
     return (values[0], values[0]) if len(values) == 1 else tuple(values)
 
 
+@on_generation_stream
 def generate_step(
     input_ids: mx.array,
     model: nn.Module,
@@ -958,6 +960,8 @@ def _make_cache(
                     "disable KV quantization for continuous batching"
                 )
             return c.to_batch(left_padding)
+        if isinstance(c, cache.AttentionSinkKVCache) and c.max_size is not None:
+            return cache.BatchRotatingKVCache(c.max_size, left_padding)
         if isinstance(c, cache.KVCache):
             if kv_bits is not None and quantize:
                 return _make_quant_cache(left_padding)
@@ -2400,6 +2404,9 @@ class PromptProcessingBatch:
                 self._finished_prompt_logits[self.uids[i]] = mx.contiguous(
                     mx.array(logits[i, -1])
                 )
+            del logits
+        # Unused lazy logits can retain previous KV buffers during admission.
+        del output
         eval_targets = [c.state for c in self.prompt_cache]
         eval_targets.extend(
             self._finished_prompt_logits[self.uids[i]] for i in finished_rows
@@ -2865,6 +2872,7 @@ class BatchGenerator:
             media={
                 "audio": prompt_kwargs.get("input_features"),
                 "video": prompt_kwargs.get("pixel_values_videos"),
+                "second_per_grid_ts": _apc.video_timing_key(prompt_kwargs),
                 "embeddings": prompt_kwargs.get("inputs_embeds"),
                 "masks": prompt_kwargs.get("attention_mask"),
             },

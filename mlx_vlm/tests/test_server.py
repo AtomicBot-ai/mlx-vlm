@@ -52,6 +52,7 @@ from mlx_vlm import apc, sample_utils
 from mlx_vlm.apc import hash_image_payload
 from mlx_vlm.generate import GenerationResult
 from mlx_vlm.generate.image import ImageGenerationResult
+from mlx_vlm.load_progress import ModelLoadCancelled
 from mlx_vlm.models.cache import KVCache
 from mlx_vlm.models.gpt_oss.processing_gpt_oss import (
     HARMONY_RESPONSE_TEMPLATE,
@@ -212,29 +213,61 @@ _MUSE_RESPONSE_TEMPLATE = {
 }
 
 
-class _MuseResponseTemplateTokenizer:
-    response_template = _MUSE_RESPONSE_TEMPLATE
+class _ResponseTemplateTokenizer:
+    def __init__(self, template):
+        self.response_template = copy.deepcopy(template)
 
-    def parse_response(self, response, prefix=None):
-        return parse_response(response, self.response_template, prefix=prefix)
+    def parse_response(self, response, schema=None, *, prefix=None):
+        return parse_response(response, schema or self.response_template, prefix=prefix)
 
-    def get_response_parser(self, prefix=None):
-        return ResponseParser(self.response_template, prefix=prefix)
+    def get_response_parser(self, response_template=None, *, prefix=None):
+        return ResponseParser(
+            response_template or self.response_template, prefix=prefix
+        )
 
 
-class _HarmonyResponseTemplateTokenizer:
-    response_template = HARMONY_RESPONSE_TEMPLATE
-
-    def parse_response(self, response, prefix=None):
-        return parse_response(response, self.response_template, prefix=prefix)
-
-    def get_response_parser(self, prefix=None):
-        return ResponseParser(self.response_template, prefix=prefix)
+# The response template shipped in Inkling 2's tokenizer_config.json.
+_INKLING_HEADER = r"(?:<\|message_model\|>[^<]*)?"
+_INKLING_RESPONSE_TEMPLATE = {
+    "defaults": {"role": "assistant"},
+    "start_anchor_pattern": r"<\|end_message\|>|<\|content_model_end_sampling\|>",
+    "fields": {
+        "reasoning_content": {
+            "open_pattern": _INKLING_HEADER + r"<\|content_thinking\|>",
+            "close": "<|end_message|>",
+            "repeats": True,
+            "join": "",
+            "content": "text",
+            "content_args": {"strip": False},
+        },
+        "content": {
+            "open_pattern": _INKLING_HEADER
+            + r"<\|content_(?:text|tool_error|invoke_tool_text)\|>",
+            "close": "<|end_message|>",
+            "repeats": True,
+            "join": "",
+            "content": "text",
+            "content_args": {"strip": False},
+        },
+        "tool_calls": {
+            "open_pattern": _INKLING_HEADER + r"<\|content_invoke_tool_json\|>",
+            "close": "<|end_message|>",
+            "repeats": True,
+            "content": "json",
+            "transform": {
+                "type": "function",
+                "function": {"name": "{content.name}", "arguments": "{content.args}"},
+            },
+        },
+    },
+}
 
 
 def _harmony_processor():
     """A processor prepared exactly as the gpt-oss loader prepares it."""
-    return _attach_harmony_template(NS(tokenizer=_HarmonyResponseTemplateTokenizer()))
+    return _attach_harmony_template(
+        NS(tokenizer=_ResponseTemplateTokenizer(HARMONY_RESPONSE_TEMPLATE))
+    )
 
 
 def _msg(content="Hello", role="user", **extra):
@@ -345,6 +378,12 @@ _JSON_TOOLS = NS(
     tool_call_end="</tool_call>",
     parse_tool_call=lambda call, tools: json.loads(call),
 )
+_INKLING_CALL = (
+    "<|message_model|><|content_thinking|>I need the weather tool.<|end_message|>"
+    "<|message_model|><|content_text|>Checking.<|end_message|>"
+    "<|message_model|>get_weather<|content_invoke_tool_json|>"
+    '{"name":"get_weather","args":{"city":"Warsaw"}}<|end_message|>'
+)
 _MUSE_CALL = (
     "to=self<|message|>I need the weather tool.<|eom|>"
     "<|start|>assistant to=get_weather<|message|>"
@@ -413,6 +452,49 @@ def _chat_events(response, reason):
         chunk for chunk in choices if chunk["choices"][0]["finish_reason"] == reason
     )
     return choices, usage, finish
+
+
+def _chat_tool_result(
+    response, stream, finish_reason="tool_calls", *, expected_partial=None
+):
+    assert response.status_code == 200, response.text
+    if stream:
+        choices = [
+            event["choices"][0] for event in _data(response) if event.get("choices")
+        ]
+        deltas = [choice["delta"] for choice in choices]
+        message = {
+            field: _joined(deltas, field) for field in ("content", "reasoning_content")
+        }
+        functions = {}
+        for delta in deltas:
+            for call in delta.get("tool_calls") or []:
+                function = functions.setdefault(
+                    call["index"], {"name": "", "arguments": ""}
+                )
+                for field in function:
+                    function[field] += call["function"].get(field, "")
+        assert list(functions) == list(range(len(functions)))
+        functions = list(functions.values())
+        finishes = [
+            choice["finish_reason"] for choice in choices if choice.get("finish_reason")
+        ]
+    else:
+        choice = response.json()["choices"][0]
+        message = choice["message"]
+        functions = [call["function"] for call in message["tool_calls"]]
+        finishes = [choice["finish_reason"]]
+    if expected_partial is not None:
+        assert functions.pop() == expected_partial
+    assert finishes == [finish_reason]
+    return NS(
+        content=message.get("content") or "",
+        reasoning_content=message.get("reasoning_content") or "",
+        calls=[
+            (function["name"], json.loads(function["arguments"]))
+            for function in functions
+        ],
+    )
 
 
 def _assert_fields(actual, **expected):
@@ -1619,6 +1701,9 @@ def _reset_runtime(monkeypatch, **overrides):
     state = dict(
         model_cache=server.ModelCacheRegistry(),
         response_generator=None,
+        model_load_progress=None,
+        preload_in_progress=False,
+        preload_failures={},
         apc_manager=None,
     )
     for name, value in (state | overrides).items():
@@ -1676,6 +1761,24 @@ class TestEmbeddingEncoding:
                 assert np.signbit(decoded[1]) == np.signbit(vector[1])
             else:
                 assert item["embedding"] == vector
+
+    @pytest.mark.parametrize("fails", [False, True])
+    def test_clears_mlx_cache(self, client, fails):
+        kwargs = (
+            dict(side_effect=ValueError("boom"))
+            if fails
+            else dict(return_value=([[1.0]], 1))
+        )
+        with (
+            patch.object(server, "get_cached_model", return_value=(None, None)),
+            patch.object(embeddings, "_embed", **kwargs),
+            patch.object(embeddings.mx, "clear_cache") as clear_cache,
+        ):
+            response = client.post(
+                "/v1/embeddings", json=dict(input="text", model="embedding")
+            )
+        assert response.status_code == (400 if fails else 200)
+        clear_cache.assert_called_once_with()
 
     @pytest.mark.parametrize("encoding", ["binary", ""])
     def test_invalid_encoding(self, client, encoding):
@@ -2024,21 +2127,67 @@ def _generator(**overrides):
     return gen
 
 
+@pytest.mark.parametrize("distributed", [False, True])
+def test_model_resources_forward_loading_observer(monkeypatch, distributed):
+    events = []
+    model, processor = NS(config=NS()), NS()
+
+    def load(*args, progress_callback, **kwargs):
+        progress_callback({"stage": "loading_checkpoint"})
+        return model, processor
+
+    monkeypatch.setattr(generation, "load", load)
+    monkeypatch.setattr(
+        server.runtime, "distributed_worker", NS(load=load) if distributed else None
+    )
+    assert generation.load_model_resources(
+        "demo", None, progress_callback=events.append
+    ) == (model, processor, model.config)
+    assert events == [{"stage": "loading_checkpoint"}]
+
+
+def test_cancelled_loader_releases_partial_weights(monkeypatch, caplog):
+    owners = []
+
+    class Weights:
+        pass
+
+    def load(*args, progress_callback, **kwargs):
+        weights = Weights()
+        owners.append(weakref.ref(weights))
+        progress_callback({"stage": "evaluating_layers"})
+
+    def cancel(event):
+        raise ModelLoadCancelled("shutdown")
+
+    monkeypatch.setattr(generation, "load", load)
+    monkeypatch.setattr(server.runtime, "distributed_worker", None)
+    gen = _generator(load_progress_callback=cancel)
+    worker = Thread(target=gen._run)
+    worker.start()
+    worker.join(5)
+    assert not worker.is_alive()
+    assert gen._ready.is_set()
+    assert isinstance(gen._load_error, ModelLoadCancelled)
+    assert gen._load_error.__traceback__ is None
+    gc.collect()
+    assert owners[0]() is None
+    assert not any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
 def test_server_caches_apc_mode_when_model_initializes(monkeypatch):
     config = NS(eos_token_id=[])
     language_model = NS()
     model = NS(language_model=language_model)
     processor = NS(tokenizer=NS())
-    gen = _generator()
+    events = []
+    gen = _generator(load_progress_callback=events.append)
     gen.apc_manager = object()
 
     monkeypatch.delenv("MLX_VLM_DRAFT_MODEL", raising=False)
     monkeypatch.delenv("MLX_VLM_DRAFT_KIND", raising=False)
-    monkeypatch.setattr(
-        generation,
-        "load_model_resources",
-        lambda *_args, **_kwargs: (model, processor, config),
-    )
+    loader = Mock(return_value=(model, processor, config))
+    monkeypatch.setattr(generation, "load_model_resources", loader)
     apc_mode = MagicMock(return_value="exact")
     monkeypatch.setattr(apc, "model_apc_mode", apc_mode)
 
@@ -2046,6 +2195,9 @@ def test_server_caches_apc_mode_when_model_initializes(monkeypatch):
 
     assert gen.apc_mode == "exact"
     apc_mode.assert_called_once_with(language_model)
+
+    assert loader.call_args.kwargs["progress_callback"] == events.append
+    assert events == [{"stage": "initializing_generator"}]
 
 
 def test_server_serves_ar_requests_after_drafter_mismatch(monkeypatch):
@@ -3579,7 +3731,9 @@ def test_response_template_tool_calls(client, api):
     token = _token(_MUSE_CALL, finish_reason="stop", prompt_tps=20, cached_tokens=2)
     with _endpoint(
         config=config,
-        processor=NS(config=config, tokenizer=_MuseResponseTemplateTokenizer()),
+        processor=NS(
+            config=config, tokenizer=_ResponseTemplateTokenizer(_MUSE_RESPONSE_TEMPLATE)
+        ),
         result=_result(_MUSE_CALL, prompt_tokens=7, generation_tokens=6),
         generator=_streaming([token], 10) if api == "chat" else None,
         parser=load_tool_module("atem"),
@@ -3607,6 +3761,228 @@ def test_response_template_tool_calls(client, api):
         arguments = call["input"]
     assert call["name"] == "get_weather" and arguments == {"city": "Warsaw"}
     assert "to=self" not in response.text and "<atem:" not in response.text
+
+
+@pytest.mark.parametrize("continuous", [False, True])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("position", ["before", "after", "between", "none"])
+@pytest.mark.parametrize(
+    "parser,template,parts",
+    [
+        (
+            "inkling",
+            _INKLING_RESPONSE_TEMPLATE,
+            [
+                "<|message_model|>" + part
+                for part in _INKLING_CALL.split("<|message_model|>")[1:]
+            ],
+        ),
+        (
+            "atem",
+            _MUSE_RESPONSE_TEMPLATE,
+            [
+                _MUSE_CALL.split("<|start|>", 1)[0],
+                "<|start|>assistant to=user<|message|>Checking.<|eom|>",
+                "<|start|>" + _MUSE_CALL.split("<|start|>", 1)[1] + "<|eom|>",
+            ],
+        ),
+    ],
+    ids=["inkling", "muse"],
+)
+def test_response_template_tool_text(
+    client, stream, continuous, position, parser, template, parts
+):
+    thinking, content, call = parts
+    segments = {
+        "before": [thinking, content, call],
+        "after": [thinking, call, content],
+        "between": [thinking, call, content, call],
+        "none": [thinking, call],
+    }[position]
+    output = "".join(segments)
+    chunks = [output[i : i + 9] for i in range(0, len(output), 9)]
+    tokens = [*map(_token, chunks), _token(finish_reason="stop")]
+    with _endpoint(
+        processor=NS(tokenizer=_ResponseTemplateTokenizer(template)),
+        result=_result(output),
+        chunks=[
+            _result(token.text, finish_reason=token.finish_reason) for token in tokens
+        ],
+        generator=_streaming(tokens) if continuous else None,
+        parser=load_tool_module(parser),
+    ):
+        response = _post(client, tools=[_tool()], stream=stream)
+    if stream and parser == "inkling":
+        fragments = [c for d in _deltas(response) for c in d.get("tool_calls") or []]
+        assert len(fragments) > len({c["index"] for c in fragments})
+    result = _chat_tool_result(response, stream)
+    assert result.calls == [("get_weather", {"city": "Warsaw"})] * (
+        2 if position == "between" else 1
+    )
+    assert result.reasoning_content == "I need the weather tool."
+    assert result.content == ("" if position == "none" else "Checking.")
+    assert "<|" not in response.text
+
+
+def _stream_inkling(client, api, chunks, finish_reason, continuous=True):
+    config = NS(model_type="inkling2")
+    result = _token if continuous else _result
+    chunks = [
+        result(text, finish_reason=finish_reason if i == len(chunks) - 1 else None)
+        for i, text in enumerate(chunks)
+    ]
+    with _endpoint(
+        config=config,
+        processor=NS(
+            config=config,
+            tokenizer=_ResponseTemplateTokenizer(_INKLING_RESPONSE_TEMPLATE),
+        ),
+        parser=load_tool_module("inkling"),
+        chunks=chunks,
+        generator=_streaming(chunks) if continuous else None,
+    ):
+        return _post(client, api, tools=[_tool()], stream=True)
+
+
+@pytest.mark.parametrize("api", ["chat", "responses"])
+@pytest.mark.parametrize("continuous", [True, False])
+@pytest.mark.parametrize(
+    "tail, expected_args",
+    [
+        ("sa", '{"city":"Warsa'),
+        ('saw"}}', '{"city":"Warsaw"}'),
+        ('saw"}}<|end_mes', '{"city":"Warsaw"}'),
+    ],
+    ids=["inside-string", "before-end-marker", "inside-end-marker"],
+)
+def test_inkling_length_during_tool_call(client, api, continuous, tail, expected_args):
+    chunks = [
+        "<|message_model|><|content_text|>Checking.<|end_message|>",
+        "<|message_model|>get_weather<|content_invoke_tool_json|>",
+        '{"name":"get_weather","args":{"city":"War',
+        tail,
+    ]
+    wire = _stream_inkling(client, api, chunks, "length", continuous)
+    events = _data(wire)
+    if api == "chat":
+        choices = [e["choices"][0] for e in events]
+        assert choices[-1]["finish_reason"] == "length"
+        deltas = [c["delta"] for c in choices]
+        assert _joined(deltas, "content") == "Checking."
+        calls = [c for d in deltas for c in d.get("tool_calls") or []]
+        assert _joined([c["function"] for c in calls], "arguments") == expected_args
+    else:
+        assert events[-1]["type"] == "response.incomplete"
+        response = _completed_response(wire)
+        assert response["incomplete_details"] == {"reason": "max_output_tokens"}
+        assert response["output_text"] == "Checking."
+        [call] = [i for i in response["output"] if i["type"] == "function_call"]
+        assert call["status"] == "incomplete" and call["arguments"] == expected_args
+        assert not any(
+            e["type"] == "response.function_call_arguments.done" for e in events
+        )
+
+
+@pytest.mark.parametrize("api", ["chat", "responses"])
+def test_inkling_length_after_a_completed_call(client, api):
+    header = "<|message_model|>get_weather<|content_invoke_tool_json|>"
+    chunks = [
+        "<|message_model|><|content_text|>Checking.<|end_message|>",
+        header + '{"name":"get_weather","args":{"city":"Rome"}}<|end_message|>',
+        header + '{"name":"get_weather","args":{"city":"Paris"}}',
+    ]
+    wire = _stream_inkling(client, api, chunks, "length")
+    events = _data(wire)
+    if api == "chat":
+        choices = [e["choices"][0] for e in events]
+        assert choices[-1]["finish_reason"] == "length"
+        calls = [c for x in choices for c in x["delta"].get("tool_calls") or []]
+        assert [c["index"] for c in calls if "id" in c] == [0, 1]
+    else:
+        response = _completed_response(wire)
+        assert response["status"] == "incomplete"
+        assert response["output_text"] == "Checking."
+        completed, partial = [
+            i for i in response["output"] if i["type"] == "function_call"
+        ]
+        assert [completed["status"], partial["status"]] == ["completed", "incomplete"]
+        done = [
+            e for e in events if e["type"] == "response.function_call_arguments.done"
+        ]
+        assert [e["call_id"] for e in done] == [completed["call_id"]]
+        messages, _ = _response_items_to_chat(response["output"])
+        assert [c["id"] for m in messages for c in m.get("tool_calls") or []] == [
+            completed["call_id"]
+        ]
+
+
+@pytest.mark.parametrize("api", ["chat", "responses"])
+@pytest.mark.parametrize(
+    "prefix, tail, emits_args",
+    [("", "[]}", False), ('{"city":"War', 'saw",}}', True)],
+    ids=["array-arguments", "invalid-after-deltas"],
+)
+def test_inkling_malformed_call_reports_error(client, api, prefix, tail, emits_args):
+    chunks = [
+        "<|message_model|>get_weather<|content_invoke_tool_json|>",
+        '{"name":"get_weather","args":' + prefix,
+        tail + "<|end_message|>",
+    ]
+    events = _data(_stream_inkling(client, api, chunks, "stop"))
+    if api == "chat":
+        choices = [e["choices"][0] for e in events if e.get("choices")]
+        assert any(x["delta"].get("tool_calls") for x in choices) == emits_args
+        assert all(x["finish_reason"] is None for x in choices)
+        assert events[-1]["error"]["code"] == "tool_call_parse_error"
+    else:
+        assert (
+            any(
+                e["type"] == "response.output_item.added"
+                and e["item"]["type"] == "function_call"
+                for e in events
+            )
+            == emits_args
+        )
+        assert not any(
+            e["type"] == "response.function_call_arguments.done" for e in events
+        )
+        assert events[-1]["type"] == "response.failed"
+        assert events[-1]["response"]["error"]["code"] == "tool_call_parse_error"
+
+
+@pytest.mark.parametrize("api", ["chat", "responses"])
+@pytest.mark.parametrize("kind", ["text", "thinking", "invalid-args"])
+def test_inkling_ignores_non_calls_before_valid_call(client, api, kind):
+    if kind == "invalid-args":
+        header = "get_weather<|content_invoke_tool_json|>"
+        payload = '{"name":"get_weather","args":[]}'
+    else:
+        header = f"<|content_{kind}|>The example is <|content_invoke_tool_json|>"
+        payload = '{"name":"get_weather","args":{}}'
+    chunks = [
+        "<|message_model|>" + header,
+        payload,
+        "<|end_message|>",
+        "<|message_model|>get_weather<|content_invoke_tool_json|>",
+        '{"name":"get_weather","args":{"city":"Warsaw"}}',
+        "<|end_message|>",
+    ]
+    events = _data(_stream_inkling(client, api, chunks, "stop"))
+    if api == "chat":
+        choices = [e["choices"][0] for e in events]
+        assert choices[-1]["finish_reason"] == "tool_calls"
+        calls = [c for x in choices for c in x["delta"].get("tool_calls") or []]
+        assert [c["function"]["name"] for c in calls if "id" in c] == ["get_weather"]
+        assert all(c["index"] == 0 for c in calls)
+    else:
+        assert events[-1]["type"] == "response.completed"
+        names = [
+            e["item"]["name"]
+            for e in events
+            if e["type"] == "response.output_item.added"
+            and e["item"]["type"] == "function_call"
+        ]
+        assert names == ["get_weather"]
 
 
 def test_chat_completions_endpoint_falls_back_from_video_to_images(client):
@@ -3831,7 +4207,10 @@ def test_anthropic_response_template_discards_tool_calls_after_stop(client):
         "messages",
         endpoint=dict(
             config=config,
-            processor=NS(config=config, tokenizer=_MuseResponseTemplateTokenizer()),
+            processor=NS(
+                config=config,
+                tokenizer=_ResponseTemplateTokenizer(_MUSE_RESPONSE_TEMPLATE),
+            ),
             parser=load_tool_module("atem"),
         ),
         tools=[_tool(api="messages")],
@@ -5077,6 +5456,18 @@ class TestCompaction:
         assert mocked.generate.call_count == 1
         assert "Conversation handoff" not in mocked.generate.call_args.kwargs["prompt"]
 
+    def test_distributed_chat_never_restores_rank_local_compaction_cache(
+        self, mocked, client, monkeypatch
+    ):
+        monkeypatch.setattr(server.runtime, "distributed_worker", object())
+        restore = Mock(side_effect=AssertionError("Rank-local compaction cache used"))
+        monkeypatch.setattr(compaction.chat_cache, "restore", restore)
+        monkeypatch.setitem(client.headers, "X-MLX-Distributed-Request", "a" * 32)
+        response = _post(client, distributed=True, max_tokens=64)
+        assert response.status_code == 200, response.text
+        assert mocked.generate.call_count == 1
+        restore.assert_not_called()
+
     @pytest.mark.parametrize("stream", [False, True])
     @pytest.mark.parametrize(
         "outcome", ["recover", "disabled", "summary-fails", "protected-too-large"]
@@ -6307,6 +6698,32 @@ class TestResponseGenerator:
                 processor=gen.processor,
             )
 
+    def test_server_apc_key_includes_per_video_timing(self):
+        gen = _ready_generator(
+            apc_manager=object(),
+            apc_mode="block",
+            model=NS(language_model=NS()),
+            processor=NS(),
+        )
+        video = mx.zeros((8, 4))
+        inputs = [
+            dict(
+                input_ids=mx.array([[1, 2]]),
+                pixel_values_videos=video,
+                second_per_grid_ts=mx.array(seconds),
+            )
+            for seconds in ([1.0, 0.5], [0.5, 1.0])
+        ]
+        gen._preprocess_request = MagicMock(side_effect=inputs)
+        queued = _capture_requests(gen, prompt_tokens=2)
+        for _ in inputs:
+            _, tokens = gen.generate(
+                "prompt", videos=["a.mp4", "b.mp4"], args=Args(max_tokens=1)
+            )
+            tokens.close()
+
+        assert queued[0].apc_semantic_hash != queued[1].apc_semantic_hash
+
     def test_runtime_context_limit(self, monkeypatch):
         monkeypatch.setenv("MAX_KV_SIZE", "8")
         _reset_runtime(
@@ -6363,7 +6780,8 @@ class TestResponseGenerator:
                 for field in ("token_number=", "token_id=", "text=")
             )
 
-    def test_prefill_progress_logging(self, caplog):
+    @pytest.mark.parametrize("emit_progress", [False, True])
+    def test_prefill_progress_logging_and_events(self, caplog, emit_progress):
         caplog.set_level(logging.INFO, logger="mlx_vlm.server")
         gen = Generator.__new__(Generator)
         prompt_batch = NS(
@@ -6375,11 +6793,38 @@ class TestResponseGenerator:
             _left_padding_per_row=[0],
             _right_pad_per_row=None,
         )
-        active = {1: {"request_id": "req-1", "prefill_processed": -1}}
+        updates = Queue()
+        active = {
+            1: {
+                "request_id": "req-1",
+                "prefill_processed": -1,
+                "emit_prompt_progress": emit_progress,
+                "rqueue": updates,
+            }
+        }
 
         gen._log_prefill_progress(NS(_prompt_batch=prompt_batch), active)
 
         assert "Prefill progress: request=req-1 tokens=2/6 (33.3%)" in caplog.text
+
+        # Re-polling a chunk must not duplicate events or regress the count.
+        gen._log_prefill_progress(NS(_prompt_batch=prompt_batch), active)
+        prompt_batch._processed_prompt_columns = 4
+        prompt_batch._inputs_embeds = mx.zeros((1, 2, 8))
+        gen._log_prefill_progress(NS(_prompt_batch=prompt_batch), active)
+        gen._log_prefill_completed(1, active[1], NS(prompt_tokens=6))
+        if emit_progress:
+            tokens = [updates.get_nowait() for _ in range(3)]
+            assert [t.prompt_progress for t in tokens] == [
+                {"status": status, "processed_tokens": count, "total_tokens": 6}
+                for status, count in (
+                    ("in_progress", 2),
+                    ("in_progress", 4),
+                    ("completed", 6),
+                )
+            ]
+            assert all(t.token_count == 0 and t.text == "" for t in tokens)
+        assert updates.empty()
 
     @pytest.mark.parametrize(
         "delayed", [False, True], ids=["timeout-cancels", "delayed-token"]
@@ -6915,7 +7360,10 @@ class TestResponseGenerator:
             monkeypatch.setenv("MLX_VLM_PRELOAD_" + key, kind)
         calls = []
 
-        def load(model_path, adapter_path=None, *, model_kind="auto"):
+        def load(
+            model_path, adapter_path=None, *, model_kind="auto", cancel_event=None
+        ):
+            assert (cancel_event is not None) == (model_kind == "text_generation")
             calls.append(model_kind)
             if model_kind == "audio_stt":
                 raise server.HTTPException(
@@ -6929,7 +7377,12 @@ class TestResponseGenerator:
 
         async def run():
             async with server._app_module.lifespan(server.app):
-                pass
+
+                async def wait_for_preloads():
+                    while server.runtime.preload_in_progress:
+                        await asyncio.sleep(0.001)
+
+                await asyncio.wait_for(wait_for_preloads(), 5)
 
         asyncio.run(run())
         assert calls == list(kinds.values())
@@ -7107,18 +7560,19 @@ def test_thinking_stream_markers(family, enabled):
     ],
 )
 def test_response_template_prefilled_thinking(prefix, text, expected):
-    tokenizer = _MuseResponseTemplateTokenizer()
-    tokenizer.response_template = {
-        "start_anchor_pattern": r"<\|im_start\|>assistant\n",
-        "fields": {
-            "reasoning_content": {
-                "open_pattern": r"<think>\n?",
-                "close_pattern": r"</think>\s*",
-                "content": "text",
+    tokenizer = _ResponseTemplateTokenizer(
+        {
+            "start_anchor_pattern": r"<\|im_start\|>assistant\n",
+            "fields": {
+                "reasoning_content": {
+                    "open_pattern": r"<think>\n?",
+                    "close_pattern": r"</think>\s*",
+                    "content": "text",
+                },
+                "content": {"close_pattern": r"<\|im_end\|>\s*", "content": "text"},
             },
-            "content": {"close_pattern": r"<\|im_end\|>\s*", "content": "text"},
-        },
-    }
+        }
+    )
     prompt = (
         "<|im_start|>assistant\n<think>Old.</think>Old answer.<|im_end|>\n"
         "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n" + prefix
@@ -7144,8 +7598,9 @@ def test_response_template_prefilled_thinking(prefix, text, expected):
     ],
 )
 def test_response_template_missing_anchor(client, api, stream, batched, anchor):
-    tokenizer = _MuseResponseTemplateTokenizer()
-    tokenizer.response_template = {**anchor, "fields": {"content": {"content": "text"}}}
+    tokenizer = _ResponseTemplateTokenizer(
+        {**anchor, "fields": {"content": {"content": "text"}}}
+    )
     result = _result("4.", finish_reason="stop")
     worker = _streaming([_token("4.", finish_reason="stop")]) if batched else None
     with _endpoint(
@@ -7171,9 +7626,338 @@ def test_response_template_missing_anchor(client, api, stream, batched, anchor):
             assert _joined(body["content"], "text") == "4."
 
 
+@pytest.fixture(params=["inkling", "muse"])
+def template_tool_case(request):
+    if request.param == "inkling":
+        thinking, content, call = [
+            "<|message_model|>" + part
+            for part in _INKLING_CALL.split("<|message_model|>")[1:]
+        ]
+        return NS(
+            parser="inkling",
+            template=_INKLING_RESPONSE_TEMPLATE,
+            thinking=thinking,
+            content=content,
+            call=call,
+            malformed=call.replace('{"city":"Warsaw"}', "{city}"),
+            truncated=call.split("Warsaw")[0] + "War",
+        )
+    thinking, call = _MUSE_CALL.split("<|start|>", 1)
+    call = "<|start|>" + call + "<|eom|>"
+    return NS(
+        parser="atem",
+        template=_MUSE_RESPONSE_TEMPLATE,
+        thinking=thinking,
+        content="<|start|>assistant to=user<|message|>Checking.<|eom|>",
+        call=call,
+        malformed=call.replace('name="get_weather"', ""),
+        truncated=call.split("Warsaw")[0] + "War",
+    )
+
+
+def _assert_tool_parse_error(response, api, stream):
+    assert response.status_code == (200 if stream or api == "responses" else 500)
+    if stream:
+        events = _data(response)
+        if api == "responses":
+            failures = [
+                e["response"] for e in events if e.get("type") == "response.failed"
+            ]
+            assert len(failures) == 1
+            body = failures[0]
+            assert not any(
+                e.get("type") in ("response.completed", "response.incomplete")
+                for e in events
+            )
+        else:
+            failures = [e for e in events if "error" in e]
+            assert len(failures) == 1
+            body = failures[0]
+            assert not any(
+                c.get("finish_reason") for e in events for c in e.get("choices", [])
+            )
+            assert not any(
+                e.get("type") in ("message_stop", "message_delta") for e in events
+            )
+    else:
+        body = response.json()
+    if api == "responses":
+        assert body["status"] == "failed"
+    error = body["error"]
+    assert error["message"].endswith(
+        "The model generated tool calls, but none could be parsed."
+    )
+    if api == "messages":
+        assert error["type"] == "api_error"
+    else:
+        assert error["code"] == "tool_call_parse_error"
+
+
+@pytest.mark.parametrize("api", ["chat", "responses", "messages"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("batched", [False, True])
+@pytest.mark.parametrize("alone", [False, True], ids=["after-text", "alone"])
+@pytest.mark.parametrize(
+    "failure,finish",
+    [
+        (
+            "cut-off",
+            dict(chat="length", responses="incomplete", messages="max_tokens"),
+        ),
+        (
+            "malformed",
+            dict(chat="stop", responses="completed", messages="end_turn"),
+        ),
+        ("unterminated", dict(chat="stop", responses="completed", messages="end_turn")),
+    ],
+    ids=["cut-off", "malformed", "unterminated"],
+)
+def test_response_template_undecodable_tool_call(
+    client, api, stream, batched, alone, failure, finish, template_tool_case
+):
+    case = template_tool_case
+    output = ("" if alone else case.thinking + case.content) + (
+        case.truncated if failure in ("cut-off", "unterminated") else case.malformed
+    )
+    chunks = [output[i : i + 9] for i in range(0, len(output), 9)]
+    tokens = [*map(_token, chunks), _token(finish_reason=finish["chat"])]
+    payload = dict(tools=[_tool(api=api)], stream=stream)
+    if api == "messages":
+        payload.update(thinking=dict(type="enabled", budget_tokens=4), max_tokens=8)
+    with _endpoint(
+        processor=NS(tokenizer=_ResponseTemplateTokenizer(case.template)),
+        result=_result(output, finish_reason=finish["chat"]),
+        chunks=[
+            _result(token.text, finish_reason=token.finish_reason) for token in tokens
+        ],
+        generator=_streaming(tokens) if batched else None,
+        parser=load_tool_module(case.parser),
+    ):
+        response = _post(client, api, **payload)
+    if failure != "cut-off":
+        _assert_tool_parse_error(response, api, stream)
+        if stream:
+            assert _thinking_text(response, api) == (
+                ("", "") if alone else ("I need the weather tool.", "Checking.")
+            )
+        elif api == "responses":
+            assert response.json()["output_text"] == ("" if alone else "Checking.")
+        return
+    assert response.status_code == 200, response.text
+    assert "<|" not in response.text
+    if stream and case.parser == "inkling" and api in ("chat", "responses"):
+        events = _data(response)
+        if api == "chat":
+            partial = [
+                c["function"]
+                for e in events
+                for x in e.get("choices") or []
+                for c in x["delta"].get("tool_calls") or []
+            ]
+            assert _joined(partial, "arguments") == '{"city":"War'
+        else:
+            partial = [
+                e
+                for e in events
+                if e["type"] == "response.function_call_arguments.delta"
+            ]
+            assert _joined(partial, "delta") == '{"city":"War'
+    else:
+        assert "city" not in response.text
+    if stream:
+        reasoning, content = _thinking_text(response, api)
+        if api == "chat":
+            (finished,) = [
+                choice["finish_reason"]
+                for event in _data(response)
+                for choice in event.get("choices") or []
+                if choice.get("finish_reason")
+            ]
+        elif api == "responses":
+            finished = _completed_response(response)["status"]
+        else:
+            finished = _anthropic_stream_stop(response)[0]
+    else:
+        body = response.json()
+        if api == "chat":
+            choice = body["choices"][0]
+            reasoning = choice["message"]["reasoning_content"]
+            content, finished = choice["message"]["content"], choice["finish_reason"]
+        elif api == "responses":
+            reasoning = _joined(
+                [
+                    part
+                    for item in body["output"]
+                    if item["type"] == "reasoning"
+                    for part in item["summary"]
+                ],
+                "text",
+            )
+            content, finished = body["output_text"], body["status"]
+        else:
+            reasoning = _joined(body["content"], "thinking")
+            content, finished = _joined(body["content"], "text"), body["stop_reason"]
+    assert (reasoning or "", content or "") == (
+        ("", "") if alone else ("I need the weather tool.", "Checking.")
+    )
+    assert finished == finish[api]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("alone", [False, True], ids=["after-text", "alone"])
+def test_response_template_tool_call_without_arguments(client, stream, alone):
+    # The tool parser reads a call that has no `args`; the template's transform
+    # does not, and the call must not take the turn's text with it.
+    start = _INKLING_CALL.index("<|message_model|>get_weather") if alone else 0
+    output = _INKLING_CALL[start:].replace(',"args":{"city":"Warsaw"}', "")
+    with _endpoint(
+        processor=NS(tokenizer=_ResponseTemplateTokenizer(_INKLING_RESPONSE_TEMPLATE)),
+        result=_result(output),
+        generator=_streaming([_token(output), _token(finish_reason="stop")]),
+        parser=load_tool_module("inkling"),
+    ):
+        response = _post(client, tools=[_tool()], stream=stream)
+    result = _chat_tool_result(response, stream)
+    assert result.calls == [("get_weather", {})]
+    assert (result.reasoning_content, result.content) == (
+        ("", "") if alone else ("I need the weather tool.", "Checking.")
+    )
+    assert "<|" not in response.text
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_response_template_tool_call_without_tools(client, stream):
+    # A call written for a request that sent no tools is not content, whether
+    # or not the response is streamed.
+    call = _INKLING_CALL[_INKLING_CALL.index("<|message_model|>get_weather") :]
+    with _endpoint(
+        processor=NS(tokenizer=_ResponseTemplateTokenizer(_INKLING_RESPONSE_TEMPLATE)),
+        result=_result(call),
+        generator=_streaming([_token(call), _token(finish_reason="stop")]),
+    ):
+        response = _post(client, stream=stream)
+    assert response.status_code == 200, response.text
+    assert "get_weather" not in response.text
+
+
+@pytest.mark.parametrize("api", ["chat", "responses", "messages"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("batched", [False, True])
+@pytest.mark.parametrize("truncated", [False, True])
+def test_response_template_keeps_valid_calls_beside_errors(
+    client, api, stream, batched, template_tool_case, truncated
+):
+    case = template_tool_case
+    output = case.thinking + case.malformed + case.call + case.malformed + case.content
+    if truncated:
+        output = case.thinking + case.content + case.call + case.truncated
+    finish_reason = "length" if truncated else "stop"
+    chunks = [output[i : i + 7] for i in range(0, len(output), 7)]
+    tokens = [*map(_token, chunks), _token(finish_reason=finish_reason)]
+    payload = dict(stream=stream, tools=[_tool(api=api)])
+    if api == "messages":
+        payload.update(thinking=dict(type="enabled", budget_tokens=4), max_tokens=8)
+    with _endpoint(
+        processor=NS(tokenizer=_ResponseTemplateTokenizer(case.template)),
+        result=_result(output, finish_reason=finish_reason),
+        chunks=[_result(t.text, finish_reason=t.finish_reason) for t in tokens],
+        generator=_streaming(tokens) if batched else None,
+        parser=load_tool_module(case.parser),
+    ):
+        response = _post(client, api, **payload)
+    assert response.status_code == 200, response.text
+    if api == "chat":
+        result = _chat_tool_result(
+            response,
+            stream,
+            "length" if truncated else "tool_calls",
+            expected_partial=(
+                {"name": "get_weather", "arguments": '{"city":"War'}
+                if stream and truncated and case.parser == "inkling"
+                else None
+            ),
+        )
+        assert result.calls == [("get_weather", {"city": "Warsaw"})]
+        assert (result.reasoning_content, result.content) == (
+            "I need the weather tool.",
+            "Checking.",
+        )
+    elif api == "responses":
+        body = (
+            next(
+                e["response"]
+                for e in _data(response)
+                if e.get("type") in ("response.completed", "response.incomplete")
+            )
+            if stream
+            else response.json()
+        )
+        assert body["status"] == ("incomplete" if truncated else "completed")
+        calls = [item for item in body["output"] if item["type"] == "function_call"]
+        if stream and truncated and case.parser == "inkling":
+            partial = calls.pop()
+            assert partial["status"] == "incomplete"
+            assert partial["arguments"] == '{"city":"War'
+        assert [(c["name"], json.loads(c["arguments"])) for c in calls] == [
+            ("get_weather", {"city": "Warsaw"})
+        ]
+        if stream:
+            assert _thinking_text(response, api) == (
+                "I need the weather tool.",
+                "Checking.",
+            )
+    elif stream:
+        events = _data(response)
+        blocks = [
+            e["content_block"]
+            for e in events
+            if e.get("type") == "content_block_start"
+            and e["content_block"]["type"] == "tool_use"
+        ]
+        assert len(blocks) == 1 and blocks[0]["name"] == "get_weather"
+        args = _joined(
+            [e["delta"] for e in events if e.get("type") == "content_block_delta"],
+            "partial_json",
+        )
+        assert json.loads(args) == {"city": "Warsaw"}
+        assert _thinking_text(response, api) == (
+            "I need the weather tool.",
+            "Checking.",
+        )
+        assert _anthropic_stream_stop(response)[0] == (
+            "max_tokens" if truncated else "tool_use"
+        )
+    else:
+        body = response.json()
+        calls = [c for c in body["content"] if c["type"] == "tool_use"]
+        assert [(c["name"], c["input"]) for c in calls] == [
+            ("get_weather", {"city": "Warsaw"})
+        ]
+        assert _joined(body["content"], "thinking") == "I need the weather tool."
+        assert _joined(body["content"], "text") == "Checking."
+        assert body["stop_reason"] == ("max_tokens" if truncated else "tool_use")
+
+
+@pytest.mark.parametrize("api", ["chat", "responses", "messages"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("batched", [False, True])
+def test_tool_parse_failure_without_response_template(client, api, stream, batched):
+    output = "Hello.<tool_call>{broken}</tool_call>"
+    tokens = [_token(output), _token(finish_reason="stop")]
+    with _endpoint(
+        result=_result(output, finish_reason="stop"),
+        chunks=[_result(t.text, finish_reason=t.finish_reason) for t in tokens],
+        generator=_streaming(tokens) if batched else None,
+        parser=_JSON_TOOLS,
+    ):
+        response = _post(client, api, stream=stream, tools=[_tool(api=api)])
+    _assert_tool_parse_error(response, api, stream)
+    assert "{broken}" not in response.text and "<tool_call>" not in response.text
+
+
 def test_response_template_thinking_stream():
     state = server.make_response_stream_state(
-        NS(tokenizer=_MuseResponseTemplateTokenizer()),
+        NS(tokenizer=_ResponseTemplateTokenizer(_MUSE_RESPONSE_TEMPLATE)),
         thinking_start_token="unused-start",
         thinking_end_token="unused-end",
     )
@@ -7684,6 +8468,7 @@ def settings_client(monkeypatch, tmp_path):
             self.processor = NS()
             self.config = NS(model_type="test")
             self.apc_manager = kwargs["apc_manager"]
+            self.load_progress_callback = kwargs["load_progress_callback"]
             self.stopped = False
             generators.append(self)
 
@@ -7702,6 +8487,286 @@ def settings_client(monkeypatch, tmp_path):
         if not generator.stopped:
             generator.stop_and_join()
     client.close()
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_startup_preload_serves_progress_and_recovers(
+    settings_client, monkeypatch, fail
+):
+    _, generators = settings_client
+    for key in list(os.environ):
+        if key.startswith("MLX_VLM_PRELOAD_"):
+            monkeypatch.delenv(key)
+    monkeypatch.setenv("MLX_VLM_PRELOAD_MODEL", "demo")
+    monkeypatch.setenv("MLX_VLM_SERVER_API_KEY", "test-key")
+    entered, release = Event(), Event()
+    generator_class = server._app_module.ResponseGenerator
+    ready = generator_class.wait_until_ready
+
+    def loading(self):
+        self.load_progress_callback(
+            {"stage": "evaluating_layers", "completed_layers": 1, "total_layers": 2}
+        )
+        entered.set()
+        assert release.wait(5)
+        if fail and len(generators) == 1:
+            raise ValueError("broken checkpoint")
+        return ready(self)
+
+    monkeypatch.setattr(generator_class, "wait_until_ready", loading)
+    monkeypatch.setattr(
+        generator_class,
+        "_cpu_preprocess",
+        lambda *a, **k: {"input_ids": np.array([[1, 2, 3]])},
+        raising=False,
+    )
+    monkeypatch.setattr(openai, "apply_chat_template", lambda *a, **k: "prompt")
+    monkeypatch.setattr(
+        openai,
+        "_build_gen_args",
+        lambda *a, **k: NS(
+            to_template_kwargs=lambda: {}, preprocessing_kwargs=lambda: {}
+        ),
+    )
+
+    async def check():
+        async with server._app_module.lifespan(server.app):
+            # Lifespan startup has returned while the loader is still blocked.
+            try:
+                assert await asyncio.to_thread(entered.wait, 2)
+                async with httpx2.AsyncClient(
+                    transport=httpx2.ASGITransport(app=server.app),
+                    base_url="http://test",
+                    headers={"Authorization": "Bearer test-key"},
+                ) as client:
+                    denied = await client.get(
+                        "/health", headers={"Authorization": "wrong"}
+                    )
+                    assert denied.status_code == 401
+                    health = await asyncio.wait_for(client.get("/health"), 1)
+                    body = health.json()
+                    assert body["status"] == "healthy" and not body["model_ready"]
+                    assert body["preload_in_progress"] and body["loaded_model"] is None
+                    assert body["model_load_progress"]["stage_percent"] == 50.0
+                    metrics = (await client.get("/metrics")).json()["server"]
+                    assert metrics["model_load_progress"] == body["model_load_progress"]
+                    for route in (
+                        "/v1/responses",
+                        "/v1/chat/completions",
+                        "/v1/messages",
+                        "/v1/responses/input_tokens",
+                    ):
+                        pending = await client.post(
+                            route,
+                            json={
+                                "model": "demo",
+                                "input": "Hello",
+                                "messages": [{"role": "user", "content": "Hello"}],
+                                "max_tokens": 8,
+                            },
+                        )
+                        assert pending.status_code == 503
+                        assert pending.json()["detail"]["code"] == "model_loading"
+                        assert pending.headers["Retry-After"] == "1"
+                    assert (await client.post("/unload")).status_code == 409
+                    assert (
+                        await client.patch("/v1/settings", json={})
+                    ).status_code == 409
+                    assert len(generators) == 1
+                    release.set()
+
+                    async def finished():
+                        while server.runtime.preload_in_progress:
+                            await asyncio.sleep(0.001)
+
+                    await asyncio.wait_for(finished(), 2)
+                    body = (await client.get("/health")).json()
+                    assert body["model_ready"] is not fail
+                    assert body["model_load_progress"]["stage"] == (
+                        "failed" if fail else "ready"
+                    )
+                    if fail:
+                        assert generators[0].stopped
+                        assert (
+                            body["preload_failures"]["text_generation"]["error"]
+                            == "broken checkpoint"
+                        )
+                    # Successful preloads are reused; failed ones can be retried normally.
+                    retry = await client.post(
+                        "/v1/responses/input_tokens",
+                        json={"model": "demo", "input": "Hello"},
+                    )
+                    assert retry.status_code == 200
+                    assert len(generators) == (2 if fail else 1)
+                    assert (await client.get("/health")).json()["model_ready"]
+            finally:
+                release.set()
+        assert all(g.stopped for g in generators)
+        assert (
+            not server.runtime.model_cache and server.runtime.response_generator is None
+        )
+
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("cancel_shutdown", [False, True])
+def test_shutdown_cancels_preload_at_next_boundary(
+    settings_client, monkeypatch, cancel_shutdown
+):
+    _, generators = settings_client
+    monkeypatch.setenv("MLX_VLM_PRELOAD_MODEL", "demo")
+    monkeypatch.setenv("MLX_VLM_PRELOAD_MESH_MODEL", "must-not-start")
+    entered, release = Event(), Event()
+    generator_class = server._app_module.ResponseGenerator
+    ready = Mock(wraps=generator_class.wait_until_ready)
+
+    def loading(self):
+        self.load_progress_callback(
+            {"stage": "evaluating_layers", "completed_layers": 0, "total_layers": 2}
+        )
+        entered.set()
+        # Stand in for one indivisible native evaluation already in progress.
+        assert release.wait(5)
+        self.load_progress_callback(
+            {"stage": "evaluating_layers", "completed_layers": 1, "total_layers": 2}
+        )
+        return ready(self)
+
+    monkeypatch.setattr(generator_class, "wait_until_ready", loading)
+    mesh = Mock(side_effect=AssertionError("Shutdown must skip the next preload"))
+    monkeypatch.setattr(server._app_module, "load_3d_model", mesh)
+
+    async def check():
+        context = server._app_module.lifespan(server.app)
+        await context.__aenter__()
+        assert await asyncio.to_thread(entered.wait, 2)
+        closing = asyncio.create_task(context.__aexit__(None, None, None))
+        try:
+            await asyncio.sleep(0.05)
+            if cancel_shutdown:
+                closing.cancel()
+                await asyncio.sleep(0)
+            assert not closing.done() and not generators[0].stopped
+        finally:
+            release.set()
+            if cancel_shutdown:
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(closing, 2)
+            else:
+                await asyncio.wait_for(closing, 2)
+        assert generators[0].stopped and not server.runtime.model_cache
+        assert not server.runtime.preload_in_progress
+        assert not server.runtime.preload_failures
+        ready.assert_not_called()
+        mesh.assert_not_called()
+
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("when", ["before_start", "after_initialize"])
+def test_preload_cancellation_does_not_publish_model(settings_client, when):
+    _, generators = settings_client
+    stopping = Event()
+    if when == "before_start":
+        stopping.set()
+
+    original = server._app_module.ResponseGenerator.wait_until_ready
+
+    def ready(self):
+        result = original(self)
+        stopping.set()
+        return result
+
+    with patch.object(server._app_module.ResponseGenerator, "wait_until_ready", ready):
+        with pytest.raises(ModelLoadCancelled):
+            server._app_module.get_cached_model("demo", cancel_event=stopping)
+    assert len(generators) == (when == "after_initialize")
+    assert all(g.stopped for g in generators)
+    assert not server.runtime.model_cache
+    assert server.runtime.response_generator is None
+    assert server.runtime.apc_manager is None
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_local_loading_progress_is_observable_during_warmup(
+    settings_client, monkeypatch, fail
+):
+    _, generators = settings_client
+    entered, release = Event(), Event()
+    generator_class = server._app_module.ResponseGenerator
+    ready = generator_class.wait_until_ready
+
+    def loading(self):
+        self.load_progress_callback(
+            {
+                "stage": "evaluating_layers",
+                "completed_layers": 1,
+                "total_layers": 2,
+            }
+        )
+        entered.set()
+        assert release.wait(5)
+        if fail:
+            raise ValueError("broken checkpoint")
+        return ready(self)
+
+    monkeypatch.setattr(generator_class, "wait_until_ready", loading)
+    monkeypatch.setattr(
+        generator_class,
+        "_cpu_preprocess",
+        lambda *a, **k: {"input_ids": np.array([[1, 2, 3]])},
+        raising=False,
+    )
+    monkeypatch.setattr(openai, "apply_chat_template", lambda *a, **k: "prompt")
+    monkeypatch.setattr(
+        openai,
+        "_build_gen_args",
+        lambda *a, **k: NS(
+            to_template_kwargs=lambda: {}, preprocessing_kwargs=lambda: {}
+        ),
+    )
+
+    async def check():
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=server.app), base_url="http://test"
+        ) as client:
+            payload = {"model": "demo", "input": "Hello"}
+            pending = [
+                asyncio.create_task(
+                    client.post("/v1/responses/input_tokens", json=payload)
+                )
+                for _ in range(1 if fail else 2)
+            ]
+            try:
+                assert await asyncio.to_thread(entered.wait, 2)
+                health = await asyncio.wait_for(client.get("/health"), 1)
+                progress = health.json()["model_load_progress"]
+                assert progress["stage"] == "evaluating_layers"
+                assert progress["stage_percent"] == 50.0
+                assert (
+                    progress["completed_layers"] == 1 and progress["total_layers"] == 2
+                )
+                assert progress["model"] == "demo" and progress["elapsed_seconds"] >= 0
+                busy = await client.post("/unload")
+                assert busy.status_code == 409
+                assert busy.json()["detail"]["code"] == "model_loading"
+            finally:
+                release.set()
+                responses = await asyncio.gather(*pending)
+            assert all(r.status_code == (400 if fail else 200) for r in responses)
+            assert len(generators) == 1
+            progress = (await client.get("/health")).json()["model_load_progress"]
+            assert progress["stage"] == ("failed" if fail else "ready")
+            assert progress["stage_percent"] is None
+            if fail:
+                assert generators[0].stopped
+            else:
+                assert (await client.post("/unload")).status_code == 200
+                assert (await client.get("/health")).json()[
+                    "model_load_progress"
+                ] is None
+
+    asyncio.run(check())
 
 
 def test_apc_patch_reaches_next_model_request(settings_client, tmp_path):
@@ -8235,23 +9300,61 @@ def test_tool_stream_matches_non_streamed_content(parser, text):
 _WEATHER_CALL = '<tool_call>{"name": "get_weather", "arguments": {}}</tool_call>'
 
 
-def test_chat_fallback_stream_parses_tool_calls(client):
+@pytest.fixture(params=[False, True], ids=["no-template", "broken-template"])
+def fallback_processor(request):
+    if not request.param:
+        return None
+    tokenizer = _ResponseTemplateTokenizer({"fields": {}})
+    tokenizer.parse_response = Mock(side_effect=ValueError("invalid template"))
+    tokenizer.get_response_parser = Mock(side_effect=ValueError("invalid template"))
+    return NS(tokenizer=tokenizer)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_chat_fallback_parses_tool_calls(client, stream, fallback_processor):
     # Without a response generator the stream_generate fallback streamed the
     # raw tool-call markup as content and never emitted tool_calls.
     result = _result(f"Checking.{_WEATHER_CALL}", finish_reason="stop")
-    with _endpoint(chunks=[result], parser=_JSON_TOOLS):
-        response = _post(client, stream=True, tools=[_tool()])
-    deltas = _deltas(response)
-    assert _joined(deltas, "content") == "Checking."
-    calls = [call for delta in deltas for call in delta.get("tool_calls") or []]
-    assert [call["function"]["name"] for call in calls] == ["get_weather"]
-    reasons = [
-        choice["finish_reason"]
-        for chunk in _data(response)
-        for choice in chunk.get("choices") or []
-        if choice.get("finish_reason")
-    ]
-    assert reasons == ["tool_calls"]
+    with _endpoint(
+        result=result, chunks=[result], parser=_JSON_TOOLS, processor=fallback_processor
+    ):
+        response = _post(client, stream=stream, tools=[_tool()])
+    parsed = _chat_tool_result(response, stream)
+    assert parsed.content == "Checking."
+    assert parsed.calls == [("get_weather", {})]
+
+
+@pytest.mark.parametrize("continuous", [False, True])
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        (
+            f"Use the closing tag </think> in XML. {_WEATHER_CALL}Done.",
+            "Use the closing tag  in XML.  Done.",
+        ),
+        (
+            f"<mm:think>First</mm:think>Before{_WEATHER_CALL}<think>Second</think>After",
+            "Before SecondAfter",
+        ),
+    ],
+    ids=["literal-close-marker", "mixed-thinking-markers"],
+)
+def test_chat_nonstream_tool_cleanup_preserves_fallback_content(
+    client, continuous, fallback_processor, text, expected
+):
+    result = _result(text, finish_reason="stop")
+    with _endpoint(
+        result=result,
+        generator=(
+            _streaming([_token(text, finish_reason="stop")]) if continuous else None
+        ),
+        parser=_JSON_TOOLS,
+        processor=fallback_processor,
+    ):
+        response = _post(client, tools=[_tool()])
+    parsed = _chat_tool_result(response, stream=False)
+    assert parsed.content == expected
+    assert parsed.calls == [("get_weather", {})]
 
 
 @pytest.mark.parametrize("api", ["chat", "responses", "messages"])
@@ -8357,13 +9460,19 @@ def test_anthropic_unfinished_call_matches_stream(
 
     with _endpoint(parser=_JSON_TOOLS, **endpoint_options()):
         response = _post(client, "messages", tools=[_tool(api="messages")])
-    assert response.status_code == 200, response.text
-    blocks = response.json()["content"]
-    assert "".join(b["text"] for b in blocks if b["type"] == "text") == expected
-    assert sum(b["type"] == "tool_use" for b in blocks) == int(completed_call)
+    failed = not completed_call and finish_reason != "length"
+    if failed:
+        _assert_tool_parse_error(response, "messages", False)
+    else:
+        assert response.status_code == 200, response.text
+        blocks = response.json()["content"]
+        assert "".join(b["text"] for b in blocks if b["type"] == "text") == expected
+        assert sum(b["type"] == "tool_use" for b in blocks) == int(completed_call)
 
     with _endpoint(parser=_JSON_TOOLS, **endpoint_options()):
         response = _post(client, "messages", stream=True, tools=[_tool(api="messages")])
+    if failed:
+        _assert_tool_parse_error(response, "messages", True)
     assert _joined(_deltas(response, "messages"), "text") == expected
     tool_blocks = [
         item["content_block"]
@@ -8519,7 +9628,82 @@ def test_audio_transcription_request(
     else:
         assert response.json() == {"text": text}
     assert {key: fake.calls[0][key] for key in forwarded} == forwarded
+    assert fake.calls[0]["max_tokens"] == 1024
     loader.assert_called_once_with("fake-stt", model_kind="audio_stt")
+
+
+@pytest.mark.parametrize(
+    "generate, options, expected",
+    [
+        (lambda audio, *, max_tokens=16384: max_tokens, {}, None),
+        (lambda audio, *, max_tokens=None: max_tokens, {}, None),
+        (lambda audio, *, max_tokens=16384: max_tokens, {"max_tokens": 0}, 0),
+        (lambda audio, *, max_tokens: max_tokens, {}, 1024),
+        (lambda audio: None, {"max_tokens": 3}, None),
+    ],
+    ids=["model-default", "none-default", "explicit-cap", "required", "unsupported"],
+)
+def test_audio_transcription_budget(generate, options, expected):
+    request = server_audio.AudioTranscriptionRequest(model="test", **options)
+    kwargs = server_audio._build_stt_generate_kwargs(
+        NS(generate=generate), request, translate=False
+    )
+    assert kwargs.get("max_tokens") == expected
+
+
+def test_transcription_token_count_does_not_imply_truncation(audio_client, monkeypatch):
+    fake, _ = _audio_backend(
+        monkeypatch, {"text": "Transcript", "generation_tokens": 64}
+    )
+    monkeypatch.setattr(
+        server_audio, "audio_read", lambda *a, **kw: (np.zeros(160), 16000)
+    )
+    response = _upload(audio_client, max_tokens="64")
+    assert response.status_code == 200
+    assert fake.calls[0]["max_tokens"] == 64
+    assert response.json() == {"text": "Transcript"}
+    assert "x-mlx-finish-reason" not in response.headers
+    assert audio_client.get("/metrics").json()["latest"]["finish_reason"] is None
+
+
+@pytest.mark.parametrize("response_format", ["json", "text", "ndjson"])
+def test_transcription_reports_backend_finish_reason(
+    audio_client, monkeypatch, response_format
+):
+    fake, _ = _audio_backend(monkeypatch)
+    monkeypatch.setattr(
+        server_audio, "audio_read", lambda *a, **kw: (np.zeros(160), 16000)
+    )
+
+    def generate(audio, *, stream=False, **kwargs):
+        if stream:
+            return iter(
+                [
+                    {"text": "Partial"},
+                    {"text": "", "is_final": True, "finish_reason": "length"},
+                ]
+            )
+        return NS(text="Partial", finish_reason="length")
+
+    monkeypatch.setattr(fake, "generate", generate)
+    response = _upload(
+        audio_client,
+        response_format=response_format,
+        stream=str(response_format == "ndjson").lower(),
+    )
+    assert response.status_code == 200
+    if response_format == "ndjson":
+        first, final = map(json.loads, response.text.splitlines())
+        assert first["text"] == "Partial"
+        assert "finish_reason" not in first
+        assert final["is_final"]
+        assert final["finish_reason"] == "length"
+    elif response_format == "text":
+        assert response.text == "Partial"
+        assert response.headers["x-mlx-finish-reason"] == "length"
+    else:
+        assert response.json() == {"text": "Partial", "finish_reason": "length"}
+    assert audio_client.get("/metrics").json()["latest"]["finish_reason"] == "length"
 
 
 @pytest.mark.parametrize(
@@ -9755,22 +10939,7 @@ def test_tool_streaming_filters_calls_consistently(
         assert all(call["type"] == "function_call" for call in calls)
         actual = [(call["name"], json.loads(call["arguments"])) for call in calls]
     else:
-        choices = [event["choices"][0] for event in events if event.get("choices")]
-        assert [
-            choice["finish_reason"] for choice in choices if choice.get("finish_reason")
-        ] == ["tool_calls"]
-        received = {}
-        for choice in choices:
-            for delta in choice["delta"].get("tool_calls") or []:
-                call = received.setdefault(delta["index"], {"arguments": ""})
-                function = delta["function"]
-                if "name" in function:
-                    call["name"] = function["name"]
-                call["arguments"] += function.get("arguments", "")
-        assert list(received) == list(range(len(expected)))
-        actual = [
-            (call["name"], json.loads(call["arguments"])) for call in received.values()
-        ]
+        actual = _chat_tool_result(response, stream=True).calls
     assert actual == expected
 
 
@@ -10720,3 +11889,75 @@ def test_diffusion_http_checkpoint_replays_without_regeneration(
         assert resumed.status_code == 200
         assert text(original)[: checkpoint["content"]] + text(resumed) == text(original)
         worker.generate.assert_not_called()
+
+
+@pytest.mark.parametrize("started", [False, True])
+def test_minimax_thinking_delimiters_at_every_chunk_boundary(started):
+    from mlx_vlm.server.responses_state import ThinkingStreamState
+
+    text = ("" if started else "<mm:think>") + "reasoning" + "</mm:think>\nanswer"
+    for split in range(len(text) + 1):
+        parser = ThinkingStreamState(started)
+        deltas = [parser.feed(text[:split]), parser.feed(text[split:], last=True)]
+        assert "".join(d.reasoning or "" for d in deltas) == "reasoning"
+        assert "".join(d.content or "" for d in deltas) == "answer"
+    parser = ThinkingStreamState(started)
+    deltas = [parser.feed(ch) for ch in text] + [parser.feed("", last=True)]
+    assert "".join(d.reasoning or "" for d in deltas) == "reasoning"
+    assert "".join(d.content or "" for d in deltas) == "answer"
+
+
+@pytest.mark.parametrize("continuous", [False, True])
+def test_responses_generation_progress_uses_native_timing_field(client, continuous):
+    chunks = [
+        NS(
+            text=text,
+            emitted_at=when,
+            generation_tokens=count,
+            prompt_tokens=3,
+            finish_reason=finish,
+        )
+        for text, when, count, finish in (
+            ("hello", 10.0, 1, None),
+            (" there", 10.5, 2, "stop"),
+        )
+    ]
+    with _endpoint(chunks=chunks, generator=_streaming(chunks) if continuous else None):
+        wire = _post(client, "responses", stream=True)
+    assert wire.status_code == 200, wire.text
+    events = _data(wire)
+    progress = [e for e in events if e["type"] == "response.generation_progress"]
+    assert [e["output_tokens"] for e in progress] == [1, 2]
+    assert "timings" not in progress[0]  # No measured interval yet.
+    assert progress[1]["timings"] == {"predicted_per_second": 2.0}
+    text = [e for e in events if e["type"] == "response.output_text.delta"]
+    assert text[-1]["timings"] == progress[-1]["timings"]
+    assert events[-1]["type"] == "response.completed"
+
+
+def test_responses_emit_real_prefill_progress_before_first_token(client):
+    tokens = [
+        _token(
+            token_count=0,
+            prompt_progress={
+                "status": status,
+                "processed_tokens": count,
+                "total_tokens": 16,
+            },
+        )
+        for status, count in (("started", 0), ("in_progress", 8), ("completed", 16))
+    ]
+    tokens.append(_token("answer", finish_reason="stop"))
+    with _endpoint(generator=_streaming(tokens, prompt_tokens=16)):
+        response = _post(client, "responses", stream=True)
+    events = _data(response)
+    prompt = [e for e in events if e.get("type") == "response.prompt_progress"]
+    assert [e["processed_tokens"] for e in prompt] == [0, 8, 16]
+    assert all(e["response_id"].startswith("resp_") for e in prompt)
+    first_text = next(
+        i for i, e in enumerate(events) if e.get("type") == "response.output_text.delta"
+    )
+    assert all(events.index(e) < first_text for e in prompt)
+    progress = [e for e in events if e.get("type") == "response.generation_progress"]
+    assert progress[-1]["output_tokens"] == 1
+    assert events[-1]["response"]["usage"]["output_tokens"] == 1

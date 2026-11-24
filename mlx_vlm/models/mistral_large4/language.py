@@ -982,10 +982,16 @@ class LanguageModel(nn.Module):
     def shard(self, group=None):
         group = group or mx.distributed.init()
         n = self.args.n_routed_experts
-        start, end = (
-            n * group.rank() // group.size(),
-            n * (group.rank() + 1) // group.size(),
-        )
+        rank, size = group.rank(), group.size()
+        if not 0 <= rank < size <= n:
+            raise ValueError("Invalid expert partition")
+        start, end = n * rank // size, n * (rank + 1) // size
+        original = (self.args.expert_start, self.args.expert_end)
+        if original not in ((0, n), (start, end)):
+            raise ValueError(
+                f"Checkpoint partition {original} does not match rank {rank}: "
+                f"expected {(start, end)}"
+            )
         for layer in self.layers:
             moe = layer.feed_forward
             if not isinstance(moe, MoE):
@@ -996,8 +1002,11 @@ class LanguageModel(nn.Module):
                 for linear in (moe.experts.w1, moe.experts.w2, moe.experts.w3):
                     for key, value in list(linear.items()):
                         if isinstance(value, mx.array) and value.shape[0] == n:
-                            linear[key] = value[start:end]
+                            # Own the selected experts instead of retaining the
+                            # full tensor through a contiguous slice view.
+                            linear[key] = mx.take(value, mx.arange(start, end), axis=0)
             moe.start, moe.end, moe.group = start, end, group
+        self.args.expert_start, self.args.expert_end = start, end
         # Dense decode shares output rows; prefill retains native GEMMs.
         self.group = group
         for layer in self.layers:

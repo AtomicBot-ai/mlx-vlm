@@ -24,6 +24,7 @@ from mlx_vlm.generate import (
     BatchResponse,
     BatchStats,
     GenerationBatch,
+    PromptCacheState,
     PromptProcessingBatch,
     SpeculativeGenerationBatch,
     _left_pad_prompts,
@@ -191,6 +192,24 @@ def test_batch_generator_apc_media_token_ids_handles_text_only_model(mock_proces
     )
 
     assert generator._apc_media_token_ids() == set()
+
+
+def test_batch_generator_apc_key_includes_per_video_timing(mock_model, mock_processor):
+    generator = BatchGenerator(
+        mock_model,
+        mock_processor,
+        apc_manager=apc_module.APCManager(num_blocks=1),
+        manage_wired_limit=False,
+    )
+    pixels = mx.zeros((8, 4))
+    keys = [
+        generator._apc_extra_hash(
+            {"pixel_values_videos": pixels, "second_per_grid_ts": seconds}
+        )
+        for seconds in ([1.0, 0.5], mx.array([1.0, 0.5]), [0.5, 1.0])
+    ]
+    assert keys[0] == keys[1]
+    assert keys[0] != keys[2]
 
 
 class TestGenerationBatch:
@@ -1497,6 +1516,55 @@ class TestThinkingBudgetCriteria:
         assert criteria.pop_forced_token_id() is None
 
 
+@pytest.mark.parametrize(
+    "override",
+    [
+        {},
+        {"enable_thinking": None},
+        {"enable_thinking": True},
+        {"enable_thinking": False},
+    ],
+)
+@pytest.mark.parametrize("prompt_ids", [[1, 99], [99, 50, 100, 1], [1, 2]])
+def test_stream_generate_budget_follows_default_thinking(override, prompt_ids):
+    tokenizer = FakeTokenizer()
+    model = SimpleNamespace(config=MockConfig(), language_model=SimpleNamespace())
+    with (
+        patch.object(
+            dispatch_module, "wired_limit", return_value=contextlib.nullcontext()
+        ),
+        patch.object(dispatch_module, "make_streaming_detokenizer"),
+        patch.object(
+            dispatch_module, "generate_step", return_value=iter(())
+        ) as generate,
+    ):
+        list(
+            dispatch_module.stream_generate(
+                model,
+                tokenizer,
+                prompt="",
+                input_ids=mx.array([prompt_ids]),
+                pixel_values=None,
+                mask=None,
+                prompt_cache=[],
+                thinking_budget=1,
+                **override,
+            )
+        )
+
+    criteria = generate.call_args.kwargs["thinking_budget_criteria"]
+    enabled = override.get("enable_thinking") is not False
+    assert criteria.in_thinking is (enabled and prompt_ids[-1] == 99)
+    if prompt_ids[-1] != 99:
+        # Ordinary answer tokens and closed blocks must not consume the budget.
+        assert criteria(50) is None
+        assert criteria.thinking_token_count == 0
+        criteria(99)  # The model can open a thinking block itself.
+    assert criteria(50) is None
+    assert criteria(51) == (10 if enabled else None)
+    assert criteria(52) == (100 if enabled else None)
+
+
 @pytest.mark.parametrize("reused_prefix", [0, 1, 2])
 def test_stream_generate_stores_checkpoint_only_before_decode(reused_prefix):
     class FakeStoppingCriteria:
@@ -1674,6 +1742,123 @@ def test_cached_prefix_rope_forwards_full_prompt_metadata():
     assert bool(mx.array_equal(kwargs["rope_deltas"], rope_deltas))
     assert bool(mx.array_equal(language_model._position_ids, position_ids))
     assert bool(mx.array_equal(language_model._rope_deltas, rope_deltas))
+
+
+def test_cached_prefix_rope_forwards_video_timing_when_supported():
+    # PR #2760 regression: Qwen2.5-VL's get_rope_index scales video temporal
+    # positions by second_per_grid_ts, so priming without it produced a
+    # different _rope_deltas than prefill and corrupted APC prefix reuse.
+    seen = {}
+    position_ids = mx.array([[0, 1, 2]], dtype=mx.int32)
+    rope_deltas = mx.array([[9]], dtype=mx.int32)
+
+    class VideoRopeLanguageModel:
+        _position_ids = None
+        _rope_deltas = None
+
+        @staticmethod
+        def get_rope_index(
+            input_ids,
+            image_grid_thw=None,
+            video_grid_thw=None,
+            attention_mask=None,
+            second_per_grid_ts=None,
+        ):
+            seen["second_per_grid_ts"] = second_per_grid_ts
+            return position_ids, rope_deltas
+
+    seconds = mx.array([0.5, 1.0])
+    kwargs = {
+        "video_grid_thw": mx.array([[2, 4, 4]]),
+        "second_per_grid_ts": seconds,
+    }
+
+    ok = _prime_cached_prefix_rope_state(
+        SimpleNamespace(language_model=VideoRopeLanguageModel()),
+        mx.array([[1, 2, 3]], dtype=mx.int32),
+        None,
+        kwargs,
+    )
+
+    assert ok is True
+    assert seen["second_per_grid_ts"] is seconds
+    assert bool(mx.array_equal(kwargs["rope_deltas"], rope_deltas))
+
+
+@pytest.mark.parametrize("cache_kind", ["apc", "per_turn"])
+def test_video_prefix_reuse_requires_matching_timing(
+    cache_kind, mock_processor, monkeypatch
+):
+    from mlx_vlm.models import qwen2_5_vl
+    from mlx_vlm.tests.test_models import build_config, model_case
+
+    case = model_case("TestGetInputEmbeddings.qwen2_5_vl_input_embeddings")
+    config = build_config(qwen2_5_vl, case["config"])
+    config.vision_start_token_id, config.video_token_id = 27, 28
+    config.vision_config.window_size = 56
+    model = qwen2_5_vl.Model(config)
+    pixels = mx.random.normal((8, 1176))
+    if cache_kind == "apc":
+        monkeypatch.setenv("APC_LAYER_MAJOR_MEMORY_MIN_TOKENS", "4")
+        cache_kwargs = {
+            "apc_manager": apc_module.APCManager(num_blocks=8, block_size=4)
+        }
+    else:
+        cache_kwargs = {"prompt_cache_state": PromptCacheState()}
+
+    def run(seconds, suffix, **kwargs):
+        return list(
+            dispatch_module.stream_generate(
+                model,
+                mock_processor,
+                prompt="",
+                max_tokens=1,
+                input_ids=mx.array([[27, 28, 28] + [5] * 17 + [suffix]]),
+                pixel_values_videos=pixels,
+                video_grid_thw=mx.array([[2, 2, 2]]),
+                second_per_grid_ts=seconds,
+                **kwargs,
+            )
+        )[-1]
+
+    assert run([1.0], 6, **cache_kwargs).cached_tokens == 0
+    assert run(mx.array([1.0]), 7, **cache_kwargs).cached_tokens == 20
+    changed = run(mx.array([0.75]), 8, **cache_kwargs)
+    assert changed.cached_tokens == 0
+    assert mx.array_equal(changed.logprobs, run([0.75], 8).logprobs)
+
+
+def test_cached_prefix_rope_keeps_legacy_signature_working():
+    seen = {}
+    position_ids = mx.array([[0, 1, 2]], dtype=mx.int32)
+    rope_deltas = mx.array([[0]], dtype=mx.int32)
+
+    class LegacyRopeLanguageModel:
+        _position_ids = None
+        _rope_deltas = None
+
+        @staticmethod
+        def get_rope_index(
+            input_ids,
+            image_grid_thw=None,
+            video_grid_thw=None,
+            attention_mask=None,
+        ):
+            seen["called"] = True
+            return position_ids, rope_deltas
+
+    kwargs = {"second_per_grid_ts": mx.array([0.5])}
+
+    ok = _prime_cached_prefix_rope_state(
+        SimpleNamespace(language_model=LegacyRopeLanguageModel()),
+        mx.array([[1, 2, 3]], dtype=mx.int32),
+        None,
+        kwargs,
+    )
+
+    assert ok is True
+    assert seen["called"] is True
+    assert bool(mx.array_equal(kwargs["position_ids"], position_ids))
 
 
 class TestPrefixCacheReuseTrim:
@@ -2272,6 +2457,22 @@ def test_sampling_filter_matches_numpy(name, values, reference, tolerance):
     if name == "p_less":
         output = sampling.apply_p_less(mx.array([10.0, 0.0, 0.0, 0.0, 0.0]), 1.0)
         assert (output != -mx.inf).tolist() == [True, False, False, False, False]
+
+
+@pytest.mark.parametrize("special_tokens", [[], [0]])
+@pytest.mark.parametrize("probability", [0.0, 1.0])
+def test_xtc_keeps_the_same_candidates_alone_and_in_a_batch(
+    special_tokens, probability
+):
+    scores = mx.log(
+        mx.array([[0.7, 0.2, 0.1], [0.34, 0.33, 0.33], [0.98, 0.015, 0.005]])
+    )
+    batched = sampling.apply_xtc(scores, probability, 0.1, special_tokens)
+    individual = mx.stack(
+        [sampling.apply_xtc(row, probability, 0.1, special_tokens) for row in scores]
+    )
+    assert mx.array_equal(batched, individual).item()
+    assert mx.all(mx.any(mx.isfinite(batched), axis=-1)).item()
 
 
 @pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
@@ -3222,3 +3423,140 @@ def test_prefill_failure_releases_reservation_after_delivering_last_decode(
         assert error.value.uid == refused
         assert gen.apc.finish_prefill.called
         assert gen.unprocessed_prompts[0][0] == refused
+
+
+def test_ernie55_continuous_batch_matches_single_with_late_arrival():
+    from mlx_vlm.tests.test_models import make_ernie55_model
+
+    model = make_ernie55_model()
+    prompts = [list(range(3)), list(range(11)), list(range(7))]
+    limits = [8, 8, 5]
+    expected = [
+        [
+            int(token)
+            for token, _ in ar_module.generate_step(
+                mx.array([prompt]),
+                model,
+                None,
+                None,
+                max_tokens=limit,
+                temperature=0,
+                prefill_step_size=3,
+            )
+        ]
+        for prompt, limit in zip(prompts, limits)
+    ]
+    processor = MockProcessor()
+    processor.tokenizer.stopping_criteria.eos_token_ids = []
+    generator = BatchGenerator(model, processor, stop_tokens=set(), prefill_step_size=3)
+
+    def insert(indices):
+        return generator.insert(
+            [prompts[i] for i in indices],
+            max_tokens=[limits[i] for i in indices],
+            prompt_kwargs=[
+                {
+                    "inputs_embeds": model.get_input_embeddings(
+                        mx.array([prompts[i]])
+                    ).inputs_embeds
+                }
+                for i in indices
+            ],
+        )
+
+    uids = insert([0, 1])
+    actual = {uid: [] for uid in uids}
+    try:
+        for _ in range(100):
+            _, responses = generator.next()
+            for response in responses:
+                actual[response.uid].append(response.token)
+            if len(uids) == 2 and responses:
+                late_uid = insert([2])[0]
+                uids.append(late_uid)
+                actual[late_uid] = []
+                cancelled = insert([2])[0]
+                assert generator.remove(cancelled)
+            if len(uids) == 3 and all(
+                len(actual[uid]) == limit for uid, limit in zip(uids, limits)
+            ):
+                break
+        assert [actual[uid] for uid in uids] == expected
+    finally:
+        generator.close()
+
+
+@pytest.mark.parametrize("batch_size", [1, 2, 4])
+def test_ernie_echo_batch_padding_completion_and_late_arrival(batch_size):
+    from mlx_vlm.tests.test_speculative import ernie_echo_case
+
+    target, draft = ernie_echo_case()
+    prompts = [list(range(5 + i * 3)) for i in range(batch_size + 1)]
+    limits = [8 + i * 3 for i in range(batch_size + 1)]
+    expected = [
+        [
+            int(t)
+            for t, _ in ar_module.generate_step(
+                mx.array([prompt]), target, None, None, max_tokens=limit, temperature=0
+            )
+        ]
+        for prompt, limit in zip(prompts, limits)
+    ]
+    processor = MockProcessor()
+    processor.tokenizer.stopping_criteria.eos_token_ids = []
+    gen = BatchGenerator(
+        target.language_model,
+        processor,
+        draft_model=draft,
+        draft_kind="mtp",
+        draft_block_size=3,
+        prefill_step_size=3,
+        prefill_batch_size=batch_size,
+        completion_batch_size=batch_size,
+        compute_logprobs=False,
+    )
+
+    def insert(indices):
+        return gen.insert(
+            [prompts[i] for i in indices],
+            [limits[i] for i in indices],
+            prompt_kwargs=[
+                {
+                    "inputs_embeds": target.get_input_embeddings(
+                        mx.array([prompts[i]])
+                    ).inputs_embeds
+                }
+                for i in indices
+            ],
+        )
+
+    uids = insert(range(batch_size))
+    actual = {uid: [] for uid in uids}
+    try:
+        for step in range(200):
+            _, responses = gen.next()
+            for r in responses:
+                actual[r.uid].append(r.token)
+            if responses and len(uids) == batch_size:
+                uids += insert([batch_size])
+                actual[uids[-1]] = []
+                cancelled = insert([batch_size])[0]
+                assert gen.remove(cancelled)
+            if not gen.has_work:
+                break
+        assert [actual[uid] for uid in uids] == expected
+    finally:
+        gen.close()
+
+
+class TestApplyMinPZeroThreshold:
+    def test_zero_threshold_keeps_every_token(self):
+        logprobs = mx.array([[-0.1, -2.5, -8.0, -20.0]], dtype=mx.float32)
+        result = sampling.apply_min_p(logprobs, 0.0)
+        assert mx.array_equal(result, logprobs).item()
+
+    def test_positive_threshold_still_filters(self):
+        logprobs = mx.array([[-0.1, -2.5, -8.0, -20.0]], dtype=mx.float32)
+        filtered = sampling.apply_min_p(logprobs, 0.5)
+        assert filtered[0, 0] == logprobs[0, 0]
+        assert mx.isinf(filtered[0, 1:]).all().item()

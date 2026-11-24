@@ -3,6 +3,8 @@ mlx_vlm.convert no longer imports mlx_lm. Pure mlx.core/mlx.nn; behaviour is
 identical. Part of the mlx-lm removal series."""
 
 import copy
+import inspect
+from functools import partial
 from typing import Callable, Optional, Tuple, Union
 
 import mlx.core as mx
@@ -84,6 +86,9 @@ def quantize_model(
           each layer based on the path. Accepts the layer `path` and the
           `module`. Returns either a bool to signify quantize/no quantize or
           a dict of quantization parameters to pass to `to_quantized`.
+          Predicates accepting a `quantization` keyword receive the resolved
+          group size, bits, and mode. They also select formats for existing
+          quantized modules; excluded modules keep their weights and metadata.
 
     Returns:
         Tuple: Tuple containing quantized model and config.
@@ -95,6 +100,14 @@ def quantize_model(
     quant_params = get_quantization_params(group_size, bits, mode)
     group_size = quant_params["group_size"]
     bits = quant_params["bits"]
+    try:
+        accepts_quantization = (
+            "quantization" in inspect.signature(quant_predicate).parameters
+        )
+    except (TypeError, ValueError):
+        accepts_quantization = False
+    if accepts_quantization:
+        quant_predicate = partial(quant_predicate, quantization=quant_params)
     if "quantization" in quantized_config:
         # If the model is already partially quantized, return params so that
         # the config is set on a per-layer basis
@@ -104,10 +117,14 @@ def quantize_model(
         quantized_config["quantization"] = dict(quant_params)
 
     def wrapped_predicate(path, module):
-        if not hasattr(module, "to_quantized"):
+        if not hasattr(module, "to_quantized") and not (
+            accepts_quantization and hasattr(module, "scales")
+        ):
             return False
 
         input_dims = module.weight.shape[-1]
+        if hasattr(module, "bits"):
+            input_dims = input_dims * 32 // module.bits
         bool_or_params = True
         default_group_is_compatible = input_dims % group_size == 0
         if not default_group_is_compatible:
@@ -132,6 +149,15 @@ def quantize_model(
                 and input_dims % fallback_group_size == 0
             ):
                 bool_or_params["group_size"] = fallback_group_size
+        if accepts_quantization and isinstance(bool_or_params, dict):
+            bool_or_params = {
+                **get_quantization_params(
+                    bool_or_params.get("group_size"),
+                    bool_or_params.get("bits"),
+                    bool_or_params.get("mode", "affine"),
+                ),
+                **bool_or_params,
+            }
         module_group_size = (
             bool_or_params.get("group_size", group_size)
             if isinstance(bool_or_params, dict)
@@ -145,12 +171,30 @@ def quantize_model(
             quantized_config["quantization"][path] = quant_params
         return bool_or_params
 
+    requantize = {}
+
+    def needs_requantization(path, module):
+        current = {key: getattr(module, key) for key in quant_params}
+        selected = wrapped_predicate(path, module)
+        if not selected:
+            quantized_config["quantization"][path] = current
+            return False
+        requested = selected if isinstance(selected, dict) else dict(quant_params)
+        quantized_config["quantization"][path] = requested
+        if current == requested:
+            return False
+        requantize[path] = requested
+        return True
+
+    if accepts_quantization:
+        dequantize_model(model, class_predicate=needs_requantization)
     nn.quantize(
         model,
         group_size,
         bits,
         mode=mode,
-        class_predicate=wrapped_predicate,
+        class_predicate=lambda path, module: requantize.get(path)
+        or (hasattr(module, "to_quantized") and wrapped_predicate(path, module)),
     )
     # support hf model tree #957
     quantized_config["quantization_config"] = quantized_config["quantization"]
@@ -161,12 +205,17 @@ def quantize_model(
     return model, quantized_config
 
 
-def dequantize_model(model: nn.Module) -> nn.Module:
+def dequantize_model(
+    model: nn.Module,
+    class_predicate: Optional[Callable[[str, nn.Module], bool]] = None,
+) -> nn.Module:
     """
     Dequantize the quantized layers in the model.
 
     Args:
         model (nn.Module): The model with quantized layers.
+        class_predicate (Callable, optional): Select which quantized modules to
+            restore. Omitted means all supported quantized modules.
 
     Returns:
         nn.Module: The model with dequantized layers.
@@ -188,20 +237,11 @@ def dequantize_model(model: nn.Module) -> nn.Module:
             kwargs = {}
             cls = nn.Embedding
         elif isinstance(module, QuantizedMultiLinear):
-            weight = mx.dequantize(
-                module.weight,
-                module.scales,
-                module.biases,
-                module.group_size,
-                module.bits,
-                module.mode,
-            )
-            num_heads, output_dims, input_dims = weight.shape
-            m = MultiLinear(input_dims, output_dims, num_heads)
-            m.weight = weight
-            dequantize_layers.append((name, m))
-            continue
+            kwargs = {}
+            cls = MultiLinear
         else:
+            continue
+        if class_predicate is not None and not class_predicate(name, module):
             continue
         weight = mx.dequantize(
             module.weight,

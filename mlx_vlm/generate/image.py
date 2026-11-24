@@ -182,6 +182,10 @@ def _model_type_from_id(model: str) -> str:
     if not model_id:
         return ""
     name = model_id.rsplit("/", 1)[-1]
+    if name.startswith(
+        ("minimax-h3-image", "minimax_h3_image")
+    ) and not name.startswith(("minimax-h3-image-pe", "minimax_h3_image_pe")):
+        return "minimax_h3_image"
     if name.startswith("flux-3-") and not name.startswith("flux-3-image-klein-pup"):
         return "flux3"
     model_type = name.split("-", 1)[0]
@@ -237,6 +241,12 @@ def _model_types_from_class_name(class_name: str) -> tuple[str, ...]:
 
 def _image_model_types_from_metadata(metadata: dict[str, Any]) -> tuple[str, ...]:
     candidates: list[str] = []
+    if metadata.get("_class_name") in {
+        "MiniMaxH3ImagePipeline",
+        "MiniMaxH3ImageTransformer2DModel",
+        "AutoencoderKLMiniMaxH3Image",
+    }:
+        _add_model_type(candidates, "minimax_h3_image")
     # BFL's native Flux3 package has a `dit` configuration instead of a
     # Diffusers pipeline class. Identify it before the Qwen text component.
     dit = metadata.get("dit")
@@ -429,6 +439,24 @@ def _resolve_image_model_path(
     model_path = Path(model).expanduser()
     if model_path.exists():
         return model_path
+    model_type = _model_type_from_id(model)
+    if _image_model_class_for_type(model_type) is None:
+        metadata_path = get_model_path(
+            model,
+            revision=revision,
+            allow_patterns=list(IMAGE_METADATA_DOWNLOAD_PATTERNS),
+        )
+        if "minimax_h3_image" in _local_image_model_types(str(metadata_path)):
+            model_type = "minimax_h3_image"
+    if model_type == "minimax_h3_image":
+        from ..models.minimax_h3_image.download import SOURCE_REPO_ID, download_model
+
+        source = (
+            SOURCE_REPO_ID
+            if model in {"minimax-h3-image", "minimax_h3_image"}
+            else model
+        )
+        return download_model(source, revision=revision, force_download=force_download)
     if _model_type_from_id(model) == "flux3":
         from ..models.flux3.download import download_model
 

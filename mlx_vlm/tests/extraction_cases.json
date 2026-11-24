@@ -447,6 +447,21 @@
       "checks": ["registry_and_config", "forward", "checkpoint"]
     },
     {
+      "id": "depth_pro_2",
+      "module": "depth_pro_2",
+      "config": {
+        "backbone_preset": "vit_small_patch16_dinov3",
+        "reassembled_blocks": [2, 5, 8, 11],
+        "cross_frame_blocks": [5, 7, 9, 11],
+        "dims_reassemble": [8, 12, 16, 24],
+        "dim_decoder": 8,
+        "fov": false
+      },
+      "input_shape": [2, 35, 47, 3],
+      "output_shapes": [2, 35, 47],
+      "checks": ["registry_and_config", "forward", "checkpoint"]
+    },
+    {
       "id": "sam3_1",
       "module": "sam3_1",
       "config": {},

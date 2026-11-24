@@ -34,6 +34,7 @@
     - [Thinking Budget](#thinking-budget)
   - [Speculative Decoding](#speculative-decoding)
     - [DFlash, DFlash2, and DSpark](#dflash-dflash2-and-dspark)
+    - [Bundled native heads](#bundled-native-heads)
     - [Gemma 4 MTP](#gemma-4-mtp)
     - [Gemma 4 EAGLE-3](#gemma-4-eagle-3)
     - [MiniMax M3 EAGLE-3](#minimax-m3-eagle-3)
@@ -60,7 +61,9 @@ Some models have detailed documentation with prompt formats, examples, and best 
 
 | Model | Documentation |
 |-------|---------------|
+| Inkling 2 Mini and Small | [Docs](mlx_vlm/models/inkling2/README.md) |
 | LFM3 / LFM3-VL | [Docs](mlx_vlm/models/lfm3/README.md) |
+| SenseNova-Loop-9B | [Docs](mlx_vlm/models/sensenova_loop/README.md) |
 | LFM3-Audio | [Docs](mlx_vlm/models/lfm3_audio/README.md) |
 | LFM3-Omni | [Docs](mlx_vlm/models/lfm3_omni/README.md) |
 | DeepSeek-OCR | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/deepseekocr/README.md) |
@@ -68,6 +71,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | Unlimited-OCR | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/unlimited_ocr/README.md) |
 | DOTS-OCR | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/dots_ocr/README.md) |
 | DOTS-MOCR | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/dots_ocr/README.md) |
+| ERNIE 5.5 Flash Base (text) | [Docs](mlx_vlm/models/ernie5_5_moe/README.md) |
 | ERNIE 4.5 VL | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/ernie4_5_moe_vl/README.md) |
 | GLM-OCR | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/glm_ocr/README.md) |
 | Phi-4 Reasoning Vision | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/phi4_siglip/README.md) |
@@ -83,11 +87,14 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | Gemma 4 | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/gemma4/README.md) |
 | Muse Spark Open | [Docs](mlx_vlm/models/muse_spark/README.md) |
 | MiniMax M3 / M3.1 Flash | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/minimax_m3_vl/README.md) |
+| MiniMax-H3-Image | [Docs](mlx_vlm/models/minimax_h3_image/README.md) |
+| Ling 3.1 Flash | [Docs](mlx_vlm/models/bailing_hybrid/README.md) |
 | Falcon-OCR | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/falcon_ocr/README.md) |
 | IndicOCR | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/indic_ocr/README.md) |
 | PP-DocLayoutV3 | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/pp_doclayout_v3/README.md) |
 | Granite Vision 3.2 | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/granite_vision/README.md) |
 | Granite Vision (4.0, 4.1) | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/granite4_vision/README.md) |
+| Granite for Docling | [Docs](mlx_vlm/models/granite_docling/README.md) |
 | MiniCPM-OCR 1.0 | [Docs](mlx_vlm/models/minicpm_ocr/README.md) |
 | MiniCPM-OCR Jev | [Docs](mlx_vlm/models/minicpm_ocr_jev/README.md) |
 | MiniCPM-V 4.7 | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/minicpmv4_7/README.md) |
@@ -100,8 +107,10 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | Spark-X2.5 | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/spark2_5/README.md) |
 | Ternary Bonsai 2 | [Docs](mlx_vlm/models/prism_hadamard_qwen35/README.md) |
 | Flint | [Docs](mlx_vlm/models/flint/README.md) |
+| Ripple | [Docs](mlx_vlm/models/ricursive/README.md) |
 | Nemotron 3.5 Super VL / Bolt / Nano Omni | [Docs](mlx_vlm/models/nemotron_h_nano_omni/README.md) |
 | Idol (image to 3D Gaussian splats) | [Docs](mlx_vlm/models/idol/README.md) |
+| Depth Pro 2 (image and video depth) | [Docs](mlx_vlm/models/depth_pro_2/README.md) · [S](https://huggingface.co/nativ-community/DepthPro2-S) · [B](https://huggingface.co/nativ-community/DepthPro2-B) · [L](https://huggingface.co/nativ-community/DepthPro2-L) · [H+](https://huggingface.co/nativ-community/DepthPro2-H) |
 
 ## Installation
 
@@ -130,6 +139,7 @@ This repo ships an agent-skills bundle under `skills/` for common MLX-VLM workfl
 | `cli-inference` | Run and debug command-line inference (`mlx_vlm.generate`) — text/image/audio inputs and image-generation flags. |
 | `server-inference` | Run and debug the local server across the models, chat, responses, messages, audio, image, cache, and metrics endpoints. |
 | `convert-quantize` | Convert and quantize Hugging Face models to MLX (`mlx_vlm.convert`) — bits/group size, quant modes, RTN/AWQ, mixed recipes. |
+| `training` | Check, start, follow, and stop training runs (`mlx_vlm.train_runs`) — options from `describe`, dataset rows, usage caps. |
 | `add-new-model` | Port a new architecture into `mlx_vlm/models` — config, weight-name mapping, reuse a similar model, add a test class. |
 | `benchmarking` | Produce credible, reproducible perf numbers and fork-vs-main A/B tables for PRs. |
 | `contributing` | Shape a change to pass review — code/config/test placement, pre-commit hooks, and PR expectations. |
@@ -198,12 +208,14 @@ mlx_vlm.generate --model mlx-community/Qwen3.5-2B-4bit \
 
 | Flag | Description |
 |------|-------------|
-| `--enable-thinking` | Activate thinking mode in the chat template |
+| `--enable-thinking` / `--no-enable-thinking` | Enable / disable thinking in the chat template; omit both to use the model's default |
 | `--thinking-budget` | Max tokens allowed inside the thinking block |
 | `--thinking-start-token` | Token that opens a thinking block (default: `<think>`) |
 | `--thinking-end-token` | Token that closes a thinking block (default: `</think>`) |
 
-When the budget is exceeded, the model is forced to emit `\n</think>` and transition to the answer. If `--enable-thinking` is passed but the model's chat template does not support it, the budget is applied only if the model generates the start token on its own.
+For `mlx_vlm.generate` (including `--chat`) and `mlx_vlm.chat`, omitting both thinking flags preserves the model's chat-template default. Use `--no-enable-thinking` to explicitly request a response without thinking when supported by the model. `--thinking-mode` takes precedence for templates that use that setting.
+
+When the budget is exceeded, the model is forced to emit `\n</think>` and transition to the answer. The budget also works with the model's default thinking mode: it starts counting when the prompt leaves a thinking block open or the model generates the start token. Closed thinking blocks in earlier turns do not count toward the budget.
 
 On the server, thinking mode is disabled by default. Start the server with `--enable-thinking` to make thinking mode the default for requests that do not specify it:
 
@@ -299,6 +311,22 @@ with `--draft-block-size 10`. The checkpoint's confidence head is loaded for
 parity, and DSpark decoding currently requires greedy sampling
 (`temperature=0`).
 
+Official OpenBMB and Red Hat Speculators checkpoints can also be loaded directly:
+
+```sh
+mlx_vlm.generate --model openbmb/MiniCPM5-2B \
+  --draft-model openbmb/MiniCPM5-2B-DSpark \
+  --prompt "Write a Python function that adds two integers." --temperature 0
+
+mlx_vlm.generate --model Qwen/Qwen3-4B \
+  --draft-model RedHatAI/Qwen3-4B-speculator.dspark \
+  --prompt "Explain speculative decoding." --temperature 0
+```
+
+The loader handles nested Speculators configs, reduced draft vocabularies,
+checkpoint-owned output heads, and each checkpoint's anchor convention.
+See [official checkpoint support](docs/speculative-decoding.md#official-checkpoint-support).
+
 Muse Glimmer's published assistant checkpoint is auto-detected as DFlash:
 
 ```sh
@@ -341,6 +369,20 @@ result = generate(
     draft_kind=draft_kind,
 )
 ```
+
+#### Bundled native heads
+
+Bundled native heads are detected when the same original checkpoint is passed
+as the target and drafter. For example:
+
+```sh
+mlx_vlm.generate --model JetBrains/Mellum2.1-12B-A2.5B-Thinking-MTP \
+  --draft-model JetBrains/Mellum2.1-12B-A2.5B-Thinking-MTP \
+  --prompt "Write a Python function that adds two integers." --temperature 0
+```
+
+This also applies to DeepSeek V4.1's bundled DSpark stages. Use
+`mlx_vlm.convert --mtp` to extract a native head alongside a converted target.
 
 #### Gemma 4 MTP
 
@@ -632,6 +674,10 @@ mlx_vlm.server --api-key <secret-token>
 # Include local models outside the Hugging Face cache
 mlx_vlm.server --model-dir /Volumes/Models --model-dir ~/my-custom-model
 ```
+
+Use `distributed: true` per request to run a model across configured Macs while
+keeping ordinary requests on the local loader. See [distributed serving](docs/distributed-serving.md)
+for worker setup, automatic checkpoint transfer, and current limitations.
 
 #### Server Options
 

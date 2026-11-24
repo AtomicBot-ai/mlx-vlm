@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import json
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
@@ -350,10 +351,17 @@ class ImageChecks:
             assert {k: pipeline.calls[-1][k] for k in forwarded} == forwarded
 
     def forward(self, case):
-        output = getattr(ForwardInputs, case["adapter"])(
-            _component(case), case["input"]
-        )
-        mx.eval(output)
+        model = _component(case)
+        mx.eval(model.parameters())
+
+        def run():
+            output = getattr(ForwardInputs, case["adapter"])(model, case["input"])
+            mx.eval(output)
+            return output
+
+        # A worker's first forward catches lazy caches outside the parameter tree.
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            output = executor.submit(run).result()
         assert output.shape == tuple(case["expected_shape"])
         assert bool(mx.all(mx.isfinite(output)))
 
@@ -973,6 +981,24 @@ def test_flux2_remote_component_index_is_a_metadata_fallback(monkeypatch, tmp_pa
         DISCOVERY_PATTERNS,
         DISCOVERY_PATTERNS + ["**/model.safetensors.index.json"],
     ]
+
+
+def test_flux2_text_rope_first_call_on_worker_thread():
+    from mlx_vlm.models.flux2.qwen.rotary import Qwen3TextRotaryEmbedding
+
+    rope = Qwen3TextRotaryEmbedding(dim=4, base=100.0)
+    assert not rope.parameters()
+
+    def run():
+        cos, sin = rope(mx.zeros((1, 2, 4)), mx.array([0, 1]))
+        return np.array(cos), np.array(sin)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        cos, sin = executor.submit(run).result()
+
+    angles = np.array([[[0, 0, 0, 0], [1, 0.1, 1, 0.1]]])
+    assert_allclose(cos, np.cos(angles), atol=1e-6)
+    assert_allclose(sin, np.sin(angles), atol=1e-6)
 
 
 def test_flux2_text_encoder_accepts_native_quantized_keys(monkeypatch, tmp_path):
@@ -1755,6 +1781,22 @@ def test_mage_flow_conversion_prefers_source_id_variant(monkeypatch, tmp_path):
     assert metadata["variant"] == "mage-flow-edit-turbo"
 
 
+def test_ideogram4_rotary_tables_on_worker_thread():
+    rope = ideogram.transformer.Ideogram4MRoPE(6, 1000, (1, 1, 1))
+    assert not rope.parameters()
+
+    def run():
+        cos, sin = rope(mx.array([[[2, 3, 4]]]))
+        return np.array(cos), np.array(sin)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        cos, sin = executor.submit(run).result()
+
+    angles = np.array([[[2, 0.3, 0.04] * 2]])
+    assert_allclose(cos, np.cos(angles), atol=1e-6)
+    assert_allclose(sin, np.sin(angles), atol=1e-6)
+
+
 @pytest.mark.parametrize("case", ["expand", "structured", "invalid"])
 def test_ideogram_prompt_expansion_policy(monkeypatch, case):
     failure = ideogram.prompting.PromptExpansionCaptionError("bad json")
@@ -2077,6 +2119,35 @@ def test_qwen_image_pipeline_scopes_kv_cache_to_each_edit_and_cfg_branch(
     assert_array_equal(decoded[0], decoded[1])
     model._sample(**args, use_kv_cache=False)
     assert_allclose(decoded[0], decoded[2], atol=0.04, rtol=0.04)
+
+
+def test_qwen_image_latent_normalization_on_worker_thread(tmp_path, monkeypatch):
+    _write_files(
+        tmp_path,
+        metadata={
+            "vae/config.json": {
+                "z_dim": 2,
+                "latents_mean": [1.0, -2.0],
+                "latents_std": [2.0, 3.0],
+            }
+        },
+    )
+    monkeypatch.setattr(qwen.pipeline, "QwenImageTextEncoder", Mock())
+    model = qwen.pipeline.QwenImagePipeline(
+        variant=qwen.config.get_variant(),
+        model_path=tmp_path,
+        text_encoder=None,
+        transformer=None,
+        vae=None,
+    )
+
+    def run():
+        latents = mx.full((1, 2, 1, 1, 1), 2.0)
+        return np.array(latents * model.latents_std + model.latents_mean)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        actual = executor.submit(run).result()
+    assert_array_equal(actual, np.array([5.0, 4.0]).reshape(1, 2, 1, 1, 1))
 
 
 @pytest.mark.parametrize("shift_terminal", [0.02, 0.13])

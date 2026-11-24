@@ -25,6 +25,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import pytest
+from mlx.utils import tree_flatten
 
 import mlx_vlm.models as models
 import mlx_vlm.turboquant as tq
@@ -84,7 +85,16 @@ from mlx_vlm.models.qwen4_exp.language import (
 )
 from mlx_vlm.models.unlimited_ocr.language import RingSlidingKVCache
 from mlx_vlm.models.z1t.language import AFTConv, Z1TCache
-from mlx_vlm.tests.test_models import DATA, build_config, model_case
+from mlx_vlm.speculative import dflash
+from mlx_vlm.speculative.common import verify_forward
+from mlx_vlm.tests.test_models import (
+    DATA,
+    build_config,
+    make_ernie55_model,
+    make_inkling2_model,
+    model_case,
+    tiny_language_model,
+)
 from mlx_vlm.turboquant import (
     BatchTurboQuantKVCache,
     TurboQuantKVCache,
@@ -1548,6 +1558,15 @@ class TestVisionFeatureCache:
         assert square != wide
         assert square == processed_image_key(mx.zeros((16, 3)), mx.array([[1, 4, 4]]))
 
+    def test_processed_key_separates_granite_docling_routes(self):
+        pixels = mx.zeros((1, 2, 3, 8, 8))
+        coarse = processed_image_key(pixels)
+        fine = processed_image_key(pixels, tile_fine_mask=mx.array([True]))
+        assert coarse != fine
+        assert fine == processed_image_key(
+            mx.zeros((1, 2, 3, 8, 8)), tile_fine_mask=mx.array([True]), max_tokens=8
+        )
+
     def test_processed_key_handles_ragged_image_batches(self):
         images = [mx.zeros((4, 3)), mx.ones((16, 3))]
         key = processed_image_key(images)
@@ -1674,10 +1693,9 @@ def coordinate(manager, caches):
 @pytest.fixture
 def managers(tmp_path, monkeypatch):
     """Own writers and readers, including reopened namespaces and memory budgets."""
-    # Keep one real host-memory reading per case. Budget/pressure tests override
-    # this explicitly; repeated vm_stat processes add no cache-lifecycle coverage.
-    free_ram = P._free_ram_bytes()
-    monkeypatch.setattr(P, "_free_ram_bytes", lambda: free_ram)
+    # Lifecycle tests must not depend on the runner's current memory pressure.
+    # Budget/pressure tests override this explicitly to exercise admission limits.
+    monkeypatch.setattr(P, "_free_ram_bytes", lambda: 1 << 40)
     owned = []
 
     def make(
@@ -1845,6 +1863,38 @@ def test_hashes_and_dependencies():
     assert P.model_key_dependencies(None, None) == ()
 
 
+@pytest.mark.parametrize("sequence", [list, tuple])
+def test_ragged_image_payloads_scope_exact_cache(prefix_manager, sequence):
+    def image_cache_key(value):
+        slices = (
+            np.zeros((3, 2, 8), dtype=np.float32),
+            np.full((3, 2, 4), value, dtype=np.float32),
+        )
+        pixels = sequence((sequence(slices),))
+        return P.semantic_extra_hash(
+            image_hash=P.hash_image_payload(pixel_values=pixels)
+        )
+
+    manager = prefix_manager(budget=1 << 20)
+    prefix = list(range(32))
+    tokens = prefix + [32]
+    keys = [image_cache_key(value) for value in (0, 1)]
+    assert keys[0] != keys[1]
+
+    for value, key in enumerate(keys):
+        assert manager.lookup_exact_cache(tokens, extra_hash=key) == (None, 0)
+        assert manager.store_exact_cache(
+            prefix, [allocated(len(prefix), value)], extra_hash=key
+        )
+
+    for value in (0, 1):
+        restored, count = manager.lookup_exact_cache(
+            tokens, extra_hash=image_cache_key(value)
+        )
+        assert count == len(prefix)
+        assert restored[0].keys[0, 0, 0, 0].item() == value
+
+
 def test_blocks_and_statistics(managers):
     manager = managers(blocks=16)
     tokens = list(range(53))
@@ -1888,7 +1938,9 @@ def test_layer_major_threshold(managers, monkeypatch):
 
 def test_disk_block_lifecycle(managers, monkeypatch):
     monkeypatch.setenv("APC_DISK_SHARD_MAX_BLOCKS", "1")
-    manager = managers("disk", blocks=1)
+    # Disk restores check both free RAM and the manager's memory headroom.
+    monkeypatch.setenv("APC_DISK_MIN_FREE_RAM_GB", "0")
+    manager = managers("disk", blocks=1, budget=1 << 20)
     first, second = list(range(48)), list(range(100, 148))
     manager.release(store_blocks(manager, first))
     manager.disk.flush()
@@ -1900,7 +1952,7 @@ def test_disk_block_lifecycle(managers, monkeypatch):
     size = manager.disk.disk_bytes
     assert size > 0 and manager.disk.dir.exists()
     manager.close()
-    reader = managers("disk")
+    reader = managers("disk", budget=1 << 20)
     warm, count = reader.lookup_prefix_disk_cache(second)
     assert count == 48 and all(c.offset == 48 for c in warm)
     assert reader.stats_snapshot()["pool_used"] == 0
@@ -1911,8 +1963,10 @@ def test_disk_block_lifecycle(managers, monkeypatch):
 
 
 @parametrize("evicted", [1, 2])
-def test_disk_prefix_with_evicted_leading_blocks(managers, evicted):
-    manager = managers("disk", blocks=3)
+def test_disk_prefix_with_evicted_leading_blocks(managers, evicted, monkeypatch):
+    # Keep prefix restoration independent of the runner's available memory.
+    monkeypatch.setenv("APC_DISK_MIN_FREE_RAM_GB", "0")
+    manager = managers("disk", blocks=3, budget=1 << 20)
     tokens = list(range(48))
     source = [filled(C.KVCache(), 48, heads=1, dim=4)]
     stored = manager.store_kv_blocks(
@@ -1957,10 +2011,10 @@ def test_disk_policy_and_metadata(managers, monkeypatch):
         tokens, allow_memory_overlap=True, max_prefix_tokens=32, min_prefix_tokens=32
     ) == (None, 0)
     manager._disk_min_free_ram_bytes = 2
-    monkeypatch.setattr(P, "_free_ram_bytes", lambda: 1)
     lookup = manager.lookup_prefix_disk_cache
-    assert lookup(tokens, allow_memory_overlap=True) == (None, 0)
-    monkeypatch.undo()
+    with monkeypatch.context() as pressure:
+        pressure.setattr(P, "_free_ram_bytes", lambda: 1)
+        assert lookup(tokens, allow_memory_overlap=True) == (None, 0)
     writer = managers("disk", namespace="metadata")
     tokens = list(range(16))
     writer.release(store_blocks(writer, tokens, extra_hash=1))
@@ -1974,15 +2028,17 @@ def test_disk_policy_and_metadata(managers, monkeypatch):
 
 
 def test_exact_promotion_and_priority(managers, monkeypatch):
+    # Exercise promotion and LRU priority independently of runner memory pressure.
+    monkeypatch.setenv("APC_DISK_MIN_FREE_RAM_GB", "0")
     monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
     tokens = [list(range(20)), list(range(100, 120))]
-    writer = managers("disk")
+    writer = managers("disk", budget=4096)
     for value, ids in enumerate(tokens, 1):
         assert writer.store_exact_cache(ids, [allocated(20, value)])
     writer.disk.flush()
     writer.close()
     monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "1")
-    reader = managers("disk")
+    reader = managers("disk", budget=4096)
     for index, hits in [(0, 1), (0, 1), (1, 2), (0, 3)]:
         warm, count = reader.lookup_exact_cache(tokens[index] + [999])
         assert warm is not None and count == 20 and reader.stats.disk_hits == hits
@@ -2916,6 +2972,58 @@ def test_single_row_checkpoint(managers):
     assert batch._apc_manager.stats.exact_stores == 1
 
 
+@pytest.mark.parametrize("right_pad_per_row", [None, [0]], ids=["left", "right"])
+def test_prefill_releases_unused_logits_before_checkpoint(
+    managers, monkeypatch, right_pad_per_row
+):
+    cache = C.ArraysCache(1)
+    cache[0] = mx.arange(128, dtype=mx.float32).reshape(1, 1, -1)
+    mx.eval(cache.state)
+    state_bytes = cache[0].nbytes
+    manager = managers(budget=4 * state_bytes)
+    manager.exact_cache_guard_tokens = 32
+    live_logits = weakref.WeakValueDictionary()
+
+    class RecurrentModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = NS(embed_tokens=lambda ids: mx.zeros((*ids.shape, 1)))
+
+        def make_cache(self):
+            return [cache]
+
+        def __call__(self, inputs, cache, **kwargs):
+            previous = cache[0][0]
+            cache[0][0] = -previous
+            mx.eval(cache[0].state)
+            logits = mx.sin(previous)
+            live_logits["step"] = logits
+            return LanguageModelOutput(logits=logits)
+
+    model = RecurrentModel()
+    tokens = list(range(64))
+    batch = prompt_batch(
+        model,
+        manager,
+        [tokens],
+        [0],
+        [cache],
+        step=32,
+        right_pad_per_row=right_pad_per_row,
+    )
+    # The checkpoint and its reserve need two states' worth of headroom.
+    # Charge one state for the previous buffer while the lazy logits retain it.
+    with monkeypatch.context() as admission:
+        admission.setattr(
+            manager, "_memory_headroom", lambda: state_bytes * (1 if live_logits else 2)
+        )
+        assert batch.prompt_step() == 32
+    assert manager.stats.exact_stores == 1
+    restored, count = manager.lookup_exact_cache(tokens)
+    assert count == 32
+    assert mx.all(restored[0][0] == -mx.arange(128).reshape(1, 1, -1)).item()
+
+
 def test_generation_stream_spill(managers, monkeypatch):
     from mlx_vlm.generate.common import generation_stream
 
@@ -2961,9 +3069,9 @@ def test_tensor_limit_replaces_idle_history(managers, monkeypatch, tier):
 
 
 @parametrize("leased", [1, 2])
-def test_tensor_limit_preserves_active_blocks(managers, monkeypatch, leased):
+def test_tensor_limit_preserves_active_blocks(memory_manager, monkeypatch, leased):
     monkeypatch.setenv("APC_MAX_POOL_TENSORS", "8")
-    manager = managers("disk", blocks=8)
+    manager = memory_manager(disk=True)
     old = store_blocks(manager, list(range(32)))
     active = [(b.block_hash, list(b.keys), list(b.values)) for b in old[:leased]]
     manager.release(old[leased:])
@@ -3238,6 +3346,8 @@ def finish_batch(batch, sample=None):
 
 
 def embeddings(lm, tokens):
+    if callable(embed := getattr(lm.model, "embed", None)):
+        return embed(tokens)
     return lm.model.embed_tokens(tokens) * getattr(lm.model, "embed_scale", 1)
 
 
@@ -3394,7 +3504,7 @@ def test_diffusion_suffix(prefix_manager, tier):
     assert recorder.input_lengths[-1] == 1
 
 
-@parametrize("model_name", ["gemma4", "qwen3_5"])
+@parametrize("model_name", ["gemma4", "qwen3_5", "inkling2"])
 @parametrize("tier", ["memory", "disk"])
 @parametrize("path", ["stream", "batch"])
 def test_hybrid_prefix_generation(prefix_manager, model_name, tier, path):
@@ -4384,3 +4494,351 @@ def test_warm_rows_decode_while_cold_row_prefills(prefix_manager, model_name):
     assert manager._prefill_reserve_bytes == 0
     assert manager.memory_plan.lengths == []
     gen.close()
+
+
+def assert_cache_state_close(actual, expected, *, atol=0, rtol=0):
+    actual, expected = dict(tree_flatten(actual)), dict(tree_flatten(expected))
+    assert actual.keys() == expected.keys()
+    for key, value in actual.items():
+        reference = expected[key]
+        if value is None or reference is None:
+            assert value is reference, key
+        else:
+            assert value.shape == reference.shape, key
+            np.testing.assert_allclose(
+                np.array(value),
+                np.array(reference),
+                atol=atol,
+                rtol=rtol,
+                equal_nan=False,
+                err_msg=key,
+            )
+
+
+@pytest.mark.parametrize(
+    "family", ["qwen3", "llama", "mistral4", "kimi_k3", "deepseek_v41"]
+)
+@pytest.mark.parametrize("keep", [0, 1, 3])
+def test_target_hidden_capture_and_rejected_prefix(family, keep):
+    mx.random.seed(5)
+    model = tiny_language_model(family)
+    ordinary, speculative = C.make_prompt_cache(model), C.make_prompt_cache(model)
+    prompt, block = mx.array([[1, 2, 3, 4, 5, 6, 7]]), mx.array([[8, 9, 10]])
+    taps = [0, 1]
+    first = model(prompt, cache=ordinary, capture_layer_ids=taps)
+    assert_cache_state_close(first.logits, model(prompt, cache=speculative).logits)
+    assert len(first.hidden_states) == len(taps)
+    output, transaction = dflash._dflash_verify(model, block, speculative, taps)
+    expected = [
+        model(block[:, i : i + 1], cache=ordinary, capture_layer_ids=taps)
+        for i in range(keep)
+    ]
+    mx.eval(output.logits)
+    if keep:
+        model.rollback_speculative_cache(speculative, transaction, keep - 1, 3)
+    else:
+        transaction.commit([0])
+    if keep:
+        assert_cache_state_close(
+            output.logits[:, :keep],
+            mx.concatenate([out.logits for out in expected], axis=1),
+            atol=1e-4,
+            rtol=1e-4,
+        )
+        for index, hidden in enumerate(output.hidden_states):
+            assert_cache_state_close(
+                hidden[:, :keep],
+                mx.concatenate([out.hidden_states[index] for out in expected], axis=1),
+                atol=1e-4,
+                rtol=1e-4,
+            )
+    assert_cache_state_close(
+        [c.state for c in speculative],
+        [c.state for c in ordinary],
+        atol=1e-4,
+        rtol=1e-4,
+    )
+    assert_cache_state_close(
+        model(mx.array([[11]]), cache=speculative).logits,
+        model(mx.array([[11]]), cache=ordinary).logits,
+        atol=1e-4,
+        rtol=1e-4,
+    )
+
+
+@pytest.mark.parametrize(
+    "length,keep",
+    [
+        (1, [0, 1]),
+        (9, [1, 9]),
+        (11, None),
+        (11, "error"),
+        (11, [0, 0]),
+        (11, [1, 3]),
+        (11, [5, 11]),
+    ],
+)
+def test_kimi_block_verification_restores_batch_rows(length, keep, monkeypatch):
+    mx.random.seed(5)
+    model = tiny_language_model("kimi_k3")
+    references = [model.make_cache() for _ in range(2)]
+    for prompt, cache in zip([[1, 2, 3, 4], [2, 3]], references):
+        model(mx.array([prompt]), cache=cache)
+    caches = [
+        (C.BatchKVCache if isinstance(rows[0], C.KVCache) else type(rows[0])).merge(
+            rows
+        )
+        for rows in zip(*references)
+    ]
+    block = mx.array([list(range(5, 5 + length)), list(range(7, 7 + length))])
+    calls = []
+    forward = type(model.model).__call__
+
+    def record_forward(inner, inputs, *args, **kwargs):
+        calls.append(inputs.shape[1])
+        if keep == "error" and len(calls) == 2:
+            raise RuntimeError("failed verification")
+        return forward(inner, inputs, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(type(model.model), "__call__", record_forward)
+        if keep == "error":
+            with pytest.raises(RuntimeError, match="failed verification"):
+                dflash._dflash_verify(model, block, caches, [0, 1])
+            keep = None
+        else:
+            _, transaction = dflash._dflash_verify(model, block, caches, [0, 1])
+            if keep is None:
+                transaction.abort()
+            else:
+                transaction.commit(keep)
+    assert calls == ([length] if length <= 8 else [8, length - 8])
+    for row, count in enumerate(keep or [0, 0]):
+        for token in range(count):
+            model(block[row : row + 1, token : token + 1], cache=references[row])
+        restored = [cache.extract(row) for cache in caches]
+        assert_cache_state_close(
+            [cache.state for cache in restored],
+            [cache.state for cache in references[row]],
+            atol=1e-4,
+            rtol=1e-4,
+        )
+        assert_cache_state_close(
+            model(mx.array([[20]]), cache=restored).logits,
+            model(mx.array([[20]]), cache=references[row]).logits,
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+
+@pytest.mark.parametrize("abort", [False, True])
+def test_deepseek_v41_batch_cache_restores_all_state(abort):
+    model = tiny_language_model("deepseek_v41")
+    prompts = [mx.array([[1, 2, 3, 4, 5, 6, 7]]), mx.array([[2, 3, 4, 5]])]
+    caches = [model.make_cache()[0] for _ in prompts]
+    expected = [model.make_cache()[0] for _ in prompts]
+    for prompt, actual, reference in zip(prompts, caches, expected):
+        model(prompt, cache=[actual])
+        model(prompt, cache=[reference])
+    batch = type(caches[0]).merge(caches)
+    block = mx.array([[8, 9, 10], [5, 6, 7]])
+    _, transaction = verify_forward(model, block, [batch])
+    if abort:
+        transaction.abort()
+    else:
+        transaction.commit([1, 3])
+    for i, count in enumerate([0, 0] if abort else [1, 3]):
+        for j in range(count):
+            model(block[i : i + 1, j : j + 1], cache=[expected[i]])
+        assert_cache_state_close(
+            batch.rows[i].state, expected[i].state, atol=1e-5, rtol=1e-5
+        )
+        assert batch.rows[i].offset == expected[i].offset
+    assert not batch.is_speculating and not any(
+        row.is_speculating for row in batch.rows
+    )
+
+
+@parametrize("family", ["small", "mini"])
+def test_inkling2_padded_batch_decode_and_extract(family):
+    model = make_inkling2_model(family)
+    # Nonzero relative profiles expose ordering errors when a ring wraps.
+    for layer in model.layers:
+        layer.self_attn.rel_proj = mx.random.normal(layer.self_attn.rel_proj.shape)
+    ids = mx.array([[0, 0, 1, 2, 3, 4, 5], [6, 7, 8, 9, 10, 11, 12]])
+    cache = _make_cache(model.language_model, [2, 0])
+    chunks = [
+        model(ids[:, :3], cache=cache).logits,
+        model(ids[:, 3:], cache=cache).logits,
+    ]
+    logits = mx.concatenate(chunks, axis=1)
+    for row, padding in enumerate((2, 0)):
+        expected = model(ids[row : row + 1, padding:]).logits
+        np.testing.assert_allclose(
+            np.array(logits[row : row + 1, padding:]),
+            np.array(expected),
+            atol=2e-5,
+            rtol=2e-5,
+        )
+    token = mx.array([[13], [14]])
+    actual = model(token, cache=cache).logits
+    for row, padding in enumerate((2, 0)):
+        full = mx.concatenate(
+            [ids[row : row + 1, padding:], token[row : row + 1]], axis=1
+        )
+        expected = model(full).logits[:, -1:]
+        np.testing.assert_allclose(
+            np.array(actual[row : row + 1]), np.array(expected), atol=2e-5, rtol=2e-5
+        )
+    extracted = [layer.extract(0) for layer in cache]
+    next_token = mx.array([[15]])
+    expected = model(
+        mx.concatenate([ids[:1, 2:], token[:1], next_token], axis=1)
+    ).logits[:, -1:]
+    np.testing.assert_allclose(
+        np.array(model(next_token, cache=extracted).logits),
+        np.array(expected),
+        atol=2e-5,
+        rtol=2e-5,
+    )
+
+
+@parametrize("prefix_len", [3, 4, 5, 11])
+@parametrize("keep", [0, 2, 5])
+def test_inkling2_sink_cache_window_rollback(prefix_len, keep):
+    from mlx_vlm.speculative.cache_state import start_speculative_cache
+
+    cache = C.AttentionSinkKVCache(max_size=4)
+    cache.step = 4  # exercise physical compaction as well as the logical window
+    prefix = mx.arange(1, prefix_len + 1).reshape(1, 1, -1, 1)
+    draft = mx.arange(51, 56).reshape(1, 1, -1, 1)
+    for i in range(prefix_len):
+        row = prefix[:, :, i : i + 1]
+        cache.update_and_fetch(row, -row)
+    transaction = start_speculative_cache([cache], 5)
+    keys, _ = cache.update_and_fetch(draft, -draft)
+    expected = mx.concatenate([prefix[:, :, -3:], draft], axis=2)
+    np.testing.assert_array_equal(keys, expected)
+    if keep:
+        transaction.commit([keep])
+    else:
+        transaction.abort()
+    history = mx.concatenate([prefix, draft[:, :, :keep]], axis=2)
+    assert cache.offset == prefix_len + keep
+    for actual, sign in zip(cache.state, (1, -1)):
+        np.testing.assert_array_equal(actual, sign * history[:, :, -4:])
+    next_key = mx.array([[[[91]]]])
+    keys, _ = cache.update_and_fetch(next_key, -next_key)
+    expected = mx.concatenate(
+        [history[:, :, -3:], next_key, mx.zeros_like(next_key)], axis=2
+    )
+    for actual, sign in zip(cache.with_sink(keys.shape[2]), (1, -1)):
+        np.testing.assert_array_equal(actual, sign * expected)
+
+
+@parametrize("tier", ["memory", "disk"])
+def test_inkling2_mini_prefix_restore_and_padded_verify(
+    tier, prefix_manager, monkeypatch
+):
+    monkeypatch.setenv("APC_EXACT_MIN_TOKENS", "1")
+    lm = make_inkling2_model("mini").language_model
+    long_prefix, short_prefix = list(range(1, 12)), [13, 14]
+    original = lm.make_cache()
+    assert all(isinstance(layer[0], C.AttentionSinkKVCache) for layer in original)
+    for i in range(0, len(long_prefix), 3):
+        mx.eval(lm(mx.array([long_prefix[i : i + 3]]), cache=original).logits)
+    if tier == "disk":
+        restored, _ = disk_roundtrip(prefix_manager, long_prefix, original, block=1)
+    else:
+        manager = prefix_manager(block=1)
+        assert manager.store_exact_cache(long_prefix, original)
+        restored, count = manager.lookup_exact_cache(long_prefix + [15])
+        assert count == len(long_prefix)
+    assert all(isinstance(layer[0], C.AttentionSinkKVCache) for layer in restored)
+    actual = lm(mx.array([[15]]), cache=restored).logits
+    expected = lm(mx.array([long_prefix + [15]])).logits[:, -1:]
+    np.testing.assert_allclose(actual, expected, atol=2e-5, rtol=2e-5)
+
+    # Padded batch rows and pre-existing disk snapshots can supply legacy
+    # cache types. Merge one such short row with the restored, wrapped row.
+    legacy = [
+        CacheList(
+            RotatingKVCache(kv.max_size) if kv.max_size else KVCache(), ArraysCache(4)
+        )
+        for kv, _ in (layer.caches for layer in original)
+    ]
+    mx.eval(lm(mx.array([short_prefix]), cache=legacy).logits)
+    merged, count = warm_exact(
+        [legacy, restored], [len(short_prefix), len(long_prefix) + 1]
+    )
+    assert count == len(long_prefix) + 1
+    drafts = [[18, 19, 20], [21, 22, 23]]
+    verify = lm(mx.array(drafts), cache=merged, speculative_verify=True)
+    mx.eval(verify.logits)
+    verify.gdn_states.commit([1, 2])
+    actual = lm(mx.array([[24], [25]]), cache=merged).logits
+    for row, tokens in enumerate(
+        (short_prefix + [18, 24], long_prefix + [15, 21, 22, 25])
+    ):
+        expected = lm(mx.array([tokens])).logits[:, -1:]
+        np.testing.assert_allclose(
+            actual[row : row + 1], expected, atol=2e-5, rtol=2e-5
+        )
+
+
+def test_ernie55_chunked_decode_compression_and_sparse_attention():
+    model = make_ernie55_model(learned=True)
+    tokens = mx.arange(19)[None]
+    expected = model(tokens).logits
+    for chunks in ([1] * 19, [2, 2, 3, 4, 8], [7, 1, 8, 3], [8, 8, 3]):
+        cache = model.make_cache()
+        actual, offset = [], 0
+        for size in chunks:
+            actual.append(model(tokens[:, offset : offset + size], cache=cache).logits)
+            offset += size
+        actual = mx.concatenate(actual, axis=1)
+        np.testing.assert_allclose(actual, expected, atol=2e-5, rtol=2e-5)
+        assert cache[0][1].pooled.shape[1] == 2
+        assert cache[0][1].remainder == 3
+        assert cache[1][0].offset == 19
+        assert cache[1][1].offset == 19
+    # Future tokens must not leak through a completed compressor window.
+    changed = mx.concatenate([tokens[:, :7], mx.full((1, 12), 99)], axis=1)
+    np.testing.assert_allclose(
+        model(changed).logits[:, :7], expected[:, :7], atol=2e-5, rtol=2e-5
+    )
+
+
+def test_ernie55_cache_merge_extract_filter_and_reset():
+    model = make_ernie55_model(learned=True)
+    caches = []
+    for length in (3, 11):
+        cache = model.make_cache()
+        model(mx.arange(length)[None], cache=cache)
+        caches.append(cache)
+    merged = [CacheList.merge([c[i] for c in caches]) for i in range(2)]
+    inputs = mx.array([[3, 4, 5], [11, 12, 13]])
+    actual = model(inputs, cache=merged).logits
+    expected = mx.concatenate(
+        [model(mx.arange(n + 3)[None]).logits[:, -3:] for n in (3, 11)]
+    )
+    np.testing.assert_allclose(actual, expected, atol=2e-5, rtol=2e-5)
+    extracted = [c.extract(1) for c in merged]
+    for c in merged:
+        c.filter(mx.array([1]))
+    actual = model(mx.array([[14]]), cache=merged).logits
+    np.testing.assert_allclose(
+        actual,
+        model(mx.array([[14]]), cache=extracted).logits,
+        atol=2e-5,
+        rtol=2e-5,
+    )
+    np.testing.assert_allclose(
+        actual, model(mx.arange(15)[None]).logits[:, -1:], atol=2e-5, rtol=2e-5
+    )
+    np.testing.assert_allclose(
+        model(inputs, cache=model.make_cache()).logits,
+        model(inputs).logits,
+        atol=2e-5,
+        rtol=2e-5,
+    )

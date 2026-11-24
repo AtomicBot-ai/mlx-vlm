@@ -34,9 +34,7 @@ Partition = Literal["fl2va", "ref2va"]
 FORMAT_NAME = "mlx-vlm-minimax-h3"
 FORMAT_VERSION = 1
 SOURCE_REPO_ID = "MiniMaxAI/MiniMax-H3"
-SOURCE_REVISION = "b3c7290e66afdf293bef3b9077b7a266ef421f34"
-DIFFUSERS_REVISION = "9f169d98d0bce392a889c3b6524d0d97734dfc0e"
-MLX_VIDEO_REVISION = "87db56a51758fefb748a359b90a5283bb8ba4837"
+SOURCE_REVISION = "main"
 
 _DTYPES = {
     "bfloat16": mx.bfloat16,
@@ -784,10 +782,6 @@ def convert_minimax_h3(
         "source": {
             "repo_id": SOURCE_REPO_ID,
             "revision": source_revision or SOURCE_REVISION,
-        },
-        "reference_revisions": {
-            "diffusers": DIFFUSERS_REVISION,
-            "mlx_video": MLX_VIDEO_REVISION,
         },
         "conversion": {
             "dtype": dtype or "source",

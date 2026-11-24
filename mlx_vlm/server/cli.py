@@ -54,7 +54,26 @@ def main():
         "--model",
         type=str,
         default=None,
-        help="Pre-load a language model at startup (e.g. mlx-community/Qwen2.5-VL-3B-Instruct-4bit).",
+        help="Pre-load a language model in the background; monitor readiness and progress at /health.",
+    )
+    distributed_mode = parser.add_mutually_exclusive_group()
+    distributed_mode.add_argument(
+        "--distributed-config",
+        help="Cluster JSON for distributed=true; an optional launch section starts workers automatically.",
+    )
+    distributed_mode.add_argument(
+        "--distributed-worker",
+        action="store_true",
+        help="Run a dedicated collective worker under mlx.launch, not a public coordinator.",
+    )
+    parser.add_argument(
+        "--distributed-backend",
+        choices=("jaccl", "ring", "mpi", "nccl"),
+        default="jaccl",
+    )
+    parser.add_argument(
+        "--distributed-model-dir",
+        help="Absolute shared staging path on every distributed worker.",
     )
     parser.add_argument(
         "--image-model",
@@ -134,7 +153,7 @@ def main():
     parser.add_argument(
         "--prefill-step-size",
         type=int,
-        default=DEFAULT_PREFILL_STEP_SIZE,
+        default=os.environ.get("PREFILL_STEP_SIZE", DEFAULT_PREFILL_STEP_SIZE),
         help="Prompt-token budget per batch step, including padding "
         "(default: %(default)s). Lower values reduce pauses in active streams.",
     )
@@ -322,6 +341,55 @@ def main():
         help="Set the logging level (default: INFO).",
     )
     args = parser.parse_args()
+    if args.distributed_config or args.distributed_worker:
+        if args.reload:
+            parser.error("Distributed serving does not support --reload")
+        if not (args.api_key or os.environ.get("MLX_VLM_SERVER_API_KEY")):
+            parser.error(
+                "Distributed serving requires --api-key or MLX_VLM_SERVER_API_KEY"
+            )
+    if args.distributed_worker:
+        if not args.distributed_model_dir or not os.path.isabs(
+            args.distributed_model_dir
+        ):
+            parser.error(
+                "--distributed-worker requires an absolute --distributed-model-dir"
+            )
+        if any(
+            (
+                args.model,
+                args.adapter_path,
+                args.draft_model,
+                args.image_model,
+                args.mesh_model,
+                args.tts_model,
+                args.stt_model,
+                args.embedding_model,
+                args.decision_model,
+                args.reranker_model,
+            )
+        ):
+            parser.error(
+                "Distributed workers load coordinator-staged models on demand; configure drafts through /v1/cluster/start instead of worker CLI flags"
+            )
+        if any(
+            name.startswith("MLX_VLM_PRELOAD_") for name in os.environ
+        ) or os.environ.get("MLX_VLM_DRAFT_MODEL"):
+            parser.error(
+                "Remove model preload/draft environment settings from distributed workers"
+            )
+        try:
+            worker_limit = int(
+                args.max_num_seqs
+                if args.max_num_seqs is not None
+                else os.environ.get("MLX_VLM_MAX_NUM_SEQS", "4")
+            )
+            if worker_limit < 1:
+                raise ValueError
+        except ValueError:
+            parser.error(
+                "Distributed workers require a positive --max-num-seqs / MLX_VLM_MAX_NUM_SEQS"
+            )
     try:
         GenerationArguments(min_pixels=args.min_pixels, max_pixels=args.max_pixels)
     except ValueError as exc:
@@ -395,6 +463,32 @@ def main():
         os.environ["TOP_LOGPROBS_K"] = str(args.top_logprobs_k)
     if args.api_key:
         os.environ["MLX_VLM_SERVER_API_KEY"] = args.api_key
+
+    if args.distributed_config:
+        from .distributed import ClusterConfig, Coordinator
+
+        try:
+            runtime.distributed_coordinator = Coordinator(
+                ClusterConfig.read(args.distributed_config)
+            )
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            parser.error(f"Invalid distributed configuration: {exc}")
+    elif args.distributed_worker:
+        from huggingface_hub import constants as hub_constants
+
+        from .distributed import DistributedWorker
+
+        # Admission is synchronized across ranks by the native generation thread.
+        os.environ.setdefault("MLX_VLM_MAX_NUM_SEQS", "4")
+        os.environ["APC_ENABLED"] = "0"
+        os.environ["APC_DISK_ENABLED"] = "0"
+        os.environ["MLX_VLM_VISION_CACHE_SIZE"] = "0"
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        # Hub has already been imported by the server; update its cached flag too.
+        hub_constants.HF_HUB_OFFLINE = True
+        runtime.distributed_worker = DistributedWorker(
+            args.distributed_backend, args.distributed_model_dir
+        )
 
     log_level = getattr(logging, args.log_level.upper(), logging.INFO)
     logging.basicConfig(

@@ -733,7 +733,12 @@ async def compact_response_context(
     cache_scope = None
     fingerprints = []
     restored = False
-    if automatic and isinstance(request, ChatRequest):
+    # A rank-local cache hit/expiry can skip collectives on just one worker.
+    if (
+        automatic
+        and isinstance(request, ChatRequest)
+        and runtime.distributed_worker is None
+    ):
         options = request.model_dump(
             exclude={"messages", "stream", "transient_context", "tool_result_context"},
             exclude_none=True,

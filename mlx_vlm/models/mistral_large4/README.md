@@ -10,9 +10,36 @@ the Pixtral encoder and Mistral projector.
 
 Use a model directory with a standard `config.json` (`model_type: mistral_large4`,
 `text_config`, and `vision_config`), tokenizer/processor files, and safetensors.
-The original Mistral release uses `params.json`; that metadata must be normalized
-to the standard configuration before loading. This port does not add a separate
-checkpoint loader or staging utility.
+When `config.json` is absent, the shared loader reads `params.json`. Both filenames
+must contain the standard model configuration schema. Normalize native Mistral
+metadata before saving it under either filename. Use standard checkpoint
+filenames such as `model.safetensors` and compatible tokenizer/processor files.
+
+For a native release containing only `params.json`, create the metadata file once
+before calling `mlx_vlm.load` or starting distributed serving:
+
+```python
+import json
+from pathlib import Path
+from mlx_vlm.models.mistral_large4.config import config_from_params
+
+model_path = Path("/path/to/model")
+params = json.loads((model_path / "params.json").read_text())
+config = config_from_params(params)
+with (model_path / "config.json").open("x") as f:
+    json.dump(config, f, indent=2)
+```
+
+The model's config post-init hook translates attention, expert routing, shared
+caches, vision, and quantization metadata. This step does not rewrite weights or
+change `params.json`. It preserves an existing `config.json` by refusing to
+overwrite it. The shared loader remains unchanged and requires `model_type`
+before it can select the architecture. NVFP4 and native 128×128 block-FP8 weights
+then use the existing conversion path. `Mistral3Processor.from_pretrained` also
+accepts native metadata directly when used explicitly.
+
+The model uses MLX-VLM's Mistral processor and NumPy/PIL image preprocessing;
+Torch and Torchvision are not required.
 
 The model sanitizer maps native weight names and stacks experts. The shared
 quantization converter preserves packed NVFP4 expert weights, block scales, and
@@ -43,7 +70,8 @@ Use an MLX build with residency-refresh support. The 100 ms refresh avoids the
 idle-related prefill stalls observed with this model by periodically renewing
 Metal residency. The launcher passes both environment settings to every rank.
 
-The runner uses `sharded_load`, which calls `model.shard(group)`, followed by
+The runner uses `sharded_load`, which calls `model.shard(group, weights=weights)`
+before conversion and expert stacking, then calls `model.shard(group)` and
 `stream_generate`. For deterministic distributed decoding, set `do_sample` to
 `false` in each model directory's `generation_config.json`.
 
@@ -52,6 +80,15 @@ Macs or 42/43/43 on three Macs. Dense layers and vision are replicated. Expert
 outputs are reduced before weighting and accumulation, preserving BF16 operation
 order. A directory containing only one rank's experts must declare its
 `expert_start` and `expert_end` in `text_config`; sharding validates that range.
+
+Distributed serving uses the same checkpoint sharding through
+`load(..., sharding_group=group)`. Native per-expert tensors outside the rank's
+range are discarded before shared NVFP4/FP8 conversion. Already-stacked MLX
+expert tensors are gathered into owned storage, avoiding slices that retain the
+full checkpoint allocation. Repeated final sharding is idempotent; attention,
+shared experts and multimodal parameters remain replicated. Pipeline-only
+loading does not select expert partitions. Bundled draft weights remain excluded
+from target loading.
 
 ## DSpark speculative decoding
 

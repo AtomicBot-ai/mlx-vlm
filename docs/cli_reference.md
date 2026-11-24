@@ -21,8 +21,16 @@ python -m mlx_vlm generate --help
 - `mlx_vlm.chat_ui` – start an interactive Gradio UI.
 - `mlx_vlm.server` – run the FastAPI server.
 - `mlx_vlm.moe_offload` – repack a MoE checkpoint for expert offloading.
+- `mlx_vlm.train` – train or fine-tune a model; `--describe` lists every algorithm and option as JSON.
+- `mlx_vlm.train_runs` – start, follow and stop background training runs with usage caps; see [training](training.md#self-describing-cli-and-run-manager).
 
 Each command accepts `--help` for full usage information.
+
+For per-request `distributed: true`, start the public server with
+`--distributed-config cluster.json`. Include `launch` settings in that JSON to
+start and stop the worker group automatically over SSH. Omit `launch` when you
+manage `--distributed-worker` processes separately. See
+[distributed serving](distributed-serving.md).
 
 Decision CLI and HTTP examples, including `--decision-model` preloading, are in
 the [decision models guide](https://github.com/Neywa-Labs/mlx-vlm#decision-models).
